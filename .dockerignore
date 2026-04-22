@@ -1,1 +1,63 @@
+# Docker ignore file for Bradicoin RPC
 
+# Dependencies
+node_modules/
+npm-debug.log
+yarn-error.log
+package-lock.json
+yarn.lock
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentation
+*.md
+README.md
+docs/
+LICENSE
+
+# Development files
+.env
+.env.local
+.env.production
+.dockerignore
+Dockerfile
+docker-compose.yml
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Test files
+test/
+tests/
+*.test.js
+*.spec.js
+coverage/
+
+# Blockchain data (keep this volume persistent)
+bradicoin-data/
+*.db
+*.json
+
+# Backup files
+*.bak
+*.backup
