@@ -4,12 +4,9 @@
   "description": "Bradicoin Mainnet RPC Server - BRD Blockchain",
   "main": "rpc-mainnet.js",
   "scripts": {
-    "start": "node rpc-mainnet.js",
-    "dev": "nodemon rpc-mainnet.js",
-    "docker:build": "docker build -t bradicoin-rpc .",
-    "docker:run": "docker run -d -p 8545:8545 --name bradicoin-mainnet bradicoin-rpc",
-    "docker:stop": "docker stop bradicoin-mainnet && docker rm bradicoin-mainnet",
-    "deploy": "./deploy.sh"
+    "start": "node server.js",
+    "dev-api": "node developer-api.js",
+    "rpc": "node rpc-mainnet.js"
   },
   "dependencies": {
     "express": "^4.18.2"
