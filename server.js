@@ -273,7 +273,7 @@ app.post('/api/register', (req, res) => {
 });
 
 // ============================================
-// BALANCE - Check balance
+// BALANCE - Check balance (MODIFICADO)
 // ============================================
 app.get('/api/balance/:address', (req, res) => {
     try {
@@ -289,13 +289,18 @@ app.get('/api/balance/:address', (req, res) => {
         
         const user = users.find(u => u.address === address);
         
+        // Se não encontrar, retorna saldo 0 em vez de 404
         if (!user) {
-            return res.status(404).json({
-                success: false,
-                error: 'Address not found',
+            return res.json({
+                success: true,
                 data: {
                     address: address,
-                    exists: false
+                    username: 'Unknown',
+                    balance: 0,
+                    currency: config.coinSymbol,
+                    exists: false,
+                    formatted: `0 ${config.coinSymbol}`,
+                    decimals: config.decimals
                 }
             });
         }
@@ -307,6 +312,7 @@ app.get('/api/balance/:address', (req, res) => {
                 username: user.username,
                 balance: user.balance,
                 currency: config.coinSymbol,
+                exists: true,
                 formatted: `${user.balance.toLocaleString()} ${config.coinSymbol}`,
                 decimals: config.decimals
             }
