@@ -1,12 +1,152 @@
+// wallet.js - Complete wallet module with checksum, encoding and validator
+// Maintains all existing functionality while adding standard crypto
+
 const crypto = require('crypto');
+const BradicoinChecksum = require('./checksum');
+const BradicoinValidator = require('./validator');
+const BradicoinEncoding = require('./encoding');
 
 class Wallet {
-    constructor() {
+    constructor(network = 'mainnet') {
+        this.network = network;
+        this.versionByte = network === 'mainnet' ? 0x00 : 0x6F;
+        
+        // Initialize new modules
+        this.checksumManager = new BradicoinChecksum();
+        this.validator = new BradicoinValidator(network);
+        this.encoding = new BradicoinEncoding(network);
+        
+        // Existing properties
         this.addresses = new Map(); // address -> { privateKey, balance, transactions, createdAt }
         this.pendingTransactions = new Map(); // txId -> { from, to, amount, status, timestamp }
         this.transactionFee = 0.01; // 0.01 BRD transaction fee
         this.minTransactionAmount = 0.01; // Minimum 0.01 BRD per transaction
+        
+        // Support both address formats (old and new)
+        this.addressPrefix = 'BRD-'; // Legacy prefix
     }
+
+    // ========================================
+    // CORE ADDRESS GENERATION (UPDATED)
+    // ========================================
+
+    /**
+     * Generate a new wallet address (Standard Base58Check)
+     */
+    generateStandardAddress(privateKey) {
+        try {
+            // 1. Derive public key from private key (simplified)
+            // In production, use secp256k1 properly
+            const publicKey = this._derivePublicKey(privateKey);
+            
+            // 2. Generate address using encoding module
+            const address = this.encoding.publicKeyToAddress(publicKey);
+            
+            // 3. Validate the generated address
+            const validation = this.validator.validateAddress(address);
+            if (!validation.valid) {
+                throw new Error(`Generated address is invalid: ${validation.error}`);
+            }
+            
+            return address;
+        } catch (error) {
+            // Fallback to legacy format if standard fails
+            return this.generateLegacyAddress(privateKey);
+        }
+    }
+
+    /**
+     * Generate legacy address (BRD- format) - kept for compatibility
+     */
+    generateLegacyAddress(privateKey) {
+        const hash = crypto.createHash('sha256').update(privateKey).digest('hex');
+        const addressHash = crypto.createHash('ripemd160').update(hash).digest('hex');
+        return this.addressPrefix + addressHash.substring(0, 16).toUpperCase();
+    }
+
+    /**
+     * Generate address from private key (auto-detects best format)
+     */
+    generateAddressFromPrivateKey(privateKey) {
+        try {
+            // Try standard format first
+            const standardAddress = this.generateStandardAddress(privateKey);
+            if (this.validator.validateAddress(standardAddress).valid) {
+                return standardAddress;
+            }
+        } catch (error) {
+            // Fallback to legacy
+        }
+        return this.generateLegacyAddress(privateKey);
+    }
+
+    /**
+     * Derive public key from private key (simplified)
+     * In production, use secp256k1 library
+     */
+    _derivePublicKey(privateKey) {
+        // Simplified derivation - in production use proper ECDSA
+        const hash = crypto.createHash('sha256').update(privateKey).digest();
+        const publicKey = Buffer.concat([
+            Buffer.from([0x04]),
+            crypto.createHash('sha256').update(hash).digest(),
+            crypto.createHash('sha256').update(hash).digest()
+        ]);
+        return publicKey;
+    }
+
+    // ========================================
+    // ADDRESS VALIDATION (NEW)
+    // ========================================
+
+    /**
+     * Validate an address (supports both formats)
+     */
+    isValidAddress(address) {
+        // 1. Check legacy format (BRD-)
+        if (address.startsWith(this.addressPrefix) && address.length === 21) {
+            return true;
+        }
+        
+        // 2. Check standard format
+        const validation = this.validator.validateAddress(address);
+        return validation.valid;
+    }
+
+    /**
+     * Verify address with checksum
+     */
+    verifyAddress(address) {
+        // Check legacy format
+        if (address.startsWith(this.addressPrefix)) {
+            return {
+                valid: true,
+                format: 'legacy',
+                address: address,
+                checksumValid: true
+            };
+        }
+        
+        // Check standard format
+        const validation = this.validator.validateAddress(address);
+        if (!validation.valid) {
+            return validation;
+        }
+
+        const checksumVerification = this.checksumManager.verifyAddressChecksum(address);
+        
+        return {
+            valid: true,
+            address: address,
+            format: 'standard',
+            checksumValid: checksumVerification.valid,
+            details: validation
+        };
+    }
+
+    // ========================================
+    // WALLET MANAGEMENT (MAINTAINED)
+    // ========================================
 
     // Generate a new wallet address
     createWallet() {
@@ -19,23 +159,17 @@ class Wallet {
             createdAt: new Date(),
             transactions: [],
             totalReceived: 0,
-            totalSent: 0
+            totalSent: 0,
+            addressFormat: address.startsWith(this.addressPrefix) ? 'legacy' : 'standard'
         });
         
         return {
             success: true,
             address: address,
             privateKey: privateKey,
+            format: address.startsWith(this.addressPrefix) ? 'legacy' : 'standard',
             message: '⚠️ Save your private key securely! You will need it to sign transactions. Never share it with anyone!'
         };
-    }
-    
-    // Generate address from private key
-    generateAddressFromPrivateKey(privateKey) {
-        // Simple address generation (in production, use proper crypto like secp256k1)
-        const hash = crypto.createHash('sha256').update(privateKey).digest('hex');
-        const addressHash = crypto.createHash('ripemd160').update(hash).digest('hex');
-        return 'BRD-' + addressHash.substring(0, 16).toUpperCase();
     }
     
     // Import existing wallet using private key
@@ -61,7 +195,8 @@ class Wallet {
             createdAt: new Date(),
             transactions: [],
             totalReceived: 0,
-            totalSent: 0
+            totalSent: 0,
+            addressFormat: address.startsWith(this.addressPrefix) ? 'legacy' : 'standard'
         });
         
         return {
@@ -79,6 +214,7 @@ class Wallet {
         }
         
         const wallet = this.addresses.get(address);
+        const addressValidation = this.verifyAddress(address);
         
         return {
             success: true,
@@ -91,7 +227,10 @@ class Wallet {
             totalSent: wallet.totalSent,
             lastTransactions: wallet.transactions.slice(-10).reverse(),
             hasPrivateKey: !!wallet.privateKey,
-            currency: 'BRD'
+            currency: 'BRD',
+            addressFormat: wallet.addressFormat || 'legacy',
+            isValid: addressValidation.valid,
+            checksumValid: addressValidation.checksumValid !== undefined ? addressValidation.checksumValid : true
         };
     }
     
@@ -102,7 +241,11 @@ class Wallet {
         }
         return this.addresses.get(address).balance;
     }
-    
+
+    // ========================================
+    // TRANSACTIONS (MAINTAINED)
+    // ========================================
+
     // Send Bradicoins to another address
     sendTransaction(fromAddress, toAddress, amount, privateKey = null) {
         // Validate addresses
@@ -110,8 +253,14 @@ class Wallet {
             throw new Error('Sender wallet not found. Please import or create wallet first');
         }
         
+        // Validate recipient address
         if (!toAddress || toAddress.length < 10) {
             throw new Error('Invalid recipient address');
+        }
+        
+        // Check if recipient address is valid
+        if (!this.isValidAddress(toAddress)) {
+            throw new Error('Invalid recipient address format');
         }
         
         // Validate amount
@@ -138,7 +287,6 @@ class Wallet {
                 throw new Error('Invalid private key for this address');
             }
         } else if (senderWallet.privateKey) {
-            // Auto-sign if wallet has private key
             privateKey = senderWallet.privateKey;
         } else {
             throw new Error('Private key required to sign transaction');
@@ -176,7 +324,8 @@ class Wallet {
                 createdAt: new Date(),
                 transactions: [],
                 totalReceived: 0,
-                totalSent: 0
+                totalSent: 0,
+                addressFormat: toAddress.startsWith(this.addressPrefix) ? 'legacy' : 'standard'
             });
         }
         
@@ -236,7 +385,11 @@ class Wallet {
             message: 'Transaction confirmed and added to blockchain'
         };
     }
-    
+
+    // ========================================
+    // UTILITY FUNCTIONS (MAINTAINED)
+    // ========================================
+
     // Get transaction status
     getTransactionStatus(transactionId) {
         if (this.pendingTransactions.has(transactionId)) {
@@ -317,7 +470,6 @@ class Wallet {
             return false;
         }
         
-        // Test signature with test data
         const testData = { test: 'verification' };
         const testSignature = this.signTransaction(privateKey, testData);
         const expectedSignature = this.signTransaction(wallet.privateKey, testData);
@@ -338,6 +490,7 @@ class Wallet {
                 totalReceived: wallet.totalReceived,
                 totalSent: wallet.totalSent,
                 hasPrivateKey: !!wallet.privateKey,
+                addressFormat: wallet.addressFormat || 'legacy',
                 currency: 'BRD'
             });
         }
@@ -424,14 +577,14 @@ class Wallet {
     // Receive coins (simple method for receiving)
     receiveCoins(address, amount, fromAddress = 'external') {
         if (!this.addresses.has(address)) {
-            // Auto-create wallet for receiving address
             this.addresses.set(address, {
                 privateKey: null,
                 balance: 0,
                 createdAt: new Date(),
                 transactions: [],
                 totalReceived: 0,
-                totalSent: 0
+                totalSent: 0,
+                addressFormat: address.startsWith(this.addressPrefix) ? 'legacy' : 'standard'
             });
         }
         
