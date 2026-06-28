@@ -2,9 +2,13 @@
 // Maintains all existing functionality while adding standard crypto
 
 const crypto = require('crypto');
+const EC = require('elliptic').ec;
 const BradicoinChecksum = require('./checksum');
 const BradicoinValidator = require('./validator');
 const BradicoinEncoding = require('./encoding');
+
+// Inicializa a curva secp256k1
+const ec = new EC('secp256k1');
 
 class Wallet {
     constructor(network = 'mainnet') {
@@ -35,8 +39,7 @@ class Wallet {
      */
     generateStandardAddress(privateKey) {
         try {
-            // 1. Derive public key from private key (simplified)
-            // In production, use secp256k1 properly
+            // 1. Derive public key from private key usando elliptic
             const publicKey = this._derivePublicKey(privateKey);
             
             // 2. Generate address using encoding module
@@ -81,18 +84,106 @@ class Wallet {
     }
 
     /**
-     * Derive public key from private key (simplified)
-     * In production, use secp256k1 library
+     * Derive public key from private key usando elliptic
+     * Agora com suporte completo a secp256k1
      */
     _derivePublicKey(privateKey) {
-        // Simplified derivation - in production use proper ECDSA
-        const hash = crypto.createHash('sha256').update(privateKey).digest();
-        const publicKey = Buffer.concat([
-            Buffer.from([0x04]),
-            crypto.createHash('sha256').update(hash).digest(),
-            crypto.createHash('sha256').update(hash).digest()
-        ]);
-        return publicKey;
+        try {
+            // Converte private key para Buffer
+            const privateKeyBuffer = Buffer.from(privateKey, 'hex');
+            
+            // Cria chave privada no formato elliptic
+            const keyPair = ec.keyFromPrivate(privateKeyBuffer);
+            
+            // Obtém chave pública (formato compactado/uncompressed)
+            const publicKey = keyPair.getPublic();
+            
+            // Retorna no formato Buffer (com 0x04 para uncompressed)
+            const pubKeyBuffer = Buffer.from(publicKey.encode('hex', false), 'hex');
+            
+            // Se quiser compressed, use:
+            // const pubKeyBuffer = Buffer.from(publicKey.encode('hex', true), 'hex');
+            
+            return pubKeyBuffer;
+        } catch (error) {
+            // Fallback: método simplificado para compatibilidade
+            const hash = crypto.createHash('sha256').update(privateKey).digest();
+            const publicKey = Buffer.concat([
+                Buffer.from([0x04]),
+                crypto.createHash('sha256').update(hash).digest(),
+                crypto.createHash('sha256').update(hash).digest()
+            ]);
+            return publicKey;
+        }
+    }
+
+    /**
+     * Generate a new key pair (private + public key)
+     */
+    generateKeyPair() {
+        const keyPair = ec.genKeyPair();
+        const privateKey = keyPair.getPrivate('hex');
+        const publicKey = keyPair.getPublic('hex', false);
+        
+        return {
+            privateKey: privateKey,
+            publicKey: publicKey,
+            publicKeyCompressed: keyPair.getPublic('hex', true)
+        };
+    }
+
+    /**
+     * Get public key from private key
+     */
+    getPublicKey(privateKey, compressed = false) {
+        try {
+            const keyPair = ec.keyFromPrivate(Buffer.from(privateKey, 'hex'));
+            return keyPair.getPublic('hex', compressed);
+        } catch (error) {
+            throw new Error(`Invalid private key: ${error.message}`);
+        }
+    }
+
+    /**
+     * Sign a message with private key
+     */
+    signMessage(privateKey, message) {
+        try {
+            const keyPair = ec.keyFromPrivate(Buffer.from(privateKey, 'hex'));
+            const msgHash = crypto.createHash('sha256').update(message).digest();
+            const signature = keyPair.sign(msgHash);
+            
+            return {
+                r: signature.r.toString('hex'),
+                s: signature.s.toString('hex'),
+                recoveryParam: signature.recoveryParam,
+                signature: signature.toDER('hex')
+            };
+        } catch (error) {
+            throw new Error(`Failed to sign message: ${error.message}`);
+        }
+    }
+
+    /**
+     * Verify a signed message
+     */
+    verifyMessage(publicKey, message, signature) {
+        try {
+            const keyPair = ec.keyFromPublic(Buffer.from(publicKey, 'hex'), 'hex');
+            const msgHash = crypto.createHash('sha256').update(message).digest();
+            
+            // Se signature for string hex, converte para DER
+            let sig;
+            if (typeof signature === 'string') {
+                sig = Buffer.from(signature, 'hex');
+            } else {
+                sig = signature;
+            }
+            
+            return keyPair.verify(msgHash, sig);
+        } catch (error) {
+            return false;
+        }
     }
 
     // ========================================
@@ -150,7 +241,8 @@ class Wallet {
 
     // Generate a new wallet address
     createWallet() {
-        const privateKey = crypto.randomBytes(32).toString('hex');
+        const keyPair = ec.genKeyPair();
+        const privateKey = keyPair.getPrivate('hex');
         const address = this.generateAddressFromPrivateKey(privateKey);
         
         this.addresses.set(address, {
@@ -160,13 +252,17 @@ class Wallet {
             transactions: [],
             totalReceived: 0,
             totalSent: 0,
-            addressFormat: address.startsWith(this.addressPrefix) ? 'legacy' : 'standard'
+            addressFormat: address.startsWith(this.addressPrefix) ? 'legacy' : 'standard',
+            publicKey: keyPair.getPublic('hex', false),
+            publicKeyCompressed: keyPair.getPublic('hex', true)
         });
         
         return {
             success: true,
             address: address,
             privateKey: privateKey,
+            publicKey: keyPair.getPublic('hex', false),
+            publicKeyCompressed: keyPair.getPublic('hex', true),
             format: address.startsWith(this.addressPrefix) ? 'legacy' : 'standard',
             message: '⚠️ Save your private key securely! You will need it to sign transactions. Never share it with anyone!'
         };
@@ -176,6 +272,13 @@ class Wallet {
     importWallet(privateKey) {
         if (!privateKey || privateKey.length !== 64) {
             throw new Error('Invalid private key. Must be 64 characters hex string');
+        }
+        
+        // Verifica se a private key é válida
+        try {
+            ec.keyFromPrivate(Buffer.from(privateKey, 'hex'));
+        } catch (error) {
+            throw new Error('Invalid private key format');
         }
         
         const address = this.generateAddressFromPrivateKey(privateKey);
@@ -189,6 +292,9 @@ class Wallet {
             };
         }
         
+        // Obtém a chave pública
+        const keyPair = ec.keyFromPrivate(Buffer.from(privateKey, 'hex'));
+        
         this.addresses.set(address, {
             privateKey: privateKey,
             balance: 0,
@@ -196,12 +302,16 @@ class Wallet {
             transactions: [],
             totalReceived: 0,
             totalSent: 0,
-            addressFormat: address.startsWith(this.addressPrefix) ? 'legacy' : 'standard'
+            addressFormat: address.startsWith(this.addressPrefix) ? 'legacy' : 'standard',
+            publicKey: keyPair.getPublic('hex', false),
+            publicKeyCompressed: keyPair.getPublic('hex', true)
         });
         
         return {
             success: true,
             address: address,
+            publicKey: keyPair.getPublic('hex', false),
+            publicKeyCompressed: keyPair.getPublic('hex', true),
             message: 'Wallet imported successfully',
             isNew: true
         };
@@ -230,7 +340,9 @@ class Wallet {
             currency: 'BRD',
             addressFormat: wallet.addressFormat || 'legacy',
             isValid: addressValidation.valid,
-            checksumValid: addressValidation.checksumValid !== undefined ? addressValidation.checksumValid : true
+            checksumValid: addressValidation.checksumValid !== undefined ? addressValidation.checksumValid : true,
+            publicKey: wallet.publicKey || null,
+            publicKeyCompressed: wallet.publicKeyCompressed || null
         };
     }
     
@@ -243,7 +355,7 @@ class Wallet {
     }
 
     // ========================================
-    // TRANSACTIONS (MAINTAINED)
+    // TRANSACTIONS (UPDATED WITH CRYPTO)
     // ========================================
 
     // Send Bradicoins to another address
@@ -292,8 +404,19 @@ class Wallet {
             throw new Error('Private key required to sign transaction');
         }
         
+        // Create transaction data for signing
+        const transactionData = {
+            fromAddress: fromAddress,
+            toAddress: toAddress,
+            amount: amount,
+            fee: this.transactionFee,
+            timestamp: new Date().toISOString()
+        };
+        
         // Create transaction
         const transactionId = crypto.randomBytes(16).toString('hex');
+        const signature = this.signTransaction(privateKey, transactionData);
+        
         const transaction = {
             id: transactionId,
             fromAddress: fromAddress,
@@ -303,9 +426,10 @@ class Wallet {
             total: totalRequired,
             type: 'SEND',
             status: 'PENDING',
-            timestamp: new Date().toISOString(),
-            signature: this.signTransaction(privateKey, { fromAddress, toAddress, amount }),
-            currency: 'BRD'
+            timestamp: transactionData.timestamp,
+            signature: signature,
+            currency: 'BRD',
+            transactionData: transactionData
         };
         
         // Store pending transaction
@@ -325,7 +449,9 @@ class Wallet {
                 transactions: [],
                 totalReceived: 0,
                 totalSent: 0,
-                addressFormat: toAddress.startsWith(this.addressPrefix) ? 'legacy' : 'standard'
+                addressFormat: toAddress.startsWith(this.addressPrefix) ? 'legacy' : 'standard',
+                publicKey: null,
+                publicKeyCompressed: null
             });
         }
         
@@ -338,6 +464,7 @@ class Wallet {
             fee: this.transactionFee,
             status: 'PENDING',
             currency: 'BRD',
+            signature: signature,
             message: `Transaction created successfully. Waiting for mining confirmation.`
         };
     }
@@ -404,7 +531,8 @@ class Wallet {
                 fee: tx.fee,
                 timestamp: tx.timestamp,
                 confirmedAt: tx.confirmedAt || null,
-                currency: 'BRD'
+                currency: 'BRD',
+                signature: tx.signature || null
             };
         }
         
@@ -422,7 +550,8 @@ class Wallet {
                     fee: transaction.fee,
                     timestamp: transaction.timestamp,
                     confirmedAt: transaction.confirmedAt || null,
-                    currency: 'BRD'
+                    currency: 'BRD',
+                    signature: transaction.signature || null
                 };
             }
         }
@@ -442,24 +571,35 @@ class Wallet {
                     amount: tx.amount,
                     fee: tx.fee,
                     timestamp: tx.timestamp,
-                    currency: 'BRD'
+                    currency: 'BRD',
+                    signature: tx.signature || null
                 });
             }
         }
         return pending;
     }
     
-    // Sign transaction with private key
+    // Sign transaction with private key (usando elliptic)
     signTransaction(privateKey, transactionData) {
-        const message = JSON.stringify(transactionData);
-        const signature = crypto
-            .createHmac('sha256', privateKey)
-            .update(message)
-            .digest('hex');
-        return signature;
+        try {
+            const keyPair = ec.keyFromPrivate(Buffer.from(privateKey, 'hex'));
+            const message = JSON.stringify(transactionData);
+            const msgHash = crypto.createHash('sha256').update(message).digest();
+            const signature = keyPair.sign(msgHash);
+            
+            return signature.toDER('hex');
+        } catch (error) {
+            // Fallback para compatibilidade
+            const message = JSON.stringify(transactionData);
+            const signature = crypto
+                .createHmac('sha256', privateKey)
+                .update(message)
+                .digest('hex');
+            return signature;
+        }
     }
     
-    // Verify signature
+    // Verify signature (usando elliptic)
     verifySignature(address, privateKey) {
         if (!this.addresses.has(address)) {
             return false;
@@ -470,11 +610,24 @@ class Wallet {
             return false;
         }
         
-        const testData = { test: 'verification' };
-        const testSignature = this.signTransaction(privateKey, testData);
-        const expectedSignature = this.signTransaction(wallet.privateKey, testData);
-        
-        return testSignature === expectedSignature;
+        try {
+            // Verifica usando elliptic
+            const keyPair = ec.keyFromPrivate(Buffer.from(privateKey, 'hex'));
+            const testData = { test: 'verification', timestamp: Date.now() };
+            const message = JSON.stringify(testData);
+            const msgHash = crypto.createHash('sha256').update(message).digest();
+            const signature = keyPair.sign(msgHash);
+            
+            // Verifica com a chave pública da carteira
+            const pubKey = ec.keyFromPublic(Buffer.from(wallet.publicKey, 'hex'), 'hex');
+            return pubKey.verify(msgHash, signature);
+        } catch (error) {
+            // Fallback para verificação simples
+            const testData = { test: 'verification' };
+            const testSignature = this.signTransaction(privateKey, testData);
+            const expectedSignature = this.signTransaction(wallet.privateKey, testData);
+            return testSignature === expectedSignature;
+        }
     }
     
     // Get all wallets summary (admin only)
@@ -491,7 +644,8 @@ class Wallet {
                 totalSent: wallet.totalSent,
                 hasPrivateKey: !!wallet.privateKey,
                 addressFormat: wallet.addressFormat || 'legacy',
-                currency: 'BRD'
+                currency: 'BRD',
+                hasPublicKey: !!wallet.publicKey
             });
         }
         return wallets;
@@ -584,7 +738,9 @@ class Wallet {
                 transactions: [],
                 totalReceived: 0,
                 totalSent: 0,
-                addressFormat: address.startsWith(this.addressPrefix) ? 'legacy' : 'standard'
+                addressFormat: address.startsWith(this.addressPrefix) ? 'legacy' : 'standard',
+                publicKey: null,
+                publicKeyCompressed: null
             });
         }
         
