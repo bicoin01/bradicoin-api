@@ -6,6 +6,7 @@ require('dotenv').config();
 // ============================================
 // IMPORTS
 // ============================================
+const crypto = require('crypto'); // ← ADICIONADO
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
@@ -211,31 +212,40 @@ app.get('/', (req, res) => {
             send: 'POST /api/send',
             users: 'GET /api/users',
             transactions: 'GET /api/transactions/:address',
-            // New endpoints
             wallet: {
                 create: 'POST /api/wallet/create',
                 verify: 'POST /api/wallet/verify',
                 wif: 'POST /api/wallet/wif',
-                detect: 'POST /api/wallet/detect'
+                detect: 'POST /api/wallet/detect',
+                generateKeys: 'POST /api/wallet/generate-keys',
+                import: 'POST /api/wallet/import'
             },
             hash: {
                 sha256: 'POST /api/hash/sha256',
                 hash160: 'POST /api/hash/hash160',
                 hash256: 'POST /api/hash/hash256',
                 hmac: 'POST /api/hash/hmac',
-                merkle: 'POST /api/hash/merkle'
+                merkle: 'POST /api/hash/merkle',
+                bip39: 'POST /api/hash/bip39'
             },
             checksum: {
                 verify: 'POST /api/checksum/verify',
-                fix: 'POST /api/checksum/fix'
+                fix: 'POST /api/checksum/fix',
+                transaction: 'POST /api/checksum/transaction',
+                verifyTx: 'POST /api/checksum/verify-tx'
             },
             encode: {
                 base58: 'POST /api/encode/base58',
                 decode: 'POST /api/decode/base58',
-                hex: 'POST /api/encode/hex'
+                hex: 'POST /api/encode/hex',
+                bech32: 'POST /api/encode/bech32'
             },
             validate: {
-                transaction: 'POST /api/validate/transaction'
+                transaction: 'POST /api/validate/transaction',
+                address: 'POST /api/validate/address',
+                privateKey: 'POST /api/validate/private-key',
+                publicKey: 'POST /api/validate/public-key',
+                txHash: 'POST /api/validate/tx-hash'
             }
         },
         message: 'Bradicoin API v2.0 - Now with advanced cryptography!'
@@ -243,24 +253,17 @@ app.get('/', (req, res) => {
 });
 
 // ============================================
-// ============================================
-// WALLET ENDPOINTS (NEW)
+// WALLET ENDPOINTS
 // ============================================
 
-// 1. Generate wallet address
+// 1. Create wallet (novo - usa o método correto)
 app.post('/api/wallet/create', (req, res) => {
     try {
-        const { publicKey } = req.body;
-        
-        if (!publicKey) {
-            return res.status(400).json({
-                success: false,
-                error: 'Public key is required'
-            });
-        }
-
-        const result = wallet.generateAddress(publicKey);
-        res.json(result);
+        const result = wallet.createWallet();
+        res.json({
+            success: true,
+            data: result
+        });
     } catch (error) {
         res.status(500).json({
             success: false,
@@ -291,7 +294,7 @@ app.post('/api/wallet/verify', (req, res) => {
     }
 });
 
-// 3. Generate WIF
+// 3. Generate WIF (Wallet Import Format)
 app.post('/api/wallet/wif', (req, res) => {
     try {
         const { privateKey, compressed = true } = req.body;
@@ -303,12 +306,9 @@ app.post('/api/wallet/wif', (req, res) => {
             });
         }
 
-        const wif = wallet.generateWIF(privateKey, compressed);
-        res.json({
-            success: true,
-            wif: wif,
-            compressed: compressed
-        });
+        // Usa o método do wallet para gerar WIF
+        const result = wallet.generateWIF(privateKey, compressed);
+        res.json(result);
     } catch (error) {
         res.status(500).json({
             success: false,
@@ -339,10 +339,35 @@ app.post('/api/wallet/detect', (req, res) => {
     }
 });
 
-// 5. Generate key pair
+// 5. Generate key pair (novo - usa elliptic)
 app.post('/api/wallet/generate-keys', (req, res) => {
     try {
         const result = wallet.generateKeyPair();
+        res.json({
+            success: true,
+            data: result
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// 6. Import wallet from private key
+app.post('/api/wallet/import', (req, res) => {
+    try {
+        const { privateKey } = req.body;
+        
+        if (!privateKey) {
+            return res.status(400).json({
+                success: false,
+                error: 'Private key is required'
+            });
+        }
+
+        const result = wallet.importWallet(privateKey);
         res.json(result);
     } catch (error) {
         res.status(500).json({
@@ -352,20 +377,47 @@ app.post('/api/wallet/generate-keys', (req, res) => {
     }
 });
 
-// 6. Import from private key
-app.post('/api/wallet/import', (req, res) => {
+// 7. Get wallet info
+app.post('/api/wallet/info', (req, res) => {
     try {
-        const { privateKey, compressed = true } = req.body;
+        const { address } = req.body;
         
-        if (!privateKey) {
+        if (!address) {
             return res.status(400).json({
                 success: false,
-                error: 'Private key is required'
+                error: 'Address is required'
             });
         }
 
-        const result = wallet.importFromPrivateKey(privateKey, compressed);
+        const result = wallet.getWalletInfo(address);
         res.json(result);
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// 8. Get balance (via wallet)
+app.post('/api/wallet/balance', (req, res) => {
+    try {
+        const { address } = req.body;
+        
+        if (!address) {
+            return res.status(400).json({
+                success: false,
+                error: 'Address is required'
+            });
+        }
+
+        const balance = wallet.getBalance(address);
+        res.json({
+            success: true,
+            address: address,
+            balance: balance,
+            currency: config.coinSymbol
+        });
     } catch (error) {
         res.status(500).json({
             success: false,
@@ -375,7 +427,7 @@ app.post('/api/wallet/import', (req, res) => {
 });
 
 // ============================================
-// HASH ENDPOINTS (NEW)
+// HASH ENDPOINTS
 // ============================================
 
 // 1. SHA-256
@@ -487,7 +539,7 @@ app.post('/api/hash/bip39', (req, res) => {
 });
 
 // ============================================
-// CHECKSUM ENDPOINTS (NEW)
+// CHECKSUM ENDPOINTS
 // ============================================
 
 // 1. Verify address checksum
@@ -547,7 +599,7 @@ app.post('/api/checksum/verify-tx', (req, res) => {
 });
 
 // ============================================
-// ENCODING ENDPOINTS (NEW)
+// ENCODING ENDPOINTS
 // ============================================
 
 // 1. Encode to Base58Check
@@ -574,7 +626,7 @@ app.post('/api/decode/base58', (req, res) => {
             return res.status(400).json({ success: false, error: 'Address is required' });
         }
         const decoded = encoding.base58CheckDecode(address);
-        res.json({ success: true, decoded: decoded });
+        res.json({ success: true, decoded: decoded.toString('hex') });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
@@ -615,7 +667,7 @@ app.post('/api/encode/bech32', (req, res) => {
 });
 
 // ============================================
-// VALIDATION ENDPOINTS (NEW)
+// VALIDATION ENDPOINTS
 // ============================================
 
 // 1. Validate transaction
