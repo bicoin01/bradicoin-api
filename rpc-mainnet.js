@@ -26,7 +26,7 @@ const CONFIG = {
     network: 'mainnet',
     networkName: 'Bradicoin',
     symbol: 'BRD',              // Token symbol: BRD
-    chainId: '0x1',
+    chainId: '0x13158',
     rpcPort: 8545,
     rpcHost: '0.0.0.0',
     dataDir: './bradicoin-data',
