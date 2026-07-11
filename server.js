@@ -1207,6 +1207,66 @@ app.get('/api/config', (req, res) => {
 });
 
 // ============================================
+// JSON-RPC ENDPOINT (para Chainlist)
+// ============================================
+app.post('/rpc', (req, res) => {
+    try {
+        const { jsonrpc, method, params, id } = req.body;
+        
+        if (jsonrpc !== '2.0') {
+            return res.status(400).json({
+                jsonrpc: '2.0',
+                error: { code: -32600, message: 'Invalid Request' },
+                id: id || null
+            });
+        }
+
+        switch(method) {
+            case 'eth_chainId':
+                return res.json({
+                    jsonrpc: '2.0',
+                    result: '0x' + config.chainId.toString(16),
+                    id: id
+                });
+                
+            case 'net_version':
+                return res.json({
+                    jsonrpc: '2.0',
+                    result: String(config.chainId),
+                    id: id
+                });
+                
+            case 'eth_blockNumber':
+                return res.json({
+                    jsonrpc: '2.0',
+                    result: '0x0',
+                    id: id
+                });
+                
+            case 'web3_clientVersion':
+                return res.json({
+                    jsonrpc: '2.0',
+                    result: `${config.coinName}/v2.0`,
+                    id: id
+                });
+                
+            default:
+                return res.json({
+                    jsonrpc: '2.0',
+                    error: { code: -32601, message: 'Method not found' },
+                    id: id
+                });
+        }
+    } catch (error) {
+        res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: error.message },
+            id: req.body?.id || null
+        });
+    }
+});
+
+// ============================================
 // 404 HANDLER - Route not found
 // ============================================
 app.use((req, res) => {
