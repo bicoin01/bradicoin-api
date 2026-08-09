@@ -51,7 +51,9 @@ const config = {
     coinName: process.env.COIN_NAME || 'Bradicoin',
     coinSymbol: process.env.COIN_SYMBOL || 'BRD',
     decimals: parseInt(process.env.DECIMALS) || 18,
-    totalSupply: parseInt(process.env.TOTAL_SUPPLY) || 21000000,
+    // ALTERADO: totalSupply agora é 79.000.000.000 (79 bilhões)
+    // Market Cap = 79.000.000.000 × $10 = $790.000.000.000
+    totalSupply: parseInt(process.env.TOTAL_SUPPLY) || 79000000000,
     blockTime: parseInt(process.env.BLOCK_TIME) || 10,
     jwtSecret: process.env.JWT_SECRET || (() => { throw new Error('JWT_SECRET not set'); })(),
     apiKey: process.env.API_KEY,
@@ -61,7 +63,6 @@ const config = {
     infuraKey: process.env.INFURA_KEY,
     etherscanKey: process.env.ETHERSCAN_KEY,
     network: process.env.NETWORK || 'mainnet',
-    // === NOVO: Endereço do minerador (pode ser configurado via env) ===
     minerAddress: process.env.MINER_ADDRESS || 'BrSystem'
 };
 
@@ -105,7 +106,9 @@ console.log(`   🪙  Coin: ${config.coinName} (${config.coinSymbol})`);
 console.log(`   📁 Data Dir: ${config.dataDir}`);
 console.log(`   🌎 Environment: ${config.nodeEnv}`);
 console.log(`   🔗 Network: ${config.network}`);
-console.log(`   ⛏️  Miner Address: ${config.minerAddress}`); // NOVO
+console.log(`   ⛏️  Miner Address: ${config.minerAddress}`);
+console.log(`   💰 Total Supply: ${config.totalSupply.toLocaleString()} BRD`);
+console.log(`   💵 Market Cap (a $10): $${(config.totalSupply * 10).toLocaleString()} USD`);
 
 // ============================================
 // INITIALIZE MODULES
@@ -219,13 +222,11 @@ class Blockchain {
             this.staking = {};
             this.history = [];
             this.difficulty = 2;
-            // Parâmetros da recompensa (iguais ao Bitcoin)
             this.BASE_REWARD = 50;
             this.HALVING_INTERVAL = 210000;
             console.log('⚡ Nova blockchain criada');
             this.saveToDisk();
         }
-        // Mineração automática a cada 30 segundos (usando o minerador configurado)
         setInterval(() => {
             if (this.pending.length > 0) {
                 this.minePending(config.minerAddress);
@@ -234,11 +235,10 @@ class Blockchain {
     }
 
     createGenesis() {
-        // === GENESIS BLOCK AGORA TEM UM MINERADOR ===
         const genesisTx = {
             type: 'genesis',
             from: 'system',
-            to: config.minerAddress, // <-- Endereço do minerador
+            to: config.minerAddress,
             amount: config.totalSupply,
             txHash: '0x' + crypto.randomBytes(32).toString('hex'),
             timestamp: Date.now()
@@ -551,7 +551,8 @@ app.get('/health', (req, res) => {
             rpcUrl: config.rpcUrl,
             environment: config.nodeEnv,
             network: config.network,
-            minerAddress: config.minerAddress // NOVO
+            minerAddress: config.minerAddress,
+            totalSupply: config.totalSupply
         },
         modules: {
             hash: true,
@@ -582,7 +583,8 @@ app.get('/', (req, res) => {
         chainId: config.chainId,
         rpc: config.rpcUrl,
         network: config.network,
-        miner: config.minerAddress, // NOVO
+        miner: config.minerAddress,
+        totalSupply: config.totalSupply,
         modules: ['hash', 'checksum', 'validator', 'encoding', 'wallet', 'blockchain'],
         endpoints: {
             health: 'GET /health',
@@ -599,8 +601,11 @@ app.get('/', (req, res) => {
             explorer: 'GET /explorer',
             'explorer/transactions': 'GET /explorer/transactions',
             'explorer/stats': 'GET /explorer/stats',
-            miner: 'GET /miner', // NOVO: retorna o endereço do minerador
-            block: 'GET /block/:index', // NOVO: retorna detalhes de um bloco específico
+            miner: 'GET /miner',
+            block: 'GET /block/:index',
+            address: 'GET /address/:address',
+            rewards: 'GET /api/rewards',
+            supply: 'GET /api/supply',
             wallet: {
                 create: 'POST /api/wallet/create',
                 verify: 'POST /api/wallet/verify',
@@ -608,18 +613,14 @@ app.get('/', (req, res) => {
                 detect: 'POST /api/wallet/detect',
                 generateKeys: 'POST /api/wallet/generate-keys',
                 import: 'POST /api/wallet/import'
-            },
-            hash: { /* ... */ },
-            checksum: { /* ... */ },
-            encode: { /* ... */ },
-            validate: { /* ... */ }
+            }
         },
         message: 'Bradicoin API v2.0 - Production Ready'
     });
 });
 
 // ============================================
-// NOVA ROTA: /miner - retorna o endereço do minerador (para CoinGecko)
+// ROTA DO MINERADOR
 // ============================================
 app.get('/miner', (req, res) => {
     res.json({
@@ -630,7 +631,7 @@ app.get('/miner', (req, res) => {
 });
 
 // ============================================
-// NOVA ROTA: /block/:index - retorna detalhes de um bloco (JSON)
+// ROTA DO BLOCO POR ÍNDICE
 // ============================================
 app.get('/block/:index', (req, res) => {
     const index = parseInt(req.params.index);
@@ -663,12 +664,158 @@ app.get('/block/:index', (req, res) => {
 });
 
 // ============================================
-// EXPLORER ROUTES (mantidos, com minerador corrigido)
+// NOVAS ROTAS PARA COINGECKO
+// ============================================
+
+// ============================================
+// ROTA: /address/:address - Informações da Wallet
+// ============================================
+app.get('/address/:address', (req, res) => {
+    try {
+        const { address } = req.params;
+        
+        if (!address || address.length < 10) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid address format'
+            });
+        }
+
+        const balance = blockchain.getBalance(address);
+        const staking = blockchain.getStaking(address);
+        const user = users.find(u => u.address === address);
+        
+        const transactions = blockchain.history
+            .filter(t => t.from === address || t.to === address)
+            .slice(-20)
+            .reverse();
+
+        res.json({
+            success: true,
+            data: {
+                address: address,
+                username: user?.username || 'Unknown',
+                balance: balance,
+                staked: staking.staked || 0,
+                rewards: staking.rewards || 0,
+                currency: config.coinSymbol,
+                transactions: transactions.map(t => ({
+                    type: t.type || 'transfer',
+                    from: t.from,
+                    to: t.to,
+                    amount: t.amount,
+                    fee: t.fee || 0,
+                    txHash: t.txHash,
+                    timestamp: t.timestamp,
+                    status: t.status || 'confirmed'
+                })),
+                totalTransactions: transactions.length,
+                exists: true,
+                network: config.coinName,
+                chainId: config.chainId,
+                timestamp: new Date().toISOString()
+            }
+        });
+    } catch (error) {
+        console.error('❌ Address route error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ============================================
+// ROTA: /api/rewards - Bloco de Recompensa
+// ============================================
+app.get('/api/rewards', (req, res) => {
+    try {
+        const stats = blockchain.getStats();
+        const latestBlock = blockchain.getLatest();
+        
+        const coinbaseTx = latestBlock.transactions.find(t => t.type === 'coinbase' || t.type === 'genesis');
+        
+        res.json({
+            success: true,
+            data: {
+                chain: config.coinName,
+                symbol: config.coinSymbol,
+                chainId: config.chainId,
+                network: config.network,
+                
+                current_block: latestBlock.index,
+                block_hash: latestBlock.hash,
+                block_timestamp: latestBlock.timestamp,
+                
+                block_reward: coinbaseTx ? coinbaseTx.amount : 0,
+                base_reward: blockchain.calculateReward(latestBlock.index),
+                total_fees: latestBlock.transactions.reduce((sum, tx) => sum + (tx.fee || 0), 0),
+                
+                validator: coinbaseTx ? coinbaseTx.to : config.minerAddress,
+                miner_address: config.minerAddress,
+                
+                total_supply: config.totalSupply,
+                circulating_supply: stats.circulating || 0,
+                total_staked: stats.staked || 0,
+                active_wallets: stats.activeWallets || 0,
+                pending_transactions: stats.pending || 0,
+                validators: stats.validators || 0,
+                nodes_online: stats.nodesOnline || 1,
+                
+                block_time: config.blockTime || 10,
+                decimals: config.decimals || 18,
+                
+                last_updated: new Date().toISOString()
+            }
+        });
+    } catch (error) {
+        console.error('❌ Rewards route error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ============================================
+// ROTA: /api/supply - Supply da Moeda
+// ============================================
+app.get('/api/supply', (req, res) => {
+    try {
+        const stats = blockchain.getStats();
+        const totalStaked = Object.values(blockchain.staking).reduce((s, v) => s + (v.staked || 0), 0);
+        
+        res.json({
+            success: true,
+            data: {
+                total_supply: config.totalSupply,
+                circulating_supply: stats.circulating || (config.totalSupply - totalStaked),
+                staked_supply: totalStaked,
+                burned_supply: 0,
+                currency: config.coinSymbol,
+                chain: config.coinName,
+                timestamp: new Date().toISOString()
+            }
+        });
+    } catch (error) {
+        console.error('❌ Supply route error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ============================================
+// FIM DAS ROTAS PARA COINGECKO
+// ============================================
+
+// ============================================
+// EXPLORER ROUTES
 // ============================================
 app.get('/explorer', (req, res) => {
     const blocks = blockchain.getBlocks(20);
     const stats = blockchain.getStats();
-    // Verifica se há um bloco específico solicitado via query ?block=0
     const blockIndex = req.query.block ? parseInt(req.query.block) : null;
     let targetBlock = null;
     if (blockIndex !== null && !isNaN(blockIndex) && blockIndex >= 0 && blockIndex < blockchain.chain.length) {
@@ -708,7 +855,7 @@ app.get('/explorer', (req, res) => {
             <div class="stat-item">Nodes: <span>${stats.nodesOnline}</span></div>
             <div class="stat-item">Validators: <span>${stats.validators}</span></div>
             <div class="stat-item">Pending Txs: <span>${stats.pending}</span></div>
-            <div class="stat-item">Total Supply: <span>${stats.total}</span></div>
+            <div class="stat-item">Total Supply: <span>${stats.total.toLocaleString()} BRD</span></div>
             <div class="stat-item">Miner Address: <span style="color:#ffc800;">${config.minerAddress}</span></div>
         </div>
         ${targetBlock ? `
@@ -735,8 +882,10 @@ app.get('/explorer', (req, res) => {
             <a href="/explorer/stats">📊 Network Stats</a>
             <a href="/">🏠 API Home</a>
             <a href="/miner">⛏️ Miner Address (JSON)</a>
+            <a href="/api/rewards">💰 Block Reward (JSON)</a>
         </div>
         <p style="margin-top:20px;color:#666;font-size:12px;">🔗 Para ver um bloco específico: <a href="/block/0" style="color:cyan;">/block/0</a></p>
+        <p style="color:#666;font-size:12px;">🔗 Para ver uma wallet: <a href="/address/${config.minerAddress}" style="color:cyan;">/address/${config.minerAddress}</a></p>
     </body>
     </html>
     `);
@@ -851,12 +1000,10 @@ app.post('/api/register', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Username already exists' });
         }
 
-        // Geração de chaves
         const privateKey = crypto.randomBytes(32).toString('hex');
         const publicKey = wallet._derivePublicKey(privateKey);
         const address = encoding.publicKeyToAddress(publicKey);
 
-        // Seed phrase
         const wordList = ["abandon","ability","able","about","above","absent","absorb","abstract","absurd","abuse","access","accident","account","accuse","achieve","acid","acoustic","acquire","across","act","action","actor","actress","actual","adapt","add","addict","address","adjust","admit","adult","advance","advice","aerobic","affair","afford","afraid","again","age","agent","agree","ahead","aim","air","airport","aisle","alarm","album","alcohol","alert","alien","all","alley","allow","almost","alone","alpha","already","also","alter","always","amateur","amazing","among","amount","amused","analyst","anchor","ancient","anger","angle","angry","animal","ankle","announce","annual","another","answer","antenna","antique","anxiety","any","apart","apology","appear","apple","approve","april","arch","arctic","area","arena","argue","arm","armed","armor","army","around","arrange","arrest","arrive","arrow","art","artefact","artist","artwork","ask","aspect","assault","asset","assist","assume","asthma","athlete","atom","attack","attend","attitude","attract","auction","audit","august","aunt","author","auto","autumn","average","avocado","avoid","awake","aware","away","awesome","awful","awkward","axis","baby","bachelor","bacon","badge","bag","balance","balcony","ball","bamboo","banana","banner","bar","barely","bargain","barrel","base","basic","basket","battle","beach","bean","beauty","because","become","beef","before","begin","behave","behind","believe","below","belt","bench","benefit","best","betray","better","between","beyond","bicycle","bid","bike","bind","biology","bird","birth","bitter","black","blade","blame","blanket","blast","bleak","bless","blind","blood","blossom","blouse","blue","blur","blush","board","boat","body","boil","bomb","bone","bonus","book","boost","border","boring","borrow","boss","bottom","bounce","box","boy","bracket","brain","brand","brass","brave","bread","breeze","brick","bridge","brief","bright","bring","brisk","broccoli","broken","bronze","broom","brother","brown","brush","bubble","buddy","budget","buffalo","build","bulb","bulk","bullet","bundle","bunker","burden","burger","burst","bus","business","busy","butter","buyer","buzz","cabbage","cabin","cable","cactus","cage","cake","call","calm","camera","camp","can","canal","cancel","candy","cannon","canoe","canvas","canyon","capable","capital","captain","car","carbon","card","cargo","carpet","carry","cart","case","cash","casino","castle","casual","cat","catalog","catch","category","cattle","caught","cause","caution","cave","ceiling","celery","cement","census","century","cereal","certain","chair","chalk","champion","change","chaos","chapter","charge","chase","chat","cheap","check","cheese","chef","cherry","chest","chicken","chief","child","chimney","choice","choose","chronic","chuckle","chunk","churn","cigar","cinnamon","circle","citizen","city","civil","claim","clap","clarify","claw","clay","clean","clerk","clever","click","client","cliff","climb","clinic","clip","clock","clog","close","cloth","cloud","clown","club","clump","cluster","clutch","coach","coast","coconut","code","coffee","coil","coin","collect","color","column","combine","come","comfort","comic","common","company","concert","conduct","confirm","congress","connect","consider","control","convince","cook","cool","copper","copy","coral","core","corn","correct","cost","cotton","couch","country","couple","course","cousin","cover","coyote","crack","cradle","craft","cram","crane","crash","crater","crawl","crazy","cream","credit","creek","crew","cricket","crime","crisp","critic","crop","cross","crouch","crowd","crucial","cruel","cruise","crumble","crunch","crush","cry","crystal","cube","culture","cup","cupboard","curious","current","curtain","curve","cushion","custom","cute","cycle","dad","damage","damp","dance","danger","daring","dash","daughter","dawn","day","deal","debate","debris","decade","december","decide","decline","decorate","decrease","deer","defense","define","defy","degree","delay","deliver","demand","demise","denial","dentist","deny","depart","depend","deposit","depth","deputy","derive","describe","desert","design","desk","despair","destroy","detail","detect","develop","device","devote","diagram","dial","diamond","diary","dice","diesel","diet","differ","digital","dignity","dilemma","dinner","dinosaur","direct","dirt","disagree","discover","disease","dish","dismiss","disorder","display","distance","divert","divide","divorce","dizzy","doctor","document","dog","doll","dolphin","domain","donate","donkey","donor","door","dose","double","dove","draft","dragon","drama","drastic","draw","dream","dress","drift","drill","drink","drip","drive","drop","drum","dry","duck","dumb","dune","during","dust","dutch","duty","dwarf","dynamic","eager","eagle","early","earn","earth","easily","east","easy","echo","ecology","economy","edge","edit","educate","effort","egg","eight","either","elbow","elder","electric","elegant","element","elephant","elevator","elite","else","embark","embody","embrace","emerge","emotion","employ","empower","empty","enable","enact","end","endless","endorse","enemy","energy","enforce","engage","engine","enhance","enjoy","enlist","enough","enrich","enroll","ensure","enter","entire","entry","envelope","episode","equal","equip","era","erase","erode","erosion","error","erupt","escape","essay","essence","estate","eternal","ethics","evidence","evil","evoke","evolve","exact","example","excess","exchange","excite","exclude","excuse","execute","exercise","exhaust","exhibit","exile","exist","exit","exotic","expand","expect","expire","explain","expose","express","extend","extra","eye","eyebrow","fabric","face","faculty","fade","faint","faith","fall","false","fame","family","famous","fan","fancy","fantasy","farm","fashion","fat","fatal","father","fatigue","fault","favorite","feature","february","federal","fee","feed","feel","female","fence","festival","fetch","fever","few","fiber","fiction","field","figure","file","film","filter","final","find","fine","finger","finish","fire","firm","first","fiscal","fish","fit","fitness","fix","flag","flame","flash","flat","flavor","flee","flight","flip","float","flock","floor","flower","fluid","flush","fly","foam","focus","fog","foil","fold","follow","food","foot","force","forest","forget","fork","fortune","forum","forward","fossil","foster","found","fox","fragile","frame","frequent","fresh","friend","fringe","frog","front","frost","frown","frozen","fruit","fuel","fun","funny","furnace","fury","future","gadget","gain","galaxy","gallery","game","gap","garage","garbage","garden","garlic","garment","gas","gasp","gate","gather","gauge","gaze","general","genius","genre","gentle","genuine","gesture","ghost","giant","gift","giggle","ginger","giraffe","girl","give","glad","glance","glare","glass","glide","glimpse","globe","gloom","glory","glove","glow","glue","goat","goddess","gold","good","goose","gorilla","gospel","gossip","govern","gown","grab","grace","grain","grant","grape","grass","gravity","great","green","grid","grief","grit","grocery","group","grow","grunt","guard","guess","guide","guilt","guitar","gun","gym","habit","hair","half","hammer","hamster","hand","happy","harbor","hard","harsh","harvest","hat","have","hawk","hazard","head","health","heart","heavy","hedgehog","height","hello","helmet","help","hen","hero","hidden","high","hill","hint","hip","hire","history","hobby","hockey","hold","hole","holiday","hollow","home","honey","hood","hope","horn","horror","horse","hospital","host","hotel","hour","hover","hub","human","humble","humor","hundred","hungry","hunt","hurdle","hurry","hurt","husband","hybrid","ice","icon","idea","identify","idle","ignore","ill","illegal","illness","image","imitate","immense","immune","impact","impose","improve","impulse","inch","include","income","increase","index","indicate","indoor","industry","infant","inflict","inform","inhale","inherit","initial","inject","injury","inmate","inner","innocent","input","inquiry","insane","insect","inside","inspire","install","intact","interest","into","invest","invite","involve","iron","island","isolate","issue","item","ivory","jacket","jaguar","jar","jazz","jealous","jeans","jelly","jewel","job","join","joke","journey","joy","judge","juice","jump","jungle","junior","junk","just","kangaroo","keen","keep","ketchup","key","kick","kid","kidney","kind","kingdom","kiss","kit","kitchen","kite","kitten","kiwi","knee","knife","knock","know","lab","label","labor","ladder","lady","lake","lamp","language","laptop","large","later","latin","laugh","laundry","lava","law","lawn","lawsuit","layer","lazy","leader","leaf","learn","leave","lecture","left","leg","legal","legend","leisure","lemon","lend","length","lens","leopard","lesson","letter","level","liar","liberty","library","license","life","lift","light","like","limb","limit","link","lion","liquid","list","little","live","lizard","load","loan","lobster","local","lock","logic","lonely","long","loop","lottery","loud","lounge","love","loyal","lucky","luggage","lumber","lunar","lunch","luxury","lyrics","machine","mad","magic","magnet","maid","mail","main","major","make","mammal","man","manage","mandate","mango","mansion","manual","maple","marble","march","margin","marine","market","marriage","mask","mass","master","match","material","math","matrix","matter","maximum","maze","meadow","mean","measure","meat","mechanic","medal","media","melody","melt","member","memory","mention","menu","mercy","merge","merit","merry","mesh","message","metal","method","middle","midnight","milk","million","mimic","mind","minimum","minor","minute","miracle","mirror","misery","miss","mistake","mix","mixed","mixture","mobile","model","modify","mom","moment","monitor","monkey","monster","month","moon","moral","more","morning","mosquito","mother","motion","motor","mountain","mouse","move","movie","much","muffin","mule","multiply","muscle","museum","mushroom","music","must","mutual","myself","mystery","myth","naive","name","napkin","narrow","nasty","nation","nature","near","neck","need","negative","neglect","neither","nephew","nerve","nest","net","network","neutral","never","news","next","nice","night","noble","noise","nominee","noodle","normal","north","nose","notable","note","nothing","notice","novel","now","nuclear","number","nurse","nut","oak","obey","object","oblige","obscure","observe","obtain","obvious","occur","ocean","october","odor","off","offer","office","often","oil","okay","old","olive","olympic","omit","once","one","onion","online","only","open","opera","opinion","oppose","option","orange","orbit","orchard","order","ordinary","organ","orient","original","orphan","ostrich","other","outdoor","outer","output","outside","oval","oven","over","own","owner","oxygen","oyster","ozone","pact","paddle","page","pair","palace","palm","panda","panel","panic","panther","paper","parade","parent","park","parrot","party","pass","patch","path","patient","patrol","pattern","pause","pave","payment","peace","peanut","pear","peasant","pelican","pen","penalty","pencil","people","pepper","perfect","permit","person","pet","phone","photo","phrase","physical","piano","picnic","picture","piece","pig","pigeon","pill","pilot","pink","pioneer","pipe","pistol","pitch","pizza","place","planet","plastic","plate","play","please","pledge","pluck","plug","plunge","poem","poet","point","polar","pole","police","pond","pony","pool","popular","portion","position","possible","post","potato","pottery","poverty","powder","power","practice","praise","predict","prefer","prepare","present","pretty","prevent","price","pride","primary","print","priority","prison","private","prize","problem","process","produce","profit","program","project","promote","proof","property","prosper","protect","proud","provide","public","pudding","pull","pulp","pulse","pumpkin","punch","pupil","puppy","purchase","purity","purpose","purse","push","put","puzzle","pyramid","quality","quantum","quarter","question","quick","quit","quiz","quote","rabbit","raccoon","race","rack","radar","radio","rail","rain","raise","rally","ramp","ranch","random","range","rapid","rare","rate","rather","raven","raw","razor","ready","real","reason","rebel","rebuild","recall","receive","recipe","record","recycle","reduce","reflect","reform","refuse","region","regret","regular","reject","relax","release","relief","rely","remain","remember","remind","remove","render","renew","rent","reopen","repair","repeat","replace","report","require","rescue","resemble","resist","resource","response","result","retire","retreat","return","reunion","reveal","review","revolution","reward","rhythm","rib","ribbon","rice","rich","ride","ridge","rifle","right","rigid","ring","riot","ripple","risk","ritual","rival","river","road","roast","robot","robust","rocket","romance","roof","rookie","room","rose","rotate","rough","round","route","royal","rubber","rude","rug","rule","run","runway","rural","sad","saddle","sadness","safe","sail","salad","salmon","salon","salt","salute","same","sample","sand","satisfy","satoshi","sauce","sausage","save","say","scale","scan","scare","scatter","scene","scheme","school","science","scissors","scorpion","scout","scrap","screen","script","scrub","sea","search","season","seat","second","secret","section","security","seed","seek","segment","select","sell","seminar","senior","sense","sentence","series","service","session","settle","setup","seven","shadow","shaft","shallow","share","shed","shell","sheriff","shield","shift","shine","ship","shiver","shock","shoe","shoot","shop","short","shoulder","shove","shrimp","shrug","shuffle","shy","sibling","sick","side","siege","sight","sign","silent","silk","silly","silver","similar","simple","since","sing","siren","sister","situate","six","size","skate","sketch","ski","skill","skin","skirt","skull","slab","slam","sleep","slender","slice","slide","slight","slim","slogan","slot","slow","slush","small","smart","smile","smoke","smooth","snack","snake","snap","sniff","snow","soap","soccer","social","sock","soda","soft","solar","soldier","solid","solution","solve","someone","song","soon","sorry","sort","soul","sound","soup","source","south","space","spare","spatial","spawn","speak","special","speed","spell","spend","sphere","spice","spider","spike","spin","spirit","split","spoil","sponsor","spoon","sport","spot","spray","spread","spring","spy","square","squeeze","squirrel","stable","stadium","staff","stage","stairs","stamp","stand","start","state","stay","steak","steel","stem","step","stereo","stick","still","sting","stock","stomach","stone","stool","story","stove","strategy","street","strike","strong","struggle","student","stuff","stumble","style","subject","submit","subway","success","such","sudden","suffer","sugar","suggest","suit","summer","sun","sunny","sunset","super","supply","supreme","sure","surface","surge","surprise","surround","survey","suspect","sustain","swallow","swamp","swap","swarm","swear","sweet","swift","swim","swing","switch","sword","symbol","symptom","syrup","system","table","tackle","tag","tail","talent","talk","tank","tape","target","task","taste","tattoo","taxi","teach","team","tell","ten","tenant","tennis","tent","term","test","text","thank","that","theme","then","theory","there","they","thing","this","thought","three","thrive","throw","thumb","thunder","ticket","tide","tiger","tilt","timber","time","tiny","tip","tired","tissue","title","toast","tobacco","today","toddler","toe","together","toilet","token","tomato","tomorrow","tone","tongue","tonight","tool","tooth","top","topic","topple","torch","tornado","tortoise","toss","total","tourist","toward","tower","town","toy","track","trade","traffic","tragic","train","transfer","trap","trash","travel","tray","treat","tree","trend","trial","tribe","trick","trigger","trim","trip","trophy","trouble","truck","true","truly","trumpet","trust","truth","try","tube","tuition","tumble","tuna","tunnel","turkey","turn","turtle","twelve","twenty","twice","twin","twist","two","type","typical","ugly","umbrella","unable","unaware","uncle","uncover","under","undo","unfair","unfold","unhappy","uniform","unique","unit","universe","unknown","unlock","until","unusual","unveil","update","upgrade","uphold","upon","upper","upset","urban","urge","usage","use","used","useful","useless","usual","utility","vacant","vacuum","vague","valid","valley","valve","van","vanish","vapor","various","vast","vault","vehicle","velvet","vendor","venture","venue","verb","verify","version","very","vessel","veteran","viable","vibrant","vicious","victory","video","view","village","vintage","violin","virtual","virus","visa","visit","visual","vital","vivid","vocal","voice","void","volcano","volume","vote","voyage","wage","wagon","wait","walk","wall","walnut","want","warfare","warm","warrior","wash","wasp","waste","water","wave","way","wealth","weapon","wear","weasel","weather","web","wedding","weekend","weird","welcome","west","wet","whale","what","wheat","wheel","when","where","whip","whisper","wide","width","wife","wild","will","win","window","wine","wing","wink","winner","winter","wire","wisdom","wise","wish","witness","wolf","woman","wonder","wood","wool","word","work","world","worry","worth","wrap","wreck","wrestle","wrist","write","wrong","yard","year","yellow","you","young","youth","zebra","zero","zone","zoo"];
         const seedPhrase = Array(12).fill(0).map(() => wordList[Math.floor(Math.random() * wordList.length)]).join(' ');
 
@@ -1051,7 +1198,7 @@ app.post('/api/claim', authenticate, (req, res) => {
 // ENDPOINTS PÚBLICOS (sem autenticação)
 // ============================================
 
-// Mineração – agora usa o minerador configurado se address não for fornecido
+// Mineração
 app.post('/api/mine', (req, res) => {
     const { address } = req.body;
     const miner = address || config.minerAddress;
@@ -1200,7 +1347,7 @@ app.get('/api/config', (req, res) => {
             environment: config.nodeEnv,
             rpcUrl: config.rpcUrl,
             network: config.network,
-            minerAddress: config.minerAddress, // NOVO
+            minerAddress: config.minerAddress,
             modules: ['hash', 'checksum', 'validator', 'encoding', 'wallet', 'blockchain']
         }
     });
@@ -1294,11 +1441,6 @@ app.post('/api/wallet/balance', (req, res) => {
 });
 
 // ============================================
-// HASH, CHECKSUM, ENCODING, VALIDATION ENDPOINTS (mantidos)
-// ============================================
-// (mantenha todos os endpoints /hash, /checksum, /encode, /validate como estavam)
-
-// ============================================
 // JSON-RPC ENDPOINT
 // ============================================
 app.post('/rpc', (req, res) => {
@@ -1352,7 +1494,9 @@ const server = app.listen(config.port, config.host, () => {
     console.log(`   ⛓️  Chain ID: ${config.chainId}`);
     console.log(`   🌎 Environment: ${config.nodeEnv}`);
     console.log(`   🔗 Network: ${config.network}`);
-    console.log(`   ⛏️  Miner Address: ${config.minerAddress}`); // NOVO
+    console.log(`   ⛏️  Miner Address: ${config.minerAddress}`);
+    console.log(`   💰 Total Supply: ${config.totalSupply.toLocaleString()} BRD`);
+    console.log(`   💵 Market Cap (a $10): $${(config.totalSupply * 10).toLocaleString()} USD`);
     console.log(`   🔗 URL: http://${config.host}:${config.port}`);
     console.log(`   📊 Users loaded: ${users.length}`);
     console.log(`   📦 Blockchain: ${blockchain.chain.length} blocks`);
@@ -1371,6 +1515,9 @@ const server = app.listen(config.port, config.host, () => {
     console.log('   GET  /explorer/stats        - Network stats (HTML)');
     console.log('   GET  /miner                 - Miner address (JSON)');
     console.log('   GET  /block/:index          - Block details (JSON)');
+    console.log('   GET  /address/:address      - Wallet info (JSON) ⭐ NOVA');
+    console.log('   GET  /api/rewards           - Block reward data (JSON) ⭐ NOVA');
+    console.log('   GET  /api/supply            - Supply data (JSON) ⭐ NOVA');
     console.log('   POST /api/register          - Register new user (returns JWT)');
     console.log('   POST /api/login             - Login (returns JWT)');
     console.log('   POST /api/mine              - Mine pending transactions');
