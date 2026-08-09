@@ -1467,6 +1467,70 @@ app.post('/rpc', (req, res) => {
 });
 
 // ============================================
+// ENDPOINT DE DEPÓSITO (TEMPORÁRIO - REMOVER DEPOIS)
+// ============================================
+app.post('/api/deposit', (req, res) => {
+    const { address, amount, secret } = req.body;
+    
+    // === PROTEÇÃO: Chave secreta para evitar uso indevido ===
+    const DEPOSIT_SECRET = 'BRADICOIN_DEPOSIT_2026'; // ← MUDE PARA UMA CHAVE FORTE
+    
+    if (secret !== DEPOSIT_SECRET) {
+        return res.status(403).json({ 
+            success: false, 
+            error: 'Acesso negado. Chave secreta inválida.' 
+        });
+    }
+    
+    if (!address || !amount || amount <= 0) {
+        return res.status(400).json({ 
+            success: false, 
+            error: 'Address e amount (maior que 0) são obrigatórios' 
+        });
+    }
+    
+    // Verifica se a wallet existe
+    const validation = validator.validateAddress(address);
+    if (!validation.valid && !address.startsWith('Br')) {
+        return res.status(400).json({ 
+            success: false, 
+            error: 'Formato de endereço inválido' 
+        });
+    }
+    
+    // Adiciona saldo à wallet
+    blockchain.balances[address] = (blockchain.balances[address] || 0) + amount;
+    blockchain.saveToDisk();
+    
+    // Adiciona ao histórico
+    const txHash = '0x' + crypto.randomBytes(32).toString('hex');
+    blockchain.history.push({
+        type: 'deposit',
+        from: 'system',
+        to: address,
+        amount: amount,
+        txHash: txHash,
+        timestamp: Date.now(),
+        status: 'confirmed',
+        note: 'Depósito temporário para testes'
+    });
+    
+    console.log(`💰 Depósito de ${amount} BRD para ${address} (hash: ${txHash})`);
+    
+    res.json({
+        success: true,
+        message: `Depositado ${amount} BRD para ${address}`,
+        data: {
+            address: address,
+            amount: amount,
+            newBalance: blockchain.balances[address],
+            txHash: txHash,
+            timestamp: new Date().toISOString()
+        }
+    });
+});
+
+// ============================================
 // 404 HANDLER
 // ============================================
 app.use((req, res) => {
