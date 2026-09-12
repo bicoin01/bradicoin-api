@@ -1,145 +1,249 @@
-const SHA256 = require('crypto-js/sha256');
+// blockchain.js
+// ============================================
+// Bradicoin Blockchain - Core
+// ============================================
 
+const SHA256 = require('crypto-js/sha256');
+const mongoose = require('mongoose');
+
+// ============================================
+// SCHEMAS MONGOOSE
+// ============================================
+const TransactionSchema = new mongoose.Schema({
+    fromAddress: { type: String, default: null },
+    toAddress: { type: String, required: true },
+    amount: { type: Number, required: true },
+    timestamp: { type: String, default: () => new Date().toISOString() },
+    hash: { type: String, default: null }
+}, { _id: false });
+
+const BlockSchema = new mongoose.Schema({
+    index: { type: Number, required: true, unique: true, index: true },
+    timestamp: { type: String, required: true },
+    transactions: { type: [TransactionSchema], default: [] },
+    previousHash: { type: String, required: true },
+    hash: { type: String, required: true, index: true },
+    nonce: { type: Number, default: 0 }
+});
+
+const BlockModel = mongoose.model('Block', BlockSchema);
+
+// ============================================
+// CLASSE BLOCK
+// ============================================
 class Block {
     constructor(index, timestamp, transactions, previousHash = '') {
         this.index = index;
         this.timestamp = timestamp;
         this.transactions = transactions;
         this.previousHash = previousHash;
-        this.hash = this.calculateHash();
         this.nonce = 0;
+        this.hash = this.calculateHash();
     }
 
     calculateHash() {
         return SHA256(
-            this.index + 
-            this.previousHash + 
-            this.timestamp + 
-            JSON.stringify(this.transactions) + 
+            this.index +
+            this.previousHash +
+            this.timestamp +
+            JSON.stringify(this.transactions) +
             this.nonce
         ).toString();
     }
 
     mineBlock(difficulty) {
-        const target = Array(difficulty + 1).join("0");
+        const target = Array(difficulty + 1).join('0');
         while (this.hash.substring(0, difficulty) !== target) {
             this.nonce++;
             this.hash = this.calculateHash();
         }
-        console.log(`Block mined: ${this.hash}`);
+    }
+
+    toObject() {
+        return {
+            index: this.index,
+            timestamp: this.timestamp,
+            transactions: this.transactions,
+            previousHash: this.previousHash,
+            hash: this.hash,
+            nonce: this.nonce
+        };
     }
 }
 
+// ============================================
+// CLASSE BLOCKCHAIN
+// ============================================
 class Blockchain {
     constructor() {
-        this.chain = [this.createGenesisBlock()];
+        this.chain = [];
         this.difficulty = 4;
         this.pendingTransactions = [];
         this.miningReward = 100;
+        this.initialized = false;
+    }
+
+    // ============================================
+    // INICIALIZAÇÃO (conecta no Mongo)
+    // ============================================
+    async initialize() {
+        if (this.initialized) return;
+
+        try {
+            // Conecta no Mongo (se ainda não conectado)
+            if (mongoose.connection.readyState === 0) {
+                await mongoose.connect(process.env.MONGO_URI);
+                console.log('✅ MongoDB conectado (blockchain)');
+            }
+
+            // Carrega a chain do banco
+            const blocks = await BlockModel.find().sort({ index: 1 }).lean();
+
+            if (blocks.length === 0) {
+                // Cria genesis block
+                const genesis = this.createGenesisBlock();
+                await BlockModel.create(genesis.toObject());
+                this.chain = [genesis];
+                console.log('🌱 Genesis block criado');
+            } else {
+                // Reconstrói instâncias de Block a partir do banco
+                this.chain = blocks.map((b) => {
+                    const block = new Block(
+                        b.index,
+                        b.timestamp,
+                        b.transactions,
+                        b.previousHash
+                    );
+                    block.hash = b.hash;
+                    block.nonce = b.nonce;
+                    return block;
+                });
+                console.log(`📦 ${blocks.length} blocos carregados do MongoDB`);
+            }
+
+            this.initialized = true;
+        } catch (error) {
+            console.error('❌ Erro ao inicializar blockchain:', error);
+            throw error;
+        }
     }
 
     createGenesisBlock() {
-        return new Block(0, "01/04/2026", "Genesis Block - Bradicoin", "0");
+        return new Block(
+            0,
+            new Date('2026-01-01T00:00:00Z').toISOString(),
+            [],              // ✅ array vazio (não string!)
+            '0'
+        );
     }
 
     getLatestBlock() {
         return this.chain[this.chain.length - 1];
     }
 
-    addTransaction(transaction) {
-        if (!transaction.toAddress || !transaction.amount) {
-            throw new Error('Transaction must include toAddress and amount');
+    async addTransaction(transaction) {
+        if (!transaction.toAddress || transaction.amount === undefined) {
+            throw new Error('Transação precisa de toAddress e amount');
         }
-        
-        transaction.timestamp = new Date().toISOString();
-        this.pendingTransactions.push(transaction);
-        
+        if (typeof transaction.amount !== 'number' || transaction.amount <= 0) {
+            throw new Error('Amount precisa ser um número positivo');
+        }
+
+        const tx = {
+            fromAddress: transaction.fromAddress || null,
+            toAddress: transaction.toAddress,
+            amount: transaction.amount,
+            timestamp: new Date().toISOString()
+        };
+
+        // Valida saldo se houver remetente
+        if (tx.fromAddress) {
+            const balance = this.getBalance(tx.fromAddress);
+            if (balance < tx.amount) {
+                throw new Error(`Saldo insuficiente: ${balance} < ${tx.amount}`);
+            }
+        }
+
+        this.pendingTransactions.push(tx);
         return this.pendingTransactions.length - 1;
     }
 
-    minePendingTransactions(minerAddress) {
-        // Add mining reward
+    async minePendingTransactions(minerAddress) {
+        // Reward para o minerador
         const rewardTransaction = {
             fromAddress: null,
             toAddress: minerAddress,
             amount: this.miningReward,
             timestamp: new Date().toISOString()
         };
-        
-        this.pendingTransactions.push(rewardTransaction);
-        
+
+        const transactionsToMine = [...this.pendingTransactions, rewardTransaction];
+
         const block = new Block(
             this.getLatestBlock().index + 1,
             new Date().toISOString(),
-            this.pendingTransactions,
+            transactionsToMine,
             this.getLatestBlock().hash
         );
-        
+
         block.mineBlock(this.difficulty);
-        
-        console.log('Block successfully mined!');
+
+        // Persiste no Mongo
+        await BlockModel.create(block.toObject());
+
         this.chain.push(block);
-        
-        // Reset pending transactions
         this.pendingTransactions = [];
-        
+
+        console.log(`⛏️  Bloco ${block.index} minerado: ${block.hash}`);
         return block;
     }
 
     getBalance(address) {
         let balance = 0;
-        
+
         for (const block of this.chain) {
-            for (const transaction of block.transactions) {
-                if (transaction.fromAddress === address) {
-                    balance -= transaction.amount;
-                }
-                
-                if (transaction.toAddress === address) {
-                    balance += transaction.amount;
-                }
+            if (!Array.isArray(block.transactions)) continue;
+
+            for (const tx of block.transactions) {
+                if (tx.fromAddress === address) balance -= tx.amount;
+                if (tx.toAddress === address) balance += tx.amount;
             }
         }
-        
+
         return balance;
     }
 
     getAllTransactionsForAddress(address) {
         const transactions = [];
-        
+
         for (const block of this.chain) {
-            for (const transaction of block.transactions) {
-                if (transaction.fromAddress === address || transaction.toAddress === address) {
-                    transactions.push({
-                        ...transaction,
-                        blockIndex: block.index
-                    });
+            if (!Array.isArray(block.transactions)) continue;
+
+            for (const tx of block.transactions) {
+                if (tx.fromAddress === address || tx.toAddress === address) {
+                    transactions.push({ ...tx, blockIndex: block.index });
                 }
             }
         }
-        
+
         return transactions;
     }
 
-    isChainValid() {
+    isValid() {
         for (let i = 1; i < this.chain.length; i++) {
             const currentBlock = this.chain[i];
             const previousBlock = this.chain[i - 1];
 
-            // Validate current block hash
             if (currentBlock.hash !== currentBlock.calculateHash()) {
-                console.log(`Invalid hash at block ${currentBlock.index}`);
+                console.log(`❌ Hash inválido no bloco ${currentBlock.index}`);
                 return false;
             }
 
-            // Validate previous block link
             if (currentBlock.previousHash !== previousBlock.hash) {
-                console.log(`Invalid previous hash link at block ${currentBlock.index}`);
+                console.log(`❌ Link quebrado no bloco ${currentBlock.index}`);
                 return false;
             }
         }
-        
-        console.log('Blockchain is valid!');
         return true;
     }
 
@@ -152,12 +256,15 @@ class Blockchain {
 
     getLatestBlockInfo() {
         const latestBlock = this.getLatestBlock();
+        if (!latestBlock) return null;
         return {
             index: latestBlock.index,
             hash: latestBlock.hash,
             previousHash: latestBlock.previousHash,
             timestamp: latestBlock.timestamp,
-            transactionsCount: latestBlock.transactions.length,
+            transactionsCount: Array.isArray(latestBlock.transactions)
+                ? latestBlock.transactions.length
+                : 0,
             nonce: latestBlock.nonce
         };
     }
@@ -168,7 +275,7 @@ class Blockchain {
             difficulty: this.difficulty,
             miningReward: this.miningReward,
             pendingTransactionsCount: this.pendingTransactions.length,
-            isValid: this.isChainValid(),
+            isValid: this.isValid(),
             latestBlock: this.getLatestBlockInfo()
         };
     }
@@ -178,8 +285,9 @@ class Blockchain {
     }
 
     clearPendingTransactions() {
+        const count = this.pendingTransactions.length;
         this.pendingTransactions = [];
-        return { message: 'Pending transactions cleared', count: this.pendingTransactions.length };
+        return { message: 'Pending transactions cleared', count };
     }
 
     updateDifficulty(newDifficulty) {
@@ -199,4 +307,7 @@ class Blockchain {
     }
 }
 
-module.exports = Blockchain;
+// ============================================
+// EXPORTA INSTÂNCIA ÚNICA (Singleton)
+// ============================================
+module.exports = new Blockchain();
