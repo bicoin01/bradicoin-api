@@ -1,25 +1,58 @@
 // staking.js
-const crypto = require('crypto');
+// ============================================
+// Bradicoin Blockchain - Staking
+// ============================================
+
+const mongoose = require('mongoose');
 const blockchain = require('./blockchain');
+const wallet = require('./wallet');
+
+const STAKE_POOL_ADDRESS = 'BrSTAKEPOOL000000000000000000000000000000';
+const DEFAULT_APY = parseFloat(process.env.STAKING_APY) || 18;
 
 // ============================================
-// SISTEMA DE STAKING
+// SCHEMA MONGOOSE — STAKE
 // ============================================
+const StakeSchema = new mongoose.Schema({
+    address: { type: String, required: true, unique: true, index: true },
+    staked: { type: Number, default: 0 },
+    rewards: { type: Number, default: 0 },
+    lastUpdate: { type: Number, default: () => Date.now() },
+    history: [{
+        type: { type: String },
+        amount: Number,
+        timestamp: Number
+    }]
+});
 
-let stakingPool = {};
+const StakeModel = mongoose.model('Stake', StakeSchema);
 
 // ============================================
-// CARREGAR DADOS
+// INICIALIZAR
 // ============================================
-function loadStakingData() {
-    try {
-        const data = blockchain.loadFromDisk();
-        if (data && data.stakingPool) {
-            stakingPool = data.stakingPool;
-        }
-    } catch (error) {
-        console.error('Erro ao carregar dados de staking:', error);
+async function initialize() {
+    if (mongoose.connection.readyState === 0) {
+        await mongoose.connect(process.env.MONGO_URI);
     }
+    await StakeModel.init();
+    console.log('✅ Staking inicializado');
+}
+
+// ============================================
+// HELPER — pega (ou cria) registro de stake
+// ============================================
+async function getOrCreate(address) {
+    let doc = await StakeModel.findOne({ address });
+    if (!doc) {
+        doc = await StakeModel.create({
+            address,
+            staked: 0,
+            rewards: 0,
+            lastUpdate: Date.now(),
+            history: []
+        });
+    }
+    return doc;
 }
 
 // ============================================
@@ -30,51 +63,40 @@ async function stake(address, amount) {
         throw new Error('Dados inválidos');
     }
 
-    // Verifica saldo
-    const balance = blockchain.getBalance(address);
-    if (balance < amount) {
-        throw new Error(`Saldo insuficiente: ${balance} < ${amount}`);
+    if (!wallet.isValidAddress(address)) {
+        throw new Error('Endereço inválido');
     }
 
-    // Inicializa pool se não existir
-    if (!stakingPool[address]) {
-        stakingPool[address] = {
-            staked: 0,
-            rewards: 0,
-            lastUpdate: Date.now(),
-            history: []
-        };
+    // Saldo do usuário via wallet (considera pendentes)
+    const balanceInfo = await wallet.getBalance(address);
+    const available = balanceInfo.total;
+
+    if (available < amount) {
+        throw new Error(`Saldo insuficiente: ${available} < ${amount}`);
     }
 
-    // Remove do saldo
-    blockchain.balances[address] = (blockchain.balances[address] || 0) - amount;
-
-    // Adiciona ao staking
-    stakingPool[address].staked += amount;
-    stakingPool[address].lastUpdate = Date.now();
-    stakingPool[address].history.push({
-        type: 'stake',
-        amount,
-        timestamp: Date.now()
-    });
-
-    // Registra transação
+    // Registra a transação de stake (debita o usuário e credita o pool)
     const tx = {
-        from: address,
-        to: null,
+        fromAddress: address,
+        toAddress: STAKE_POOL_ADDRESS,
         amount,
-        type: 'stake',
-        timestamp: Date.now(),
-        hash: crypto.randomBytes(32).toString('hex')
+        timestamp: new Date().toISOString(),
+        type: 'stake'
     };
-    blockchain.addTransaction(tx);
-    blockchain.saveToDisk();
+    await blockchain.addTransaction(tx);
+
+    // Atualiza registro do stake
+    const doc = await getOrCreate(address);
+    doc.staked += amount;
+    doc.lastUpdate = Date.now();
+    doc.history.push({ type: 'stake', amount, timestamp: Date.now() });
+    await doc.save();
 
     return {
         address,
-        staked: stakingPool[address].staked,
-        rewards: stakingPool[address].rewards,
-        total: stakingPool[address].staked + stakingPool[address].rewards
+        staked: doc.staked,
+        rewards: doc.rewards,
+        total: doc.staked + doc.rewards
     };
 }
 
@@ -86,120 +108,131 @@ async function unstake(address, amount) {
         throw new Error('Dados inválidos');
     }
 
-    if (!stakingPool[address]) {
-        throw new Error('Nenhum stake encontrado');
+    const doc = await StakeModel.findOne({ address });
+    if (!doc || doc.staked < amount) {
+        throw new Error(`Stake insuficiente: ${doc ? doc.staked : 0} < ${amount}`);
     }
 
-    if (stakingPool[address].staked < amount) {
-        throw new Error(`Stake insuficiente: ${stakingPool[address].staked} < ${amount}`);
-    }
-
-    // Remove do staking
-    stakingPool[address].staked -= amount;
-    stakingPool[address].lastUpdate = Date.now();
-    stakingPool[address].history.push({
-        type: 'unstake',
-        amount,
-        timestamp: Date.now()
-    });
-
-    // Adiciona ao saldo
-    blockchain.balances[address] = (blockchain.balances[address] || 0) + amount;
-
-    // Registra transação
+    // Registra a transação de unstake (credita de volta ao usuário)
     const tx = {
-        from: null,
-        to: address,
+        fromAddress: STAKE_POOL_ADDRESS,
+        toAddress: address,
         amount,
-        type: 'unstake',
-        timestamp: Date.now(),
-        hash: crypto.randomBytes(32).toString('hex')
+        timestamp: new Date().toISOString(),
+        type: 'unstake'
     };
-    blockchain.addTransaction(tx);
-    blockchain.saveToDisk();
+    await blockchain.addTransaction(tx);
+
+    // Atualiza registro
+    doc.staked -= amount;
+    doc.lastUpdate = Date.now();
+    doc.history.push({ type: 'unstake', amount, timestamp: Date.now() });
+    await doc.save();
 
     return {
         address,
-        staked: stakingPool[address].staked,
-        rewards: stakingPool[address].rewards,
-        total: stakingPool[address].staked + stakingPool[address].rewards
+        staked: doc.staked,
+        rewards: doc.rewards,
+        total: doc.staked + doc.rewards
     };
 }
 
 // ============================================
-// CALCULAR REWARDS
+// CALCULAR REWARDS (APY)
 // ============================================
 async function calculateReward(address) {
-    if (!stakingPool[address]) return 0;
+    const doc = await StakeModel.findOne({ address });
+    if (!doc || doc.staked <= 0) return 0;
 
-    const data = stakingPool[address];
-    const timeElapsed = (Date.now() - data.lastUpdate) / (1000 * 60 * 60 * 24 * 365);
-    const apy = parseFloat(process.env.STAKING_APY) || 18;
-    
-    const reward = data.staked * (apy / 100) * timeElapsed;
+    const timeElapsedYears = (Date.now() - doc.lastUpdate) / (1000 * 60 * 60 * 24 * 365);
+    const reward = doc.staked * (DEFAULT_APY / 100) * timeElapsedYears;
     return reward;
 }
 
 // ============================================
-// DISTRIBUIR REWARDS
+// DISTRIBUIR REWARD
 // ============================================
 async function distributeReward(address, amount) {
-    if (!stakingPool[address]) {
-        stakingPool[address] = { staked: 0, rewards: 0, lastUpdate: Date.now(), history: [] };
-    }
+    if (!amount || amount <= 0) return null;
 
-    stakingPool[address].rewards += amount;
-    stakingPool[address].lastUpdate = Date.now();
-    stakingPool[address].history.push({
-        type: 'reward',
+    // Registra tx de reward (fromAddress: null = vem do sistema)
+    const tx = {
+        fromAddress: null,
+        toAddress: address,
         amount,
-        timestamp: Date.now()
-    });
+        timestamp: new Date().toISOString(),
+        type: 'reward'
+    };
+    await blockchain.addTransaction(tx);
 
-    // Adiciona ao saldo
-    blockchain.balances[address] = (blockchain.balances[address] || 0) + amount;
+    // Atualiza registro
+    const doc = await getOrCreate(address);
+    doc.rewards += amount;
+    doc.lastUpdate = Date.now();
+    doc.history.push({ type: 'reward', amount, timestamp: Date.now() });
+    await doc.save();
 
-    blockchain.saveToDisk();
-    return stakingPool[address];
+    return doc;
 }
 
 // ============================================
-// BUSCAR STAKERS ATIVOS
+// STAKERS ATIVOS
 // ============================================
 async function getActiveStakers() {
-    const active = [];
-    for (const [address, data] of Object.entries(stakingPool)) {
-        if (data.staked > 0) {
-            active.push({
-                address,
-                staked: data.staked,
-                rewards: data.rewards,
-                lastUpdate: data.lastUpdate
-            });
-        }
-    }
-    return active;
+    const docs = await StakeModel.find({ staked: { $gt: 0 } }).lean();
+    return docs.map((d) => ({
+        address: d.address,
+        staked: d.staked,
+        rewards: d.rewards,
+        lastUpdate: d.lastUpdate
+    }));
 }
 
 // ============================================
-// ESTATÍSTICAS DE STAKING
+// BUSCAR STAKE DE UM USUÁRIO
+// ============================================
+async function getStake(address) {
+    const doc = await StakeModel.findOne({ address });
+    if (!doc) {
+        return { address, staked: 0, rewards: 0, total: 0 };
+    }
+    return {
+        address: doc.address,
+        staked: doc.staked,
+        rewards: doc.rewards,
+        total: doc.staked + doc.rewards,
+        lastUpdate: doc.lastUpdate
+    };
+}
+
+// ============================================
+// ALIAS — o server.js chama getRewards
+// ============================================
+async function getRewards(address) {
+    return getStake(address);
+}
+
+// ============================================
+// ESTATÍSTICAS GLOBAIS
 // ============================================
 async function getStakingStats() {
+    const docs = await StakeModel.find().lean();
+
     let totalStaked = 0;
     let totalRewards = 0;
     let activeStakers = 0;
 
-    for (const data of Object.values(stakingPool)) {
-        totalStaked += data.staked || 0;
-        totalRewards += data.rewards || 0;
-        if (data.staked > 0) activeStakers++;
+    for (const d of docs) {
+        totalStaked += d.staked || 0;
+        totalRewards += d.rewards || 0;
+        if (d.staked > 0) activeStakers++;
     }
 
     return {
         totalStaked,
         totalRewards,
         activeStakers,
-        apy: parseFloat(process.env.STAKING_APY) || 18
+        apy: DEFAULT_APY
     };
 }
 
@@ -207,11 +240,15 @@ async function getStakingStats() {
 // EXPORTA
 // ============================================
 module.exports = {
+    initialize,            // ✅ server.js precisa
     stake,
     unstake,
     calculateReward,
     distributeReward,
     getActiveStakers,
+    getStake,
+    getRewards,            // ✅ server.js precisa (rota /api/staking/rewards/:address)
     getStakingStats,
-    loadStakingData
+    STAKE_POOL_ADDRESS,
+    StakeModel
 };
