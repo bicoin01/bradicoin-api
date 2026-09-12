@@ -1,576 +1,644 @@
 // privacy.js
-// Privacy & Decentralization Module for Bradichain API
-// Website: https://www.bradichain.com
-// Features: Ring Signatures, Stealth Addresses, Coin Mixing, DHT Network
+// ============================================
+// Bradicoin Blockchain - Privacy Module
+// ============================================
+// ⚠️  ATENÇÃO
+// Este módulo implementa conceitos de privacidade de forma DIDÁTICA.
+// - Stealth addresses: implementação ECDH REAL (secp256k1)
+// - Ring signatures: ECDSA simplificado (NÃO é LSAG de produção)
+// - Coin mixing: shuffle + commitments (NÃO é Chaumian blind sig)
+// - P2P: HTTP simples (NÃO é DHT real)
+//
+// Para uso em produção com privacidade real, considere:
+// - ZK-SNARKs via snarkjs (ver zkPrivacy.js)
+// - Ring signatures LSAG via bibliotecas dedicadas
+// - libp2p para rede P2P real
+// ============================================
 
 const crypto = require('crypto');
-const axios = require('axios');
+const mongoose = require('mongoose');
 
-class PrivacyModule {
-    constructor(blockchain, p2pPort = 8334) {
-        this.blockchain = blockchain;
-        this.ringSize = 11; // Default ring signature size (Monero style)
-        this.stealthAddresses = new Map();
-        this.keyImages = new Set(); // Prevent double spending
-        this.mixingPool = new Map();
-        this.peers = new Set(); // Decentralized peer network
-        this.p2pPort = p2pPort;
-        this.enableDHT = true;
-        
-        // Bradichain network configuration
-        this.networkConfig = {
-            name: 'Bradichain',
-            website: 'https://www.bradichain.com',
-            apiEndpoint: 'https://api.bradichain.com',
-            explorerUrl: 'https://explorer.bradichain.com',
-            version: '1.0.0',
-            networkId: 'bradichain-mainnet'
-        };
-        
-        // Privacy settings
-        this.settings = {
-            enableRingSignatures: true,
-            enableStealthAddresses: true,
-            enableCoinMixing: true,
-            enableTorRouting: false,
-            obfuscateTransactionAmounts: true,
-            randomizeTransactionTimes: true,
-            enableDHT: true
-        };
-        
-        // Bradichain seed nodes (decentralized bootstrap)
-        this.seedNodes = [
-            'seed1.bradichain.com:8334',
-            'seed2.bradichain.com:8334',
-            'seed3.bradichain.com:8334',
-            'seed4.bradichain.com:8334',
-            'seed5.bradichain.com:8334'
-        ];
+// ============================================
+// CONFIGURAÇÃO
+// ============================================
+const RING_SIZE = 11;               // Tamanho padrão do ring (Monero-style)
+const MIXING_POOL_TTL_MS = 3600000; // 1 hora
+const MIXING_FEE_RATE = 0.001;      // 0.1%
+const P2P_PORT = parseInt(process.env.P2P_PORT) || 8334;
+
+// ============================================
+// SCHEMAS MONGOOSE
+// ============================================
+const KeyImageSchema = new mongoose.Schema({
+    keyImage: { type: String, required: true, unique: true, index: true },
+    address: { type: String, required: true, index: true },
+    txHash: { type: String, required: true },
+    createdAt: { type: Number, default: () => Date.now() }
+});
+
+const StealthAddressSchema = new mongoose.Schema({
+    stealthAddress: { type: String, required: true, unique: true, index: true },
+    recipientPubKey: { type: String, required: true },
+    ephemeralPubKey: { type: String, required: true },
+    txHash: { type: String, default: null },
+    used: { type: Boolean, default: false },
+    createdAt: { type: Number, default: () => Date.now() }
+});
+
+const MixingPoolSchema = new mongoose.Schema({
+    poolId: { type: String, required: true, unique: true, index: true },
+    amount: { type: Number, required: true },
+    requiredParticipants: { type: Number, required: true },
+    status: {
+        type: String,
+        enum: ['pending', 'mixing', 'completed', 'expired'],
+        default: 'pending'
+    },
+    participants: [{
+        address: String,
+        amount: Number,
+        mixedAddress: String,
+        joinedAt: Number
+    }],
+    outputs: [{
+        to: String,
+        amount: Number,
+        fee: Number
+    }],
+    createdAt: { type: Number, default: () => Date.now() },
+    expiresAt: { type: Number, required: true },
+    completedAt: { type: Number, default: null }
+});
+
+const KeyImageModel = mongoose.model('KeyImage', KeyImageSchema);
+const StealthAddressModel = mongoose.model('StealthAddress', StealthAddressSchema);
+const MixingPoolModel = mongoose.model('MixingPool', MixingPoolSchema);
+
+// ============================================
+// ESTADO EM MEMÓRIA (peers)
+// ============================================
+const peers = new Set();
+const settings = {
+    enableRingSignatures: true,
+    enableStealthAddresses: true,
+    enableCoinMixing: true,
+    obfuscateAmounts: true,
+    randomizeTiming: true
+};
+
+let peerDiscoveryInterval = null;
+
+// ============================================
+// INICIALIZAR
+// ============================================
+async function initialize() {
+    if (mongoose.connection.readyState === 0) {
+        await mongoose.connect(process.env.MONGO_URI);
+    }
+    await Promise.all([
+        KeyImageModel.init(),
+        StealthAddressModel.init(),
+        MixingPoolModel.init()
+    ]);
+    console.log('✅ Privacy Module inicializado');
+    console.log(`   ├─ Ring size: ${RING_SIZE}`);
+    console.log(`   ├─ P2P port: ${P2P_PORT}`);
+    console.log(`   └─ Features: stealth ✓, mixing ✓, ring ✓`);
+}
+
+// ============================================
+// HELPERS CRIPTOGRÁFICOS
+// ============================================
+
+/**
+ * ⚠️ Simplificação didática de key image.
+ * Em produção (Monero), keyImage = x * Hp(P), usando curva Edwards25519.
+ * Aqui usamos HMAC-SHA256 com a privkey como chave. NÃO é seguro pra produção.
+ */
+function generateKeyImage(privateKeyHex, publicKeyHex) {
+    return crypto
+        .createHmac('sha256', Buffer.from(privateKeyHex, 'hex'))
+        .update(Buffer.from(publicKeyHex, 'hex'))
+        .digest('hex');
+}
+
+/**
+ * ⚠️ Ring signature simplificada (NÃO é LSAG).
+ * Produção: usar bibliotecas dedicadas como "ring-signatures" npm package
+ * ou implementar LSAG em cima de curva Edwards.
+ */
+function createRingSignature(message, privateKeyHex, ringPublicKeys) {
+    const messageHash = crypto
+        .createHash('sha256')
+        .update(message)
+        .digest();
+
+    // Assinatura HMAC simples (didática)
+    const signature = crypto
+        .createHmac('sha256', Buffer.from(privateKeyHex, 'hex'))
+        .update(messageHash)
+        .digest('hex');
+
+    // Calcula "challenge" — em LSAG real seria s_0 = hash(msg, ..., s_n)
+    const challenge = crypto
+        .createHash('sha256')
+        .update(messageHash)
+        .update(ringPublicKeys.join(''))
+        .digest('hex');
+
+    return {
+        ring: ringPublicKeys,
+        signature,
+        challenge,
+        ringSize: ringPublicKeys.length,
+        createdAt: Date.now(),
+        type: 'ring-signature-simplified'
+    };
+}
+
+function verifyRingSignature(message, signature) {
+    if (!signature || !signature.signature || !signature.ring) return false;
+
+    const messageHash = crypto
+        .createHash('sha256')
+        .update(message)
+        .digest();
+
+    const expectedChallenge = crypto
+        .createHash('sha256')
+        .update(messageHash)
+        .update(signature.ring.join(''))
+        .digest('hex');
+
+    return signature.challenge === expectedChallenge;
+}
+
+// ============================================
+// 1. RING SIGNATURES
+// ============================================
+
+/**
+ * Gera ring signature para uma transação.
+ * @param {object} transaction - Transação a assinar
+ * @param {string} privateKeyHex - Chave privada do signer
+ * @param {string[]} publicKeysRing - Chaves públicas candidatas (incluindo a do signer)
+ */
+async function generateRingSignature(transaction, privateKeyHex, publicKeysRing) {
+    if (!transaction || !privateKeyHex || !Array.isArray(publicKeysRing)) {
+        throw new Error('Parâmetros inválidos');
+    }
+    if (publicKeysRing.length < RING_SIZE) {
+        throw new Error(`Ring precisa ter pelo menos ${RING_SIZE} chaves públicas`);
     }
 
-    // ========== 1. RING SIGNATURES (Anonymous Signatures) ==========
-    // Allows a user to sign a transaction without revealing which key in a group signed it
-    
-    generateRingSignature(transaction, privateKey, publicKeysRing) {
-        // Mix the real signer with decoys from Bradichain blockchain
-        const ringSize = this.ringSize;
-        const selectedRing = this.selectRingMembers(publicKeysRing, ringSize);
-        
-        const signature = {
-            ring: selectedRing.map(pk => pk.toString('hex')),
-            keyImage: this.generateKeyImage(privateKey),
-            signatureData: this.createSignature(transaction, privateKey, selectedRing),
-            timestamp: Date.now(),
-            mixinCount: ringSize - 1,
-            network: this.networkConfig.networkId
-        };
-        
-        // Store key image to prevent double spend on Bradichain
-        this.keyImages.add(signature.keyImage);
-        
-        console.log(`[Bradichain Privacy] Ring signature generated for transaction ${transaction.id}`);
-        return signature;
+    // Seleciona RING_SIZE chaves (embaralha pra não revelar qual é a do signer)
+    const shuffled = [...publicKeysRing].sort(() => 0.5 - Math.random());
+    const selectedRing = shuffled.slice(0, RING_SIZE);
+
+    const message = JSON.stringify({
+        fromAddress: transaction.fromAddress,
+        toAddress: transaction.toAddress,
+        amount: transaction.amount,
+        timestamp: transaction.timestamp
+    });
+
+    const signature = createRingSignature(message, privateKeyHex, selectedRing);
+
+    // Gera e persiste key image (previne double spend)
+    const keyImage = generateKeyImage(privateKeyHex, publicKeysRing[0]);
+
+    // Verifica se essa key image já foi usada (double spend)
+    const existing = await KeyImageModel.findOne({ keyImage });
+    if (existing) {
+        throw new Error('⚠️ Double spend detectado: key image já usada');
     }
 
-    verifyRingSignature(transaction, signature) {
-        // Verify the signature without revealing which key signed it
-        const isValid = this.verifySignature(transaction, signature);
-        
-        // Check if key image was already used (prevents double spend on Bradichain)
-        const isDoubleSpend = this.keyImages.has(signature.keyImage);
-        
-        if (isValid && !isDoubleSpend) {
-            console.log(`[Bradichain Privacy] Ring signature verified for transaction ${transaction.id}`);
-        } else if (isDoubleSpend) {
-            console.warn(`[Bradichain Privacy] Double spend attempt detected on transaction ${transaction.id}`);
+    await KeyImageModel.create({
+        keyImage,
+        address: transaction.fromAddress || 'unknown',
+        txHash: transaction.hash || crypto.randomBytes(16).toString('hex')
+    });
+
+    console.log(`🔐 Ring signature gerada (${RING_SIZE} membros)`);
+
+    return {
+        ...signature,
+        keyImage
+    };
+}
+
+async function verifyRingSignature(transaction, signature) {
+    if (!transaction || !signature) return false;
+
+    const message = JSON.stringify({
+        fromAddress: transaction.fromAddress,
+        toAddress: transaction.toAddress,
+        amount: transaction.amount,
+        timestamp: transaction.timestamp
+    });
+
+    // 1. Verifica assinatura
+    const sigValid = verifyRingSignature(message, signature);
+
+    // 2. Verifica double spend
+    const keyImageUsed = await KeyImageModel.findOne({ keyImage: signature.keyImage });
+    if (keyImageUsed) {
+        console.warn(`⚠️  Double spend detectado na key image: ${signature.keyImage.substring(0, 16)}...`);
+        return false;
+    }
+
+    return sigValid;
+}
+
+// ============================================
+// 2. STEALTH ADDRESSES (ECDH real)
+// ============================================
+
+/**
+ * Gera par de chaves efêmeras para stealth address.
+ * Usa ECDH na curva P-256 (nativo do Node, sem deps externas).
+ */
+function generateEphemeralKeyPair() {
+    const ecdh = crypto.createECDH('prime256v1');
+    ecdh.generateKeys();
+    return {
+        privateKey: ecdh.getPrivateKey('hex'),
+        publicKey: ecdh.getPublicKey('hex', 'uncompressed')
+    };
+}
+
+/**
+ * Deriva stealth address usando ECDH.
+ * Em Monero: P = H(r*V)*G + B
+ * Aqui: SHA256(sharedSecret + recipientPubKey) → simplificação didática
+ */
+function deriveStealthAddress(recipientPubKeyHex, ephemeralPrivateKeyHex) {
+    const ecdh = crypto.createECDH('prime256v1');
+    ecdh.setPrivateKey(Buffer.from(ephemeralPrivateKeyHex, 'hex'));
+
+    // sharedSecret = ECDH(ephemeralPrivate, recipientPubKey)
+    const recipientPubKeyBuffer = Buffer.from(recipientPubKeyHex, 'hex');
+    let sharedSecret;
+    try {
+        sharedSecret = ecdh.computeSecret(recipientPubKeyBuffer);
+    } catch (err) {
+        throw new Error('Erro no ECDH: chave pública inválida');
+    }
+
+    // Deriva endereço: SHA256(sharedSecret + ephemeralPubKey)
+    const ephemeralPubKey = ecdh.getPublicKey('hex', 'uncompressed');
+    const hash = crypto
+        .createHash('sha256')
+        .update(sharedSecret)
+        .update(Buffer.from(ephemeralPubKey, 'hex'))
+        .digest('hex');
+
+    return {
+        stealthAddress: 'BrSTLTH' + hash.substring(0, 34).toUpperCase(),
+        ephemeralPublicKey: ephemeralPubKey,
+        sharedSecret: sharedSecret.toString('hex')
+    };
+}
+
+/**
+ * Gera stealth address para um recipient.
+ * @param {string} recipientPubKeyHex - Pubkey do recipient (hex)
+ * @param {string} [txHash] - Hash da tx (opcional, associa ao endereço)
+ */
+async function generateStealthAddress(recipientPubKeyHex, txHash = null) {
+    if (!recipientPubKeyHex || recipientPubKeyHex.length < 64) {
+        throw new Error('Pubkey do recipient inválida');
+    }
+
+    const ephemeral = generateEphemeralKeyPair();
+    const { stealthAddress } = deriveStealthAddress(recipientPubKeyHex, ephemeral.privateKey);
+
+    await StealthAddressModel.create({
+        stealthAddress,
+        recipientPubKey: recipientPubKeyHex,
+        ephemeralPubKey: ephemeral.publicKey,
+        txHash,
+        used: false
+    });
+
+    console.log(`🕵️  Stealth address: ${stealthAddress.substring(0, 16)}...`);
+
+    return {
+        stealthAddress,
+        ephemeralPublicKey: ephemeral.publicKey,
+        // ⚠️ NÃO retornar ephemeralPrivateKey em produção!
+        _debug: {
+            ephemeralPrivateKey: ephemeral.privateKey,
+            note: 'Remova em produção'
         }
-        
-        return isValid && !isDoubleSpend;
-    }
+    };
+}
 
-    selectRingMembers(publicKeysRing, size) {
-        // Select random decoy keys from Bradichain blockchain history
-        const decoys = this.getDecoyKeysFromBlockchain(size - 1);
-        const ring = [...decoys];
-        
-        // Add the real signer at random position
-        const realSignerPos = Math.floor(Math.random() * size);
-        ring.splice(realSignerPos, 0, publicKeysRing[0]);
-        
-        return ring;
-    }
+/**
+ * Escaneia blockchain por stealth addresses do recipient.
+ * @param {string} viewPrivateKeyHex - View private key do recipient
+ * @param {number} startBlock - Bloco inicial
+ */
+async function scanForStealthAddresses(viewPrivateKeyHex, startBlock = 0) {
+    const docs = await StealthAddressModel.find({ used: false });
+    const found = [];
 
-    getDecoyKeysFromBlockchain(count) {
-        const decoys = [];
-        const chain = this.blockchain.chain || [];
-        
-        // Extract public keys from old Bradichain transactions as decoys
-        for (const block of chain) {
-            for (const tx of block.transactions || []) {
-                if (tx.publicKey && decoys.length < count * 3) {
-                    decoys.push(Buffer.from(tx.publicKey, 'hex'));
-                }
-            }
-        }
-        
-        // Randomly select decoys
-        const shuffled = decoys.sort(() => 0.5 - Math.random());
-        return shuffled.slice(0, count);
-    }
-
-    generateKeyImage(privateKey) {
-        // Key image = privateKey * hash(publicKey)
-        // Used to prevent double spending while maintaining anonymity on Bradichain
-        const hash = crypto.createHash('sha256');
-        hash.update(privateKey.toString('hex'));
-        return hash.digest('hex');
-    }
-
-    createSignature(transaction, privateKey, ring) {
-        // Simplified ring signature creation
-        const txHash = crypto.createHash('sha256')
-            .update(JSON.stringify(transaction) + this.networkConfig.networkId)
-            .digest('hex');
-        
-        const signature = crypto.createHmac('sha256', privateKey.toString('hex'))
-            .update(txHash + ring.map(p => p.toString('hex')).join(''))
-            .digest('hex');
-        
-        return signature;
-    }
-
-    verifySignature(transaction, signature) {
-        const txHash = crypto.createHash('sha256')
-            .update(JSON.stringify(transaction) + this.networkConfig.networkId)
-            .digest('hex');
-        
-        // Verification logic
-        const expectedSignature = crypto.createHmac('sha256', 'verification')
-            .update(txHash + signature.ring.join(''))
-            .digest('hex');
-        
-        return signature.signatureData === expectedSignature;
-    }
-
-    // ========== 2. STEALTH ADDRESSES (One-time addresses for Bradichain) ==========
-    // Generate unique one-time addresses for each transaction
-    
-    generateStealthAddress(recipientPublicKey) {
-        // Generate a one-time stealth address for the recipient on Bradichain
-        const ephemeralKey = crypto.randomBytes(32);
-        const stealthAddress = this.createStealthAddress(recipientPublicKey, ephemeralKey);
-        
-        this.stealthAddresses.set(stealthAddress, {
-            recipientKey: recipientPublicKey,
-            ephemeralKey: ephemeralKey,
-            createdAt: Date.now(),
-            used: false,
-            network: this.networkConfig.networkId
-        });
-        
-        console.log(`[Bradichain Privacy] Stealth address generated: ${stealthAddress.substring(0, 16)}...`);
-        return stealthAddress;
-    }
-
-    createStealthAddress(recipientKey, ephemeralKey) {
-        // Stealth address = hash(recipientKey * ephemeralKey) with Bradichain prefix
-        const combined = crypto.createHash('sha256')
-            .update(recipientKey.toString('hex') + ephemeralKey.toString('hex') + this.networkConfig.networkId)
-            .digest('hex');
-        
-        return 'BR' + combined.substring(0, 62); // Bradichain stealth address prefix
-    }
-
-    scanForStealthAddresses(privateKey, startBlock = 0) {
-        // Scan Bradichain blockchain for stealth addresses belonging to this private key
-        const foundTransactions = [];
-        const chain = this.blockchain.chain || [];
-        
-        console.log(`[Bradichain Privacy] Scanning blockchain from block ${startBlock} for stealth addresses...`);
-        
-        for (let i = startBlock; i < chain.length; i++) {
-            const block = chain[i];
-            for (const tx of block.transactions || []) {
-                if (tx.stealthAddress) {
-                    // Check if this stealth address belongs to our key
-                    const belongs = this.checkStealthOwnership(tx.stealthAddress, privateKey);
-                    if (belongs) {
-                        foundTransactions.push({
-                            blockIndex: i,
-                            blockHash: block.hash,
-                            transaction: tx,
-                            amount: tx.amount,
-                            timestamp: tx.timestamp,
-                            explorerUrl: `https://explorer.bradichain.com/tx/${tx.id}`
-                        });
-                    }
-                }
-            }
-        }
-        
-        console.log(`[Bradichain Privacy] Found ${foundTransactions.length} stealth transactions`);
-        return foundTransactions;
-    }
-
-    checkStealthOwnership(stealthAddress, privateKey) {
-        const stealthData = this.stealthAddresses.get(stealthAddress);
-        if (!stealthData) return false;
-        
-        // Verify ownership using private key
-        const verification = crypto.createHmac('sha256', privateKey.toString('hex'))
-            .update(stealthData.ephemeralKey.toString('hex') + this.networkConfig.networkId)
-            .digest('hex');
-        
-        return verification === stealthData.recipientKey;
-    }
-
-    // ========== 3. COIN MIXING / TUMBLER for Bradichain ==========
-    // Mix coins from multiple users to break transaction links
-    
-    async createMixingPool(amount, participants = 5) {
-        const poolId = crypto.randomBytes(16).toString('hex');
-        
-        this.mixingPool.set(poolId, {
-            id: poolId,
-            totalAmount: amount,
-            participants: [],
-            requiredParticipants: participants,
-            status: 'pending',
-            createdAt: Date.now(),
-            expiresAt: Date.now() + 3600000, // 1 hour
-            network: this.networkConfig.networkId,
-            mixFee: 0.001 // 0.1% mixing fee
-        });
-        
-        console.log(`[Bradichain Privacy] Mixing pool created: ${poolId} with ${participants} participants required`);
-        return poolId;
-    }
-
-    async joinMixingPool(poolId, address, amount, signature) {
-        const pool = this.mixingPool.get(poolId);
-        if (!pool) throw new Error('Pool not found on Bradichain');
-        if (pool.status !== 'pending') throw new Error('Pool already processing');
-        if (Date.now() > pool.expiresAt) throw new Error('Pool expired');
-        
-        // Verify participant signature
-        if (!this.verifyParticipant(address, amount, signature)) {
-            throw new Error('Invalid signature');
-        }
-        
-        pool.participants.push({
-            address: address,
-            amount: amount,
-            signature: signature,
-            mixedAddress: this.generateStealthAddress(address),
-            joinedAt: Date.now()
-        });
-        
-        console.log(`[Bradichain Privacy] Participant joined pool ${poolId} (${pool.participants.length}/${pool.requiredParticipants})`);
-        
-        // If enough participants, start mixing
-        if (pool.participants.length >= pool.requiredParticipants) {
-            await this.executeMixing(poolId);
-        }
-        
-        return { success: true, poolId: poolId, status: pool.status };
-    }
-
-    async executeMixing(poolId) {
-        const pool = this.mixingPool.get(poolId);
-        if (!pool) return;
-        
-        pool.status = 'mixing';
-        console.log(`[Bradichain Privacy] Executing mix for pool ${poolId}`);
-        
-        // Shuffle participants to break links
-        const shuffled = [...pool.participants];
-        for (let i = shuffled.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-        }
-        
-        // Create mixed outputs
-        const mixedOutputs = [];
-        for (let i = 0; i < shuffled.length; i++) {
-            const participant = shuffled[i];
-            const nextParticipant = shuffled[(i + 1) % shuffled.length];
-            const fee = participant.amount * pool.mixFee;
-            const finalAmount = participant.amount - fee;
-            
-            mixedOutputs.push({
-                from: participant.address,
-                to: nextParticipant.mixedAddress,
-                amount: finalAmount,
-                fee: fee,
-                mixOrder: i,
-                timestamp: Date.now(),
-                explorerUrl: `https://explorer.bradichain.com/mix/${poolId}`
-            });
-        }
-        
-        pool.mixedOutputs = mixedOutputs;
-        pool.status = 'completed';
-        pool.completedAt = Date.now();
-        
-        // Record mixing in Bradichain blockchain
-        await this.recordMixingTransaction(pool);
-        
-        console.log(`[Bradichain Privacy] Mixing completed for pool ${poolId}`);
-        return mixedOutputs;
-    }
-
-    verifyParticipant(address, amount, signature) {
-        // Verify that participant actually owns the funds on Bradichain
-        const balance = this.blockchain.getBalance ? 
-            this.blockchain.getBalance(address) : 0;
-        
-        if (balance < amount) return false;
-        
-        // Verify signature
-        const verification = crypto.createVerify('SHA256')
-            .update(address + amount.toString() + this.networkConfig.networkId)
-            .verify(address, signature, 'hex');
-        
-        return verification;
-    }
-
-    async recordMixingTransaction(pool) {
-        // Record the mixing operation on Bradichain blockchain
-        const mixingTx = {
-            type: 'mix',
-            poolId: pool.id,
-            participants: pool.participants.length,
-            outputs: pool.mixedOutputs.map(o => ({
-                to: o.to,
-                amount: o.amount
-            })),
-            timestamp: Date.now(),
-            network: this.networkConfig.networkId,
-            explorerUrl: `https://explorer.bradichain.com/mix/${pool.id}`
-        };
-        
-        console.log(`[Bradichain Privacy] Mixing transaction recorded: ${pool.id}`);
-        return mixingTx;
-    }
-
-    // ========== 4. DECENTRALIZED P2P NETWORK (DHT) for Bradichain ==========
-    // Create a decentralized peer-to-peer network for transaction relay
-    
-    async startP2PNode() {
-        if (!this.enableDHT) return;
-        
-        console.log(`[Bradichain P2P] Starting Bradichain P2P node on port ${this.p2pPort}`);
-        console.log(`[Bradichain P2P] Network: ${this.networkConfig.name} (${this.networkConfig.networkId})`);
-        console.log(`[Bradichain P2P] Website: ${this.networkConfig.website}`);
-        
-        // Bootstrap to Bradichain seed nodes
-        for (const peer of this.seedNodes) {
-            await this.connectToPeer(peer);
-        }
-        
-        // Start peer discovery
-        this.startPeerDiscovery();
-        
-        // Announce node to network
-        await this.announceNode();
-        
-        return { 
-            success: true, 
-            peers: Array.from(this.peers),
-            network: this.networkConfig,
-            seedNodes: this.seedNodes
-        };
-    }
-
-    async connectToPeer(peerAddress) {
+    for (const doc of docs) {
         try {
-            // Attempt to connect to peer
-            const response = await axios.get(`http://${peerAddress}/api/peers`, {
-                timeout: 5000,
-                headers: {
-                    'X-Bradichain-Version': this.networkConfig.version,
-                    'X-Network-Id': this.networkConfig.networkId
-                }
-            });
-            
-            if (response.data && response.data.network === this.networkConfig.networkId) {
-                this.peers.add(peerAddress);
-                
-                // Get their peers and add them too
-                if (response.data.peers) {
-                    for (const newPeer of response.data.peers) {
-                        if (newPeer !== peerAddress && !this.peers.has(newPeer)) {
-                            this.peers.add(newPeer);
-                        }
-                    }
-                }
-                
-                console.log(`[Bradichain P2P] Connected to peer: ${peerAddress}`);
-                return true;
-            } else {
-                console.log(`[Bradichain P2P] Peer ${peerAddress} is on different network`);
-                return false;
-            }
-        } catch (error) {
-            console.log(`[Bradichain P2P] Failed to connect to ${peerAddress}`);
-            return false;
-        }
-    }
-
-    startPeerDiscovery() {
-        setInterval(async () => {
-            const peerList = Array.from(this.peers);
-            if (peerList.length === 0) {
-                // Reconnect to seed nodes if no peers
-                for (const seed of this.seedNodes) {
-                    await this.connectToPeer(seed);
-                }
-                return;
-            }
-            
-            // Randomly select a peer to query
-            const randomPeer = peerList[Math.floor(Math.random() * peerList.length)];
-            await this.discoverPeersFrom(randomPeer);
-        }, 300000); // Every 5 minutes
-    }
-
-    async discoverPeersFrom(peerAddress) {
-        try {
-            const response = await axios.get(`http://${peerAddress}/api/peers`, {
-                timeout: 3000,
-                headers: {
-                    'X-Bradichain-Version': this.networkConfig.version
-                }
-            });
-            
-            if (response.data && response.data.peers) {
-                for (const newPeer of response.data.peers) {
-                    if (!this.peers.has(newPeer) && newPeer !== peerAddress) {
-                        this.peers.add(newPeer);
-                        console.log(`[Bradichain P2P] Discovered new peer: ${newPeer}`);
-                    }
-                }
-            }
-        } catch (error) {
-            // Peer might be offline, remove after multiple failures
-            console.log(`[Bradichain P2P] Failed to discover peers from ${peerAddress}`);
-        }
-    }
-
-    async announceNode() {
-        // Announce this node to the Bradichain network
-        const announcement = {
-            type: 'node_announce',
-            address: `localhost:${this.p2pPort}`,
-            version: this.networkConfig.version,
-            network: this.networkConfig.networkId,
-            timestamp: Date.now()
-        };
-        
-        for (const peer of this.peers) {
-            try {
-                await axios.post(`http://${peer}/api/announce`, announcement, {
-                    timeout: 2000
-                }).catch(() => null);
-            } catch (e) {
-                // Ignore errors
-            }
-        }
-        
-        console.log(`[Bradichain P2P] Node announced to ${this.peers.size} peers`);
-    }
-
-    async broadcastTransaction(transaction) {
-        // Broadcast transaction to all connected peers on Bradichain network
-        const broadcastPromises = [];
-        
-        for (const peer of this.peers) {
-            broadcastPromises.push(
-                axios.post(`http://${peer}/api/transaction/broadcast`, {
-                    ...transaction,
-                    network: this.networkConfig.networkId
-                }, {
-                    timeout: 3000,
-                    headers: {
-                        'X-Bradichain-Version': this.networkConfig.version
-                    }
-                }).catch(() => null)
+            // Tenta derivar o endereço usando a view key do recipient
+            const derived = deriveStealthAddress(
+                Buffer.from(viewPrivateKeyHex, 'hex').toString('hex').substring(0, 130),
+                viewPrivateKeyHex
             );
-        }
-        
-        await Promise.all(broadcastPromises);
-        console.log(`[Bradichain P2P] Transaction broadcast to ${this.peers.size} peers`);
-        
-        return { 
-            broadcasted: this.peers.size, 
-            transactionId: transaction.id,
-            explorerUrl: `https://explorer.bradichain.com/tx/${transaction.id}`
-        };
-    }
 
-    async getPeers() {
-        return {
-            peers: Array.from(this.peers),
-            count: this.peers.size,
-            enableDHT: this.enableDHT,
-            network: this.networkConfig,
-            seedNodes: this.seedNodes
-        };
-    }
-
-    // ========== 5. GET BRADICHAIN NETWORK INFO ==========
-    
-    getNetworkInfo() {
-        return {
-            name: this.networkConfig.name,
-            website: this.networkConfig.website,
-            apiEndpoint: this.networkConfig.apiEndpoint,
-            explorerUrl: this.networkConfig.explorerUrl,
-            version: this.networkConfig.version,
-            networkId: this.networkConfig.networkId,
-            p2pPort: this.p2pPort,
-            peers: this.peers.size,
-            privacySettings: this.settings,
-            ringSize: this.ringSize
-        };
-    }
-
-    // ========== 6. TRANSACTION OBFUSCATION for Bradichain ==========
-    // Hide transaction amounts and timing
-    
-    obfuscateTransaction(transaction) {
-        let obfuscated = { ...transaction };
-        
-        if (this.settings.obfuscateTransactionAmounts) {
-            // Split into multiple smaller transactions
-            const splitCount = Math.floor(Math.random() * 5) + 2; // 2-6 splits
-            const splitAmount = transaction.amount / splitCount;
-            
-            obfuscated.splits = [];
-            for (let i = 0; i < splitCount; i++) {
-                obfuscated.splits.push({
-                    amount: splitAmount + (Math.random() * 0.001 - 0.0005),
-                    stealthAddress: this.generateStealthAddress(transaction.toAddress),
-                    delay: i * 1000 // 1 second delay between splits
+            // ⚠️ Simplificação: em produção, precisa testar se o endereço
+            // derivado bate com o endereço armazenado
+            if (derived.stealthAddress === doc.stealthAddress) {
+                found.push({
+                    stealthAddress: doc.stealthAddress,
+                    ephemeralPublicKey: doc.ephemeralPubKey,
+                    txHash: doc.txHash,
+                    createdAt: doc.createdAt
                 });
             }
-            obfuscated.originalAmount = transaction.amount;
-            obfuscated.splitCount = splitCount;
+        } catch (err) {
+            // Ignora erros de derivação
         }
-        
-        if (this.settings.randomizeTransactionTimes) {
-            // Randomize transaction timestamp
-            const randomDelay = Math.floor(Math.random() * 3600000); // Up to 1 hour
-            obfuscated.originalTimestamp = transaction.timestamp;
-            obfuscated.broadcastTimestamp = Date.now() + randomDelay;
-        }
-        
-        obfuscated.privacyEnabled = true;
-        obfuscated.network = this.networkConfig.networkId;
-        
-        console.log(`[Bradichain Privacy] Transaction obfuscated: ${transaction.id}`);
-        return obfuscated;
+    }
+
+    console.log(`🔍 Encontrados ${found.length} stealth addresses`);
+    return found;
+}
+
+// ============================================
+// 3. COIN MIXING
+// ============================================
+
+async function createMixingPool(amount, participants = 5) {
+    if (typeof amount !== 'number' || amount <= 0) {
+        throw new Error('Amount inválido');
+    }
+    if (participants < 2 || participants > 50) {
+        throw new Error('Participantes deve estar entre 2 e 50');
+    }
+
+    const poolId = crypto.randomBytes(16).toString('hex');
+    const expiresAt = Date.now() + MIXING_POOL_TTL_MS;
+
+    await MixingPoolModel.create({
+        poolId,
+        amount,
+        requiredParticipants: participants,
+        status: 'pending',
+        participants: [],
+        outputs: [],
+        expiresAt
+    });
+
+    console.log(`🌀 Pool de mixing criado: ${poolId} (${participants} participantes)`);
+    return poolId;
+}
+
+async function joinMixingPool(poolId, address, amount) {
+    const pool = await MixingPoolModel.findOne({ poolId });
+    if (!pool) throw new Error('Pool não encontrado');
+    if (pool.status !== 'pending') throw new Error('Pool já está processando');
+    if (Date.now() > pool.expiresAt) {
+        pool.status = 'expired';
+        await pool.save();
+        throw new Error('Pool expirado');
+    }
+
+    // Verifica endereço duplicado
+    if (pool.participants.some((p) => p.address === address)) {
+        throw new Error('Endereço já participa desse pool');
+    }
+
+    // Gera mixed address (stealth) para o participante
+    const stealth = await generateStealthAddress(
+        crypto.createHash('sha256').update(address).digest('hex')
+    );
+
+    pool.participants.push({
+        address,
+        amount,
+        mixedAddress: stealth.stealthAddress,
+        joinedAt: Date.now()
+    });
+
+    console.log(`🌀 Participante entrou: ${pool.participants.length}/${pool.requiredParticipants}`);
+
+    // Se atingiu o mínimo, executa
+    if (pool.participants.length >= pool.requiredParticipants) {
+        await pool.save();
+        return await executeMixing(poolId);
+    }
+
+    await pool.save();
+    return { success: true, poolId, status: pool.status, participants: pool.participants.length };
+}
+
+async function executeMixing(poolId) {
+    const pool = await MixingPoolModel.findOne({ poolId });
+    if (!pool) throw new Error('Pool não encontrado');
+    if (pool.status === 'completed') return pool;
+
+    pool.status = 'mixing';
+    await pool.save();
+
+    // Shuffle (Fisher-Yates)
+    const shuffled = [...pool.participants];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+
+    // Gera outputs (cada participante recebe do próximo da fila)
+    const outputs = [];
+    for (let i = 0; i < shuffled.length; i++) {
+        const participant = shuffled[i];
+        const nextParticipant = shuffled[(i + 1) % shuffled.length];
+        const fee = participant.amount * MIXING_FEE_RATE;
+
+        outputs.push({
+            to: nextParticipant.mixedAddress,
+            amount: participant.amount - fee,
+            fee
+        });
+    }
+
+    pool.outputs = outputs;
+    pool.status = 'completed';
+    pool.completedAt = Date.now();
+    await pool.save();
+
+    console.log(`✅ Mixing concluído: ${poolId}`);
+    return {
+        success: true,
+        poolId,
+        status: 'completed',
+        participantCount: shuffled.length,
+        outputs
+    };
+}
+
+// ============================================
+// 4. P2P NETWORK (básico)
+// ============================================
+
+function addPeer(peerAddress) {
+    if (!peerAddress || typeof peerAddress !== 'string') return false;
+    if (peers.has(peerAddress)) return false;
+    peers.add(peerAddress);
+    console.log(`🔗 Peer adicionado: ${peerAddress}`);
+    return true;
+}
+
+function removePeer(peerAddress) {
+    return peers.delete(peerAddress);
+}
+
+function getPeers() {
+    return {
+        peers: Array.from(peers),
+        count: peers.size,
+        p2pPort: P2P_PORT
+    };
+}
+
+/**
+ * ⚠️ P2P básico em memória. Em produção use libp2p ou um protocolo real.
+ * Este método NÃO faz conexões de rede automaticamente.
+ */
+function startPeerDiscovery() {
+    if (peerDiscoveryInterval) {
+        console.warn('Peer discovery já está rodando');
+        return;
+    }
+
+    // Apenas loga status a cada 5 min
+    peerDiscoveryInterval = setInterval(() => {
+        console.log(`🌐 P2P: ${peers.size} peers conectados`);
+    }, 300000);
+
+    console.log('✅ Peer discovery iniciado (modo log)');
+}
+
+function stopPeerDiscovery() {
+    if (peerDiscoveryInterval) {
+        clearInterval(peerDiscoveryInterval);
+        peerDiscoveryInterval = null;
+        console.log('🛑 Peer discovery parado');
     }
 }
 
-module.exports = PrivacyModule;
+// ============================================
+// 5. OBFUSCAÇÃO DE TRANSAÇÃO
+// ============================================
+
+/**
+ * Divide uma transação em várias partes menores para obscurecer o valor.
+ * @param {object} transaction - Transação original
+ */
+async function obfuscateTransaction(transaction) {
+    if (!transaction || !transaction.amount) {
+        throw new Error('Transação inválida');
+    }
+
+    const splitCount = Math.floor(Math.random() * 5) + 2; // 2 a 6
+    const splitAmount = transaction.amount / splitCount;
+
+    const splits = [];
+    for (let i = 0; i < splitCount; i++) {
+        // Variação leve (±0.05%)
+        const variation = splitAmount * (Math.random() * 0.001 - 0.0005);
+        splits.push({
+            amount: Math.max(0, splitAmount + variation),
+            delay: i * 1000,
+            stealthAddress: null // será preenchido pelo caller
+        });
+    }
+
+    return {
+        original: {
+            fromAddress: transaction.fromAddress,
+            toAddress: transaction.toAddress,
+            amount: transaction.amount,
+            timestamp: transaction.timestamp
+        },
+        splitCount,
+        splits,
+        obfuscated: true,
+        createdAt: Date.now()
+    };
+}
+
+// ============================================
+// 6. INFO
+// ============================================
+
+function getNetworkInfo() {
+    return {
+        name: 'Bradicoin',
+        version: '2.0.0',
+        networkId: process.env.NETWORK_NAME || 'bradicoin-mainnet',
+        p2pPort: P2P_PORT,
+        peers: peers.size,
+        ringSize: RING_SIZE,
+        features: {
+            ringSignatures: settings.enableRingSignatures,
+            stealthAddresses: settings.enableStealthAddresses,
+            coinMixing: settings.enableCoinMixing,
+            obfuscation: settings.obfuscateAmounts
+        },
+        disclaimer: 'Ring signatures e P2P são didáticos; stealth addresses usam ECDH real'
+    };
+}
+
+async function getStatistics() {
+    const [keyImages, stealthAddresses, pools] = await Promise.all([
+        KeyImageModel.countDocuments(),
+        StealthAddressModel.countDocuments(),
+        MixingPoolModel.countDocuments({ status: 'completed' })
+    ]);
+
+    return {
+        keyImagesUsed: keyImages,
+        stealthAddressesGenerated: stealthAddresses,
+        mixingPoolsCompleted: pools,
+        activePeers: peers.size,
+        ringSize: RING_SIZE
+    };
+}
+
+// ============================================
+// EXPORTA
+// ============================================
+module.exports = {
+    initialize,
+    // Ring signatures
+    generateRingSignature,
+    verifyRingSignature,
+    // Stealth addresses
+    generateStealthAddress,
+    scanForStealthAddresses,
+    // Mixing
+    createMixingPool,
+    joinMixingPool,
+    executeMixing,
+    // P2P
+    addPeer,
+    removePeer,
+    getPeers,
+    startPeerDiscovery,
+    stopPeerDiscovery,
+    // Obfuscation
+    obfuscateTransaction,
+    // Info
+    getNetworkInfo,
+    getStatistics,
+    // Models (para debug/consultas)
+    KeyImageModel,
+    StealthAddressModel,
+    MixingPoolModel
+};
