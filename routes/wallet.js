@@ -136,23 +136,12 @@ router.post(
             finalUsername = `${user.username}_${req.userId.toString().slice(-6)}`;
         }
 
-        // ===== CRIA WALLET USANDO wallet.js =====
-        // ⚠️ wallet.js gera endereço próprio. Vamos sobrepor com o do frontend
-        // pra garantir que seja o MESMO derivado da seed.
-        const result = await blockchainWallet.createWallet(finalUsername);
-
-        // Atualiza a wallet com o endereço que veio do frontend
-        // (e publicKey se fornecida)
-        await WalletModel.findOneAndUpdate(
-            { address: result.address },
-            {
-                $set: {
-                    address: address,               // sobrescreve com o do frontend
-                    publicKey: publicKey || result.publicKey,
-                    userId: req.userId              // 🆕 vincula ao user
-                }
-            }
-        );
+                // ===== CRIA WALLET USANDO wallet.js (com address do frontend) =====
+        const result = await blockchainWallet.createWallet(finalUsername, {
+            address,
+            publicKey,
+            userId: req.userId
+        });
 
         // Vincula ao User
         user.walletAddress = address;
@@ -164,9 +153,9 @@ router.post(
             message: 'Carteira criada com sucesso',
             data: {
                 wallet: {
-                    address: address,
-                    username: finalUsername,
-                    publicKey: publicKey || result.publicKey,
+                    address: result.address,
+                    username: result.username,
+                    publicKey: result.publicKey,
                     createdAt: result.createdAt
                 },
                 initialBalance: result.initialBalance || 1000,
@@ -232,7 +221,7 @@ router.post(
             });
         }
 
-        // ===== CRIA NOVA WALLET COM ENDEREÇO DERIVADO =====
+                // ===== CRIA NOVA WALLET COM ENDEREÇO DERIVADO =====
         const user = await User.findById(req.userId);
         let finalUsername = user.username;
         const usernameInUse = await WalletModel.findOne({ username: finalUsername });
@@ -240,18 +229,10 @@ router.post(
             finalUsername = `${user.username}_${req.userId.toString().slice(-6)}`;
         }
 
-        const result = await blockchainWallet.createWallet(finalUsername);
-
-        // Sobrescreve com o endereço derivado da seed
-        await WalletModel.findOneAndUpdate(
-            { address: result.address },
-            {
-                $set: {
-                    address: derivedAddress,
-                    userId: req.userId
-                }
-            }
-        );
+        const result = await blockchainWallet.createWallet(finalUsername, {
+            address: derivedAddress,
+            userId: req.userId
+        });
 
         user.walletAddress = derivedAddress;
         await user.save();
@@ -261,8 +242,8 @@ router.post(
             message: 'Carteira importada com sucesso',
             data: {
                 wallet: {
-                    address: derivedAddress,
-                    username: finalUsername,
+                    address: result.address,
+                    username: result.username,
                     publicKey: result.publicKey,
                     createdAt: result.createdAt
                 }
