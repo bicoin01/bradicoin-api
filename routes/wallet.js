@@ -51,9 +51,22 @@ async function getUserWallet(userId) {
     const user = await User.findById(userId);
     if (!user || !user.walletAddress) return null;
 
-    // Usa o WalletModel do próprio wallet.js
     const WalletModel = blockchainWallet.WalletModel;
-    return WalletModel.findOne({ address: user.walletAddress });
+
+    // 1) tenta pelo userId (mais confiável)
+    let wallet = await WalletModel.findOne({ userId });
+    if (wallet) return wallet;
+
+    // 2) fallback: pelo endereço salvo no User
+    wallet = await WalletModel.findOne({ address: user.walletAddress });
+
+    // 3) auto-heal: se achou por endereço mas sem userId, vincula
+    if (wallet && !wallet.userId) {
+        wallet.userId = userId;
+        await wallet.save();
+    }
+
+    return wallet;
 }
 
 // ============================================
