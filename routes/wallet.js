@@ -1,15 +1,15 @@
 // routes/wallet.js
 // ============================================
-// Rotas de wallet - Bradicoin (integração blockchain + auth)
+// Rotas de wallet - Bradicoin
+// Integração: blockchain + auth + seed phrase
 // ============================================
 
 const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
 const User = require('../models/User');
-const Wallet = require('../models/Wallet');
 const Transaction = require('../models/Transaction');
-const blockchainWallet = require('../wallet'); // ← seu wallet.js da raiz
+const blockchainWallet = require('../wallet'); // wallet.js da raiz
 const { authenticate } = require('../middleware/auth');
 const { asyncHandler } = require('../middleware/error');
 
@@ -17,9 +17,9 @@ const { asyncHandler } = require('../middleware/error');
 // CONFIGURAÇÕES
 // ============================================
 
-const FEE_AMOUNT = 0.015;         // Fee fixa por envio (0.015 BRD)
+const FEE_AMOUNT = 0.015;         // Fee por envio (0.015 BRD ≈ $0.15)
 const MIN_SEND = 0.17;            // Mínimo para enviar
-const AIRDROP_ENABLED = false;    // ⏸️ DESATIVADO — você ativa depois
+const AIRDROP_ENABLED = false;    // ⏸️ Desativado
 const AIRDROP_MIN = 5;
 const AIRDROP_MAX = 15;
 const AIRDROP_COOLDOWN_HOURS = 6;
@@ -36,77 +36,223 @@ function generateTxId() {
     return 'tx_' + crypto.randomBytes(16).toString('hex');
 }
 
-// Vincula um user do auth com uma wallet do blockchain wallet.js
-async function getOrCreateUserWallet(userId) {
-    let walletDoc = await Wallet.findOne({ userId });
+// Deriva endereço a partir da seed (mesmo algoritmo do frontend)
+// Frontend faz: SHA256(seed).substring(0, 38) com prefixo "Br"
+// Aqui validamos apenas o formato — o app já manda pronto
+function isValidAddressFormat(address) {
+    return typeof address === 'string' &&
+           address.startsWith('Br') &&
+           address.length >= 20 &&
+           address.length <= 60;
+}
 
-    if (!walletDoc) {
-        // Cria nova wallet via wallet.js (que já salva no Mongo + gera endereço)
-        const user = await User.findById(userId);
-        const username = user.username + '_' + userId.toString().slice(-6);
+// Busca wallet vinculada ao user
+async function getUserWallet(userId) {
+    const user = await User.findById(userId);
+    if (!user || !user.walletAddress) return null;
 
-        const result = await blockchainWallet.createWallet(username);
-
-        // Atualiza o WalletModel com o userId (vinculação)
-        walletDoc = await Wallet.findOneAndUpdate(
-            { address: result.address },
-            { $set: { userId } },
-            { new: true }
-        );
-
-        // Vincula ao User também
-        await User.findByIdAndUpdate(userId, {
-            $set: { walletAddress: result.address }
-        });
-    }
-
-    return walletDoc;
+    // Usa o WalletModel do próprio wallet.js
+    const WalletModel = blockchainWallet.WalletModel;
+    return WalletModel.findOne({ address: user.walletAddress });
 }
 
 // ============================================
 // POST /api/v1/wallet/create
-// Cria carteira pro usuário logado
+// Cria carteira nova (usuário logado, vindo do /register)
 // ============================================
 
 router.post(
     '/create',
     authenticate,
     asyncHandler(async (req, res) => {
-        // Verifica se já tem
-        const existing = await Wallet.findOne({ userId: req.userId });
-        if (existing) {
-            return res.status(409).json({
+        const { address, publicKey, username } = req.body;
+
+        // ===== VALIDAÇÕES =====
+        if (!address) {
+            return res.status(400).json({
                 success: false,
-                error: 'Você já tem uma carteira',
-                data: { wallet: formatWallet(existing) }
+                error: 'Endereço é obrigatório'
             });
         }
 
-        // Cria via wallet.js (blockchain + Mongo)
+        if (!isValidAddressFormat(address)) {
+            return res.status(400).json({
+                success: false,
+                error: 'Formato de endereço inválido'
+            });
+        }
+
+        // ===== VERIFICA SE JÁ TEM WALLET =====
         const user = await User.findById(req.userId);
-        const username = user.username + '_' + req.userId.toString().slice(-6);
+        if (user.walletAddress) {
+            const existing = await blockchainWallet.WalletModel.findOne({
+                address: user.walletAddress
+            });
+            if (existing) {
+                return res.status(409).json({
+                    success: false,
+                    error: 'Você já tem uma carteira',
+                    data: {
+                        wallet: {
+                            address: existing.address,
+                            username: existing.username,
+                            publicKey: existing.publicKey,
+                            createdAt: existing.createdAt
+                        }
+                    }
+                });
+            }
+        }
 
-        const result = await blockchainWallet.createWallet(username);
+        // ===== VERIFICA SE ENDEREÇO JÁ EXISTE =====
+        const WalletModel = blockchainWallet.WalletModel;
+        const addressExists = await WalletModel.findOne({ address });
+        if (addressExists) {
+            return res.status(409).json({
+                success: false,
+                error: 'Este endereço já está em uso'
+            });
+        }
 
-        // Vincula userId
-        const walletDoc = await Wallet.findOneAndUpdate(
+        // ===== VERIFICA USERNAME =====
+        // O wallet.js exige username único. Usamos o do User + sufixo
+        // se estiver em uso, ou o username que veio do frontend
+        let finalUsername = username || user.username;
+        const usernameInUse = await WalletModel.findOne({ username: finalUsername });
+        if (usernameInUse) {
+            finalUsername = `${user.username}_${req.userId.toString().slice(-6)}`;
+        }
+
+        // ===== CRIA WALLET USANDO wallet.js =====
+        // ⚠️ wallet.js gera endereço próprio. Vamos sobrepor com o do frontend
+        // pra garantir que seja o MESMO derivado da seed.
+        const result = await blockchainWallet.createWallet(finalUsername);
+
+        // Atualiza a wallet com o endereço que veio do frontend
+        // (e publicKey se fornecida)
+        await WalletModel.findOneAndUpdate(
             { address: result.address },
-            { $set: { userId: req.userId } },
-            { new: true }
+            {
+                $set: {
+                    address: address,               // sobrescreve com o do frontend
+                    publicKey: publicKey || result.publicKey,
+                    userId: req.userId              // 🆕 vincula ao user
+                }
+            }
         );
 
         // Vincula ao User
-        await User.findByIdAndUpdate(req.userId, {
-            $set: { walletAddress: result.address }
-        });
+        user.walletAddress = address;
+        await user.save();
 
+        // ===== RETORNA =====
         res.status(201).json({
             success: true,
             message: 'Carteira criada com sucesso',
             data: {
-                wallet: formatWallet(walletDoc),
-                initialBalance: result.initialBalance,
-                note: result.note
+                wallet: {
+                    address: address,
+                    username: finalUsername,
+                    publicKey: publicKey || result.publicKey,
+                    createdAt: result.createdAt
+                },
+                initialBalance: result.initialBalance || 1000,
+                note: 'Saldo será confirmado quando o próximo bloco for minerado'
+            }
+        });
+    })
+);
+
+// ============================================
+// POST /api/v1/wallet/import
+// Importa carteira existente via seed phrase
+// ============================================
+
+router.post(
+    '/import',
+    authenticate,
+    asyncHandler(async (req, res) => {
+        const { seed, password } = req.body;
+
+        if (!seed) {
+            return res.status(400).json({
+                success: false,
+                error: 'Seed phrase é obrigatória'
+            });
+        }
+
+        // ===== DERIVA ENDEREÇO DA SEED (mesmo algoritmo do frontend) =====
+        // SHA256(seed) → primeiros 38 chars → prefixo "Br"
+        const seedHash = crypto
+            .createHash('sha256')
+            .update(seed.trim())
+            .digest('hex');
+        const derivedAddress = 'Br' + seedHash.substring(0, 38);
+
+        // ===== VERIFICA SE ESSA WALLET JÁ EXISTE =====
+        const WalletModel = blockchainWallet.WalletModel;
+        const existingWallet = await WalletModel.findOne({ address: derivedAddress });
+
+        if (existingWallet) {
+            // Carteira já existe — só vincula ao usuário atual
+            const user = await User.findById(req.userId);
+            user.walletAddress = derivedAddress;
+            await user.save();
+
+            // Atualiza userId na wallet
+            await WalletModel.findOneAndUpdate(
+                { address: derivedAddress },
+                { $set: { userId: req.userId } }
+            );
+
+            return res.json({
+                success: true,
+                message: 'Carteira importada com sucesso (já existia)',
+                data: {
+                    wallet: {
+                        address: existingWallet.address,
+                        username: existingWallet.username,
+                        publicKey: existingWallet.publicKey,
+                        createdAt: existingWallet.createdAt
+                    }
+                }
+            });
+        }
+
+        // ===== CRIA NOVA WALLET COM ENDEREÇO DERIVADO =====
+        const user = await User.findById(req.userId);
+        let finalUsername = user.username;
+        const usernameInUse = await WalletModel.findOne({ username: finalUsername });
+        if (usernameInUse) {
+            finalUsername = `${user.username}_${req.userId.toString().slice(-6)}`;
+        }
+
+        const result = await blockchainWallet.createWallet(finalUsername);
+
+        // Sobrescreve com o endereço derivado da seed
+        await WalletModel.findOneAndUpdate(
+            { address: result.address },
+            {
+                $set: {
+                    address: derivedAddress,
+                    userId: req.userId
+                }
+            }
+        );
+
+        user.walletAddress = derivedAddress;
+        await user.save();
+
+        res.json({
+            success: true,
+            message: 'Carteira importada com sucesso',
+            data: {
+                wallet: {
+                    address: derivedAddress,
+                    username: finalUsername,
+                    publicKey: result.publicKey,
+                    createdAt: result.createdAt
+                }
             }
         });
     })
@@ -120,9 +266,26 @@ router.get(
     '/me',
     authenticate,
     asyncHandler(async (req, res) => {
-        const walletDoc = await getOrCreateUserWallet(req.userId);
+        const user = await User.findById(req.userId);
 
-        // Pega saldo REAL da blockchain
+        if (!user.walletAddress) {
+            return res.status(404).json({
+                success: false,
+                error: 'Você ainda não tem uma carteira',
+                code: 'NO_WALLET'
+            });
+        }
+
+        const walletDoc = await getUserWallet(req.userId);
+        if (!walletDoc) {
+            return res.status(404).json({
+                success: false,
+                error: 'Carteira não encontrada',
+                code: 'WALLET_NOT_FOUND'
+            });
+        }
+
+        // Saldo REAL da blockchain
         const balanceData = await blockchainWallet.getBalance(walletDoc.address);
 
         res.json({
@@ -152,11 +315,19 @@ router.get(
     '/address',
     authenticate,
     asyncHandler(async (req, res) => {
-        const walletDoc = await getOrCreateUserWallet(req.userId);
+        const user = await User.findById(req.userId);
+
+        if (!user.walletAddress) {
+            return res.status(404).json({
+                success: false,
+                error: 'Você ainda não tem uma carteira',
+                code: 'NO_WALLET'
+            });
+        }
 
         res.json({
             success: true,
-            data: { address: walletDoc.address }
+            data: { address: user.walletAddress }
         });
     })
 );
@@ -169,13 +340,22 @@ router.get(
     '/balance',
     authenticate,
     asyncHandler(async (req, res) => {
-        const walletDoc = await getOrCreateUserWallet(req.userId);
-        const balanceData = await blockchainWallet.getBalance(walletDoc.address);
+        const user = await User.findById(req.userId);
+
+        if (!user.walletAddress) {
+            return res.status(404).json({
+                success: false,
+                error: 'Você ainda não tem uma carteira',
+                code: 'NO_WALLET'
+            });
+        }
+
+        const balanceData = await blockchainWallet.getBalance(user.walletAddress);
 
         res.json({
             success: true,
             data: {
-                address: walletDoc.address,
+                address: user.walletAddress,
                 confirmed: balanceData.balance,
                 pending: balanceData.pending,
                 total: balanceData.total,
@@ -204,7 +384,6 @@ router.post(
         }
 
         const sendAmount = parseFloat(amount);
-
         if (isNaN(sendAmount) || sendAmount <= 0) {
             return res.status(400).json({
                 success: false,
@@ -219,7 +398,6 @@ router.post(
             });
         }
 
-        // Valida endereço de destino
         if (!blockchainWallet.isValidAddress(to)) {
             return res.status(400).json({
                 success: false,
@@ -227,19 +405,27 @@ router.post(
             });
         }
 
-        // Pega carteira do remetente
-        const fromWallet = await getOrCreateUserWallet(req.userId);
+        // ===== CARREGA CARTEIRA =====
+        const user = await User.findById(req.userId);
+        if (!user.walletAddress) {
+            return res.status(404).json({
+                success: false,
+                error: 'Você ainda não tem uma carteira',
+                code: 'NO_WALLET'
+            });
+        }
 
-        if (fromWallet.address === to) {
+        if (user.walletAddress === to) {
             return res.status(400).json({
                 success: false,
                 error: 'Você não pode enviar para si mesmo'
             });
         }
 
-        // Verifica se destinatário existe
-        const toWalletExists = await Wallet.findOne({ address: to });
-        if (!toWalletExists) {
+        // ===== VERIFICA DESTINATÁRIO =====
+        const WalletModel = blockchainWallet.WalletModel;
+        const toWallet = await WalletModel.findOne({ address: to });
+        if (!toWallet) {
             return res.status(404).json({
                 success: false,
                 error: 'Endereço de destino não encontrado'
@@ -247,7 +433,7 @@ router.post(
         }
 
         // ===== VERIFICA SALDO =====
-        const balanceData = await blockchainWallet.getBalance(fromWallet.address);
+        const balanceData = await blockchainWallet.getBalance(user.walletAddress);
         const totalDebit = round8(sendAmount + FEE_AMOUNT);
 
         if (balanceData.total < totalDebit) {
@@ -257,12 +443,11 @@ router.post(
             });
         }
 
-        // ===== ADICIONA NA BLOCKCHAIN =====
+        // ===== ENVIA PRA BLOCKCHAIN =====
         const txId = generateTxId();
 
-        // Transação principal (envio)
         await blockchainWallet.addTransaction({
-            fromAddress: fromWallet.address,
+            fromAddress: user.walletAddress,
             toAddress: to,
             amount: sendAmount,
             fee: FEE_AMOUNT,
@@ -272,21 +457,18 @@ router.post(
             message: message || null
         });
 
-        // Transação de fee (se quiser registrar)
-        // (opcional - você pode remover isso se não quiser)
-
         res.json({
             success: true,
             message: `Transação enviada. Aguardando confirmação na blockchain...`,
             data: {
                 txId,
-                from: fromWallet.address,
+                from: user.walletAddress,
                 to,
                 amount: sendAmount,
                 fee: FEE_AMOUNT,
                 totalDebit,
                 status: 'pending',
-                note: 'A transação será confirmada em até 30 segundos quando o próximo bloco for minerado'
+                note: 'A transação será confirmada em até 30 segundos'
             }
         });
     })
@@ -300,14 +482,21 @@ router.get(
     '/history',
     authenticate,
     asyncHandler(async (req, res) => {
-        const walletDoc = await getOrCreateUserWallet(req.userId);
+        const user = await User.findById(req.userId);
+
+        if (!user.walletAddress) {
+            return res.status(404).json({
+                success: false,
+                error: 'Você ainda não tem uma carteira',
+                code: 'NO_WALLET'
+            });
+        }
+
         const limit = parseInt(req.query.limit) || 50;
+        const history = await blockchainWallet.getHistory(user.walletAddress, limit);
 
-        const history = await blockchainWallet.getHistory(walletDoc.address, limit);
-
-        // Formata pro frontend
         const formatted = history.map((tx) => {
-            const isSent = tx.fromAddress === walletDoc.address;
+            const isSent = tx.fromAddress === user.walletAddress;
             return {
                 txId: tx.txId || null,
                 type: isSent ? 'sent' : 'received',
@@ -326,7 +515,7 @@ router.get(
         res.json({
             success: true,
             data: {
-                address: walletDoc.address,
+                address: user.walletAddress,
                 transactions: formatted,
                 count: formatted.length
             }
@@ -336,7 +525,7 @@ router.get(
 
 // ============================================
 // POST /api/v1/wallet/airdrop
-// (DESATIVADO por enquanto)
+// ⏸️ DESATIVADO
 // ============================================
 
 router.post(
@@ -351,8 +540,7 @@ router.post(
             });
         }
 
-        // ... (lógica de airdrop pra quando ativar)
-        // Por enquanto, apenas retorna aviso
+        // (lógica pra quando ativar)
     })
 );
 
@@ -375,19 +563,6 @@ router.get(
         });
     })
 );
-
-// ============================================
-// HELPER — Formata wallet pra resposta
-// ============================================
-
-function formatWallet(walletDoc) {
-    return {
-        address: walletDoc.address,
-        username: walletDoc.username,
-        publicKey: walletDoc.publicKey,
-        createdAt: walletDoc.createdAt
-    };
-}
 
 // ============================================
 // EXPORTS
