@@ -14,6 +14,14 @@ const WalletSchema = new mongoose.Schema({
     address: { type: String, required: true, unique: true, index: true },
     username: { type: String, required: true, unique: true, index: true },
     publicKey: { type: String, required: true },
+    
+    userId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+        default: null,
+        index: true
+    },
+
     createdAt: { type: String, default: () => new Date().toISOString() }
 });
 
@@ -56,9 +64,15 @@ async function initialize() {
 }
 
 // ============================================
-// CRIAR CARTEIRA
+// CRIAR CARTEIRA (aceita address/publicKey/userId opcionais)
 // ============================================
-async function createWallet(username) {
+async function createWallet(username, options = {}) {
+    const {
+        address: presetAddress,
+        publicKey: presetPublicKey,
+        userId = null
+    } = options;
+
     if (!username || username.length < 3) {
         throw new Error('Username deve ter pelo menos 3 caracteres');
     }
@@ -69,47 +83,59 @@ async function createWallet(username) {
         throw new Error(`Username "${username}" já está em uso`);
     }
 
-    // Gera endereço único (garante que não colide)
-    let address;
-    let attempts = 0;
-    do {
-        address = 'Br' + crypto.randomBytes(10).toString('hex').toUpperCase();
-        attempts++;
-        if (attempts > 5) throw new Error('Não foi possível gerar endereço único');
-    } while (await WalletModel.findOne({ address }));
+    // Endereço: usa o do frontend se vier, senão gera
+    let address = presetAddress;
+    if (!address) {
+        let attempts = 0;
+        do {
+            address = 'Br' + crypto.randomBytes(10).toString('hex').toUpperCase();
+            attempts++;
+            if (attempts > 5) throw new Error('Não foi possível gerar endereço único');
+        } while (await WalletModel.findOne({ address }));
+    } else {
+        if (!isValidAddress(address)) {
+            throw new Error('Endereço inválido');
+        }
+        const addrExists = await WalletModel.findOne({ address });
+        if (addrExists) {
+            throw new Error('Endereço já está em uso');
+        }
+    }
 
-    // Gera par de chaves
+    // Gera par de chaves (ou usa a publicKey do frontend)
     const keys = generateWalletKeys();
+    const finalPublicKey = presetPublicKey || keys.publicKey;
 
-    // Salva wallet no Mongo
+    // Salva wallet no Mongo — AGORA COM userId
     await WalletModel.create({
         address,
         username,
-        publicKey: keys.publicKey,
+        publicKey: finalPublicKey,
+        userId,
         createdAt: new Date().toISOString()
     });
 
-    // Cria transação de criação (fromAddress: null = criação/sistema)
+    // Transação de criação (fromAddress: null = sistema)
     const initialBalance = parseInt(process.env.INITIAL_BALANCE) || 1000;
 
     const tx = {
-        fromAddress: null,               // ✅ compatível com blockchain.js
-        toAddress: address,              // ✅ compatível
+        fromAddress: null,
+        toAddress: address,
         amount: initialBalance,
         timestamp: new Date().toISOString(),
         type: 'wallet_creation'
     };
 
-    await blockchain.addTransaction(tx); // ✅ await + formato certo
+    await blockchain.addTransaction(tx);
 
     console.log(`👤 Carteira criada: ${username} (${address})`);
-    console.log(`💰 Saldo inicial pendente: ${initialBalance} BRD (será confirmado no próximo bloco)`);
+    console.log(`💰 Saldo inicial pendente: ${initialBalance} BRD`);
 
     return {
         address,
         username,
-        publicKey: keys.publicKey,
-        privateKey: keys.privateKey, // ⚠️ NUNCA expor em produção!
+        publicKey: finalPublicKey,
+        privateKey: keys.privateKey,
         initialBalance,
         createdAt: new Date().toISOString(),
         note: 'Saldo será confirmado quando o próximo bloco for minerado'
