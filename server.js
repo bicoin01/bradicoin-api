@@ -45,6 +45,13 @@ const explorer = require('./explorer');
 const market = require('./market');
 
 // ============================================
+// IMPORTAÇÕES — AUTH
+// ============================================
+const mongoose = require('mongoose');
+const authRoutes = require('./routes/auth');
+const { errorHandler, notFoundHandler } = require('./middleware/error');
+
+// ============================================
 // CONFIGURAÇÃO DO LOGGER
 // ============================================
 const logger = winston.createLogger({
@@ -138,6 +145,10 @@ app.get('/health', (req, res) => {
 // ============================================
 // ROTAS DA API
 // ============================================
+
+// ========== AUTH (v1) ==========
+app.use('/api/v1/auth', authRoutes);
+logger.info('✅ Rotas de auth montadas em /api/v1/auth');
 
 // ========== WALLET ==========
 app.post('/api/wallet/create', async (req, res) => {
@@ -362,15 +373,33 @@ io.on('connection', async (socket) => {
 });
 
 // ============================================
+// MIDDLEWARES DE ERRO (DEVEM SER OS ÚLTIMOS)
+// ============================================
+app.use(notFoundHandler);
+app.use(errorHandler);
+
+// ============================================
 // SERVIÇO DE ARQUIVOS ESTÁTICOS
 // ============================================
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Fallback para SPA — só para rotas NÃO-API
+// Fallback para SPA — serve HTML se existir, senão deixa passar
 app.get('*', (req, res, next) => {
+    // Deixa as rotas /api passarem como 404 JSON
     if (req.path.startsWith('/api')) {
         return res.status(404).json({ error: 'Rota não encontrada' });
     }
+
+    // Tenta servir o arquivo específico (ex: /wallet.html)
+    const safePath = req.path.replace(/^\//, '').split('?')[0];
+    if (safePath && safePath.includes('.')) {
+        const filePath = path.join(__dirname, 'public', safePath);
+        return res.sendFile(filePath, (err) => {
+            if (err) next();
+        });
+    }
+
+    // Senão, serve index.html (SPA fallback)
     res.sendFile(path.join(__dirname, 'public', 'index.html'), (err) => {
         if (err) next();
     });
@@ -442,12 +471,31 @@ async function startRewardDistribution() {
 }
 
 // ============================================
+// CONEXÃO COM MONGODB
+// ============================================
+async function connectMongoDB() {
+    try {
+        await mongoose.connect(process.env.MONGO_URI, {
+            serverSelectionTimeoutMS: 5000,
+            socketTimeoutMS: 45000
+        });
+        logger.info('✅ MongoDB conectado');
+    } catch (error) {
+        logger.error('❌ Erro ao conectar MongoDB:', error);
+        process.exit(1);
+    }
+}
+
+// ============================================
 // INICIALIZAÇÃO
 // ============================================
 async function initialize() {
     try {
         logger.info('🚀 Inicializando Bradicoin Blockchain...');
 
+        // Conecta no MongoDB PRIMEIRO
+        await connectMongoDB();
+        
         // Inicializa todos os módulos em sequência
         await blockchain.initialize();
         await wallet.initialize();
