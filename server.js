@@ -49,6 +49,8 @@ const market = require('./market');
 // ============================================
 const mongoose = require('mongoose');
 const authRoutes = require('./routes/auth');
+const reserveRoutes = require('./routes/reserve');
+const reserveStakingRoutes = require('./routes/reserveStaking');
 const { errorHandler, notFoundHandler } = require('./middleware/error');
 
 // ============================================
@@ -149,6 +151,11 @@ app.get('/health', (req, res) => {
 // ========== AUTH (v1) ==========
 app.use('/api/v1/auth', authRoutes);
 logger.info('✅ Rotas de auth montadas em /api/v1/auth');
+
+// ========== FUNDO DE RESERVA ==========
+app.use('/api/v1/reserve', reserveRoutes);
+app.use('/api/v1/reserve-staking', reserveStakingRoutes);
+logger.info('✅ Rotas do Fundo de Reserva montadas');
 
 // ========== WALLET ==========
 app.post('/api/wallet/create', async (req, res) => {
