@@ -110,12 +110,9 @@ const io = socketIo(server, {
         methods: ['GET', 'POST'],
         credentials: true
     },
-    // Sem isso, qualquer origem conecta via WebSocket
     allowRequest: (req, callback) => {
         const origin = req.headers.origin;
-        // Permite sem origin (curl, mobile app)
         if (!origin) return callback(null, true);
-        // Verifica whitelist
         const ok = ALLOWED_ORIGINS.includes(origin);
         callback(null, ok);
     }
@@ -125,9 +122,8 @@ const io = socketIo(server, {
 io.use(async (socket, next) => {
     try {
         const token = socket.handshake.auth?.token;
-        
+
         if (!token) {
-            // Conexão anônima é permitida (só vê eventos públicos)
             socket.user = null;
             return next();
         }
@@ -150,7 +146,6 @@ io.use(async (socket, next) => {
 
         next();
     } catch (error) {
-        // Falha silenciosa — conecta como anônimo
         socket.user = null;
         next();
     }
@@ -160,15 +155,14 @@ io.use(async (socket, next) => {
 // MIDDLEWARE DE SEGURANÇA
 // ============================================
 
-// 1. Trust proxy (para req.ip funcionar atrás de Nginx)
 app.set('trust proxy', 1);
 
-// 2. Helmet (headers de segurança + CSP)
+// Helmet
 app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc: ["'self'"],
-            scriptSrc: ["'self'"],                    // ajuste se usar CDN de scripts
+            scriptSrc: ["'self'"],
             styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
             fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
             imgSrc: ["'self'", "data:", "blob:"],
@@ -184,11 +178,7 @@ app.use(helmet({
     crossOriginEmbedderPolicy: false,
     crossOriginResourcePolicy: { policy: 'cross-origin' },
     hsts: IS_PROD
-        ? {
-              maxAge: 31536000,        // 1 ano
-              includeSubDomains: true,
-              preload: true
-          }
+        ? { maxAge: 31536000, includeSubDomains: true, preload: true }
         : false,
     referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
     noSniff: true,
@@ -196,16 +186,11 @@ app.use(helmet({
     xssFilter: true
 }));
 
-// 3. CORS (whitelist)
+// CORS
 app.use(cors({
     origin: (origin, cb) => {
-        // Permite requisições sem origin (curl, Postman, apps mobile)
         if (!origin) return cb(null, true);
-        
-        if (ALLOWED_ORIGINS.includes(origin)) {
-            return cb(null, true);
-        }
-        
+        if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
         logger.warn('CORS bloqueado para origem:', origin);
         cb(new Error('Origem não permitida pelo CORS'));
     },
@@ -214,33 +199,21 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// 4. Sanitização contra NoSQL injection
-app.use(mongoSanitize({
-    replaceWith: '_',
-    allowDots: false
-}));
-
-// 5. HTTP Parameter Pollution
+// Sanitização
+app.use(mongoSanitize({ replaceWith: '_', allowDots: false }));
 app.use(hpp());
 
-// 6. Compressão
+// Compressão
 app.use(compression());
 
-// 7. Body parsers (limite 1MB)
-app.use(express.json({
-    limit: '1mb',
-    strict: true
-}));
-app.use(express.urlencoded({
-    extended: false,
-    limit: '1mb'
-}));
+// Body parsers
+app.use(express.json({ limit: '1mb', strict: true }));
+app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 
 // ============================================
 // LOGGER DE REQUISIÇÕES
 // ============================================
 if (IS_PROD) {
-    // Em produção, loga apenas erros e lentidão
     app.use((req, res, next) => {
         const start = Date.now();
         res.on('finish', () => {
@@ -257,7 +230,6 @@ if (IS_PROD) {
         next();
     });
 } else {
-    // Em dev, loga tudo
     app.use((req, res, next) => {
         logger.info(`${req.method} ${req.path}`);
         next();
@@ -268,7 +240,6 @@ if (IS_PROD) {
 // RATE LIMITERS
 // ============================================
 
-// Limite geral
 const generalLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 300,
@@ -277,7 +248,6 @@ const generalLimiter = rateLimit({
     message: { success: false, error: 'Muitas requisições. Tente novamente em 15 minutos.' }
 });
 
-// Limite para transações (mais restrito)
 const txLimiter = rateLimit({
     windowMs: 60 * 1000,
     max: 20,
@@ -285,7 +255,6 @@ const txLimiter = rateLimit({
     message: { success: false, error: 'Muitas transações. Tente novamente em 1 minuto.' }
 });
 
-// Aplica limite geral em toda API
 app.use('/api', generalLimiter);
 
 // ============================================
@@ -315,19 +284,15 @@ app.get('/health/detailed', asyncHandler(async (req, res) => {
 // ROTAS DA API — v1
 // ============================================
 
-// Auth
 app.use('/api/v1/auth', authRoutes);
 logger.info('✅ Rotas: /api/v1/auth');
 
-// Wallet (balance, history, nonce)
 app.use('/api/v1/wallet', walletRoutes);
 logger.info('✅ Rotas: /api/v1/wallet');
 
-// Transactions (submit, get)
 app.use('/api/v1/transaction', txLimiter, transactionRoutes);
 logger.info('✅ Rotas: /api/v1/transaction');
 
-// Reserve
 app.use('/api/v1/reserve', reserveRoutes);
 app.use('/api/v1/reserve-staking', reserveStakingRoutes);
 logger.info('✅ Rotas: /api/v1/reserve + /api/v1/reserve-staking');
@@ -335,9 +300,7 @@ logger.info('✅ Rotas: /api/v1/reserve + /api/v1/reserve-staking');
 // ============================================
 // ROTAS DE ADMIN
 // ============================================
-// ⚠️ Só admin. Usadas pela página do Reserve.
 
-// Enviar transação do Reserve
 app.post(
     '/api/v1/admin/reserve/send',
     authenticate,
@@ -355,7 +318,6 @@ app.post(
             publicKey
         } = req.body;
 
-        // Confirma que o admin está enviando do Reserve
         if (fromAddress !== process.env.RESERVE_ADDRESS) {
             throw new AppError('Admin só pode enviar do Reserve', 403);
         }
@@ -380,7 +342,6 @@ app.post(
     })
 );
 
-// Info do Reserve
 app.get(
     '/api/v1/admin/reserve/info',
     authenticate,
@@ -392,7 +353,6 @@ app.get(
     })
 );
 
-// Mint (só admin)
 app.post(
     '/api/v1/admin/reserve/mint',
     authenticate,
@@ -440,25 +400,20 @@ io.on('connection', async (socket) => {
 // SPA FALLBACK + ARQUIVOS ESTÁTICOS
 // ============================================
 
-// Arquivos estáticos
 app.use(express.static(path.join(__dirname, 'public'), {
     maxAge: IS_PROD ? '1d' : 0,
     etag: true
 }));
 
-// Fallback SPA (seguro contra path traversal)
 app.get('*', (req, res, next) => {
-    // Rotas /api passam para o notFoundHandler
     if (req.path.startsWith('/api')) {
         return next();
     }
 
-    // Rejeita paths suspeitos
     if (req.path.includes('..') || req.path.includes('\0')) {
         throw new AppError('Caminho inválido', 400);
     }
 
-    // Serve index.html como SPA fallback
     const indexPath = path.join(__dirname, 'public', 'index.html');
     res.sendFile(indexPath, (err) => {
         if (err) next();
@@ -466,7 +421,7 @@ app.get('*', (req, res, next) => {
 });
 
 // ============================================
-// HANDLERS DE ERRO (DEVEM SER OS ÚLTIMOS)
+// HANDLERS DE ERRO
 // ============================================
 app.use(notFoundHandler);
 app.use(errorHandler);
@@ -490,7 +445,7 @@ async function connectMongoDB() {
 }
 
 // ============================================
-// AUTO-MINING (com lock distribuído em memória)
+// AUTO-MINING
 // ============================================
 let miningInterval = null;
 let miningLock = false;
@@ -499,7 +454,6 @@ const MINING_INTERVAL_MS = parseInt(process.env.MINING_INTERVAL_MS) || 30000;
 
 async function startAutoMining() {
     miningInterval = setInterval(async () => {
-        // Lock local (evita execuções sobrepostas)
         if (miningLock) return;
         miningLock = true;
 
@@ -514,7 +468,6 @@ async function startAutoMining() {
                 return;
             }
 
-            // Garante que a carteira do minerador existe
             const minerWallet = await WalletModel.findOne({ address: minerAddress });
             if (!minerWallet) {
                 logger.warn(`Carteira do minerador não encontrada: ${minerAddress}`);
@@ -525,7 +478,6 @@ async function startAutoMining() {
             if (block) {
                 logger.info(`⛏️ Bloco ${block.index} minerado (${block.transactions.length} txs)`);
 
-                // Notifica todos os clientes WS
                 io.emit('block:mined', {
                     index: block.index,
                     hash: block.hash,
@@ -552,25 +504,20 @@ async function initialize() {
         logger.info(`🌐 Domínio: ${DOMAIN}`);
         logger.info(`🔧 Modo: ${process.env.NODE_ENV || 'development'}`);
 
-        // 1. Conecta no MongoDB
         await connectMongoDB();
 
-        // 2. Inicializa módulos em ordem
         await blockchain.initialize();
         await wallet.initialize();
         await transactions.initialize();
 
-        // 3. Reserva
         const { ReserveModel } = require('./models/Reserve');
         const reserve = await ReserveModel.getReserve();
         logger.info(`🏦 Reserve: ${reserve.address}`);
         logger.info(`💰 Reserve balance: ${reserve.balance.toString()} BRD`);
         logger.info(`📊 Max supply: ${reserve.maxSupply.toString()} BRD`);
 
-        // 4. Auto-mining
         await startAutoMining();
 
-        // 5. Inicia servidor
         server.listen(PORT, () => {
             logger.info('');
             logger.info('════════════════════════════════════════');
@@ -621,7 +568,6 @@ async function shutdown(signal) {
         });
     });
 
-    // Força saída depois de 10s
     setTimeout(() => {
         logger.error('⚠️ Forçando saída após timeout');
         process.exit(1);
