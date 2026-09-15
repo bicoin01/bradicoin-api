@@ -56,7 +56,7 @@ const { errorHandler, notFoundHandler } = require('./middleware/error');
 // ============================================
 // CONFIGURAÇÃO DO LOGGER
 // ============================================
-const logger = winston.createLogger({
+const { logger } = require('./middleware/error');
     level: process.env.LOG_LEVEL || 'info',
     format: winston.format.combine(
         winston.format.timestamp(),
