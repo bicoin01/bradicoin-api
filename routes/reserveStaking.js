@@ -1,28 +1,25 @@
 // routes/reserveStaking.js
 // ============================================
-// Staking do Fundo de Reserva (130% APR / 50% APR)
+// Staking do Fundo de Reserva - BradiChain (v2.0)
+// ============================================
+// ⚠️ USO PESSOAL — APRs altos (130% / 50%) mantidos.
+// Em produção pública, reduzir para 5-15%.
 // ============================================
 
 const express = require('express');
 const router = express.Router();
-const crypto = require('crypto');
-const User = require('../models/User');
-const blockchainWallet = require('../wallet');
-const blockchain = require('../blockchain');
-const { ReserveModel } = require('../models/Reserve');
-const { ReserveStakeModel, POOLS, calcReward } = require('../models/ReserveStake');
-const { authenticate } = require('../middleware/auth');
-const { asyncHandler } = require('../middleware/error');
+const { Decimal128 } = require('mongoose').Schema.Types;
 
-function generateTxId() {
-    return 'tx_' + crypto.randomBytes(16).toString('hex');
-}
+const { ReserveModel } = require('../models/Reserve');
+const { ReserveStakeModel, POOLS } = require('../models/ReserveStake');
+const WalletModel = require('../models/Wallet');
+const wallet = require('../wallet');
+const { authenticate } = require('../middleware/auth');
+const { asyncHandler, AppError } = require('../middleware/error');
 
 // ============================================
 // GET /api/v1/reserve-staking/pools
-// Lista os pools disponíveis
 // ============================================
-
 router.get(
     '/pools',
     asyncHandler(async (req, res) => {
@@ -32,6 +29,7 @@ router.get(
             seconds: p.seconds,
             apr: p.apr,
             minStake: p.minStake,
+            maxStake: p.maxStake,
             icon: p.icon
         }));
 
@@ -44,9 +42,12 @@ router.get(
 
 // ============================================
 // POST /api/v1/reserve-staking/stake
-// Cria stake com 130% APR / 50% APR
 // ============================================
-
+// ⚠️ Lógica:
+//   1. Debita do saldo do usuário (atomic)
+//   2. Credita no Reserve (atomic)
+//   3. Cria registro de stake
+//
 router.post(
     '/stake',
     authenticate,
@@ -55,127 +56,91 @@ router.post(
 
         // ===== VALIDAÇÕES =====
         if (!amount || !poolKey) {
-            return res.status(400).json({
-                success: false,
-                error: 'Valor e pool são obrigatórios'
-            });
+            throw new AppError('Valor e pool são obrigatórios', 400);
         }
 
         const pool = POOLS[poolKey];
         if (!pool) {
-            return res.status(400).json({
-                success: false,
-                error: 'Pool inválido'
-            });
+            throw new AppError('Pool inválido', 400);
         }
 
-        const stakeAmount = parseFloat(amount);
-        if (isNaN(stakeAmount) || stakeAmount <= 0) {
-            return res.status(400).json({
-                success: false,
-                error: 'Valor inválido'
-            });
+        const amountNum = parseFloat(amount);
+        if (!Number.isFinite(amountNum) || amountNum <= 0) {
+            throw new AppError('Valor inválido', 400);
         }
 
-        if (stakeAmount < pool.minStake) {
-            return res.status(400).json({
-                success: false,
-                error: `Mínimo para ${pool.name}: ${pool.minStake} BRD`
-            });
+        const minStake = parseFloat(pool.minStake);
+        if (amountNum < minStake) {
+            throw new AppError(`Mínimo para ${pool.name}: ${minStake} BRD`, 400);
         }
 
-        // ===== CARREGA USER E WALLET =====
-        const user = await User.findById(req.userId);
-        if (!user || !user.walletAddress) {
-            return res.status(404).json({
-                success: false,
-                error: 'Você precisa ter uma carteira'
-            });
+        const maxStake = parseFloat(pool.maxStake);
+        if (amountNum > maxStake) {
+            throw new AppError(`Máximo para ${pool.name}: ${maxStake} BRD`, 400);
         }
 
-        const WalletModel = blockchainWallet.WalletModel;
-        const walletDoc = await WalletModel.findOne({ address: user.walletAddress });
-        if (!walletDoc) {
-            return res.status(404).json({
-                success: false,
-                error: 'Carteira não encontrada'
-            });
+        // ===== CARREGA WALLET DO USUÁRIO =====
+        const userWallet = await WalletModel.findOne({
+            userId: req.user._id,
+            status: 'active'
+        });
+
+        if (!userWallet) {
+            throw new AppError('Você precisa ter uma carteira ativa', 404);
         }
 
         // ===== VERIFICA SE JÁ TEM STAKE ATIVO =====
-        const existing = await ReserveStakeModel.getActiveStake(req.userId);
+        const existing = await ReserveStakeModel.getActiveStake(req.user._id);
         if (existing) {
-            return res.status(409).json({
-                success: false,
-                error: 'Você já tem um stake ativo. Faça unstake antes de criar outro.',
-                data: {
-                    activeStake: {
-                        id: existing._id,
-                        pool: existing.poolName,
-                        amount: existing.amount,
-                        endTime: existing.endTime
-                    }
-                }
-            });
+            throw new AppError(
+                'Você já tem um stake ativo. Faça unstake antes de criar outro.',
+                409
+            );
         }
 
         // ===== VERIFICA SALDO =====
-        const balanceData = await blockchainWallet.getBalance(user.walletAddress);
-        if (balanceData.total < stakeAmount) {
-            return res.status(400).json({
-                success: false,
-                error: `Saldo insuficiente. Você tem ${balanceData.total} BRD`
-            });
+        const balanceNum = parseFloat(userWallet.balance.toString());
+        if (balanceNum < amountNum) {
+            throw new AppError(`Saldo insuficiente: ${balanceNum} BRD`, 400);
         }
 
-        // ===== DEBITA DO USUÁRIO (blockchain) =====
-        const txId = generateTxId();
-        await blockchain.addTransaction({
-            fromAddress: user.walletAddress,
-            toAddress: blockchainWallet.RESERVE_ADDRESS || 'Br7ReserveA9k2M8pQ5tN1vB4cD6wE0yU3iL',
-            amount: stakeAmount,
-            fee: 0,
-            timestamp: new Date().toISOString(),
-            type: 'reserve_stake',
-            txId
-        });
+        // ===== DEBITA DO USUÁRIO (atomic) =====
+        const amountStr = amountNum.toString();
+        await WalletModel.debit(userWallet.address, amountStr);
 
-        // ===== CRIA REGISTRO DO STAKE =====
+        // ===== CREDITA NO RESERVE (atomic) =====
+        await ReserveModel.receiveStake(amountStr);
+
+        // ===== CRIA REGISTRO DE STAKE =====
         const now = Date.now();
         const stake = await ReserveStakeModel.create({
-            userId: req.userId,
-            address: user.walletAddress,
+            userId: req.user._id,
+            address: userWallet.address,
             poolKey,
             poolName: pool.name,
-            amount: stakeAmount,
+            amount: Decimal128.fromString(amountStr),
             apr: pool.apr,
             seconds: pool.seconds,
             startTime: new Date(now),
             endTime: new Date(now + pool.seconds * 1000),
-            status: 'active',
-            txHash: txId
+            status: 'active'
         });
-
-        // ===== ATUALIZA ESTATÍSTICAS DO FUNDO =====
-        const reserve = await ReserveModel.getReserve();
-        reserve.totalStakes += 1;
-        await reserve.save();
 
         res.json({
             success: true,
-            message: `Stake de ${stakeAmount} BRD criado em ${pool.name}`,
+            message: `Stake de ${amountNum} BRD criado em ${pool.name}`,
             data: {
                 stake: {
                     id: stake._id,
                     pool: stake.poolName,
-                    amount: stake.amount,
+                    poolKey: stake.poolKey,
+                    amount: stake.amount.toString(),
                     apr: stake.apr,
                     seconds: stake.seconds,
                     startTime: stake.startTime,
                     endTime: stake.endTime,
-                    expectedReward: stake.getExpectedReward(),
-                    status: stake.status,
-                    txHash: stake.txHash
+                    expectedReward: stake.getExpectedReward().toString(),
+                    status: stake.status
                 }
             }
         });
@@ -184,92 +149,61 @@ router.post(
 
 // ============================================
 // POST /api/v1/reserve-staking/unstake
-// Libera o stake + recompensa
 // ============================================
-
 router.post(
     '/unstake',
     authenticate,
     asyncHandler(async (req, res) => {
-        const user = await User.findById(req.userId);
-        if (!user || !user.walletAddress) {
-            return res.status(404).json({
-                success: false,
-                error: 'Você precisa ter uma carteira'
-            });
-        }
-
         // ===== PEGA STAKE ATIVO =====
-        const stake = await ReserveStakeModel.getActiveStake(req.userId);
+        const stake = await ReserveStakeModel.getActiveStake(req.user._id);
         if (!stake) {
-            return res.status(404).json({
-                success: false,
-                error: 'Você não tem stake ativo'
-            });
+            throw new AppError('Você não tem stake ativo', 404);
         }
 
         // ===== VERIFICA SE JÁ PODE SACAR =====
         if (!stake.isReady()) {
             const remaining = stake.getTimeRemaining();
-            return res.status(400).json({
-                success: false,
-                error: `Stake ainda bloqueado. Faltam ${Math.ceil(remaining / 1000)} segundos`,
-                data: {
-                    remainingMs: remaining,
-                    endTime: stake.endTime
-                }
-            });
+            throw new AppError(
+                `Stake ainda bloqueado. Faltam ${Math.ceil(remaining / 1000)} segundos`,
+                400
+            );
         }
 
         // ===== CALCULA RECOMPENSA =====
-        const reward = stake.getExpectedReward();
-        const totalReturn = stake.amount + reward;
+        const rewardNum = parseFloat(stake.getExpectedReward());
+        const principalNum = parseFloat(stake.amount.toString());
+        const totalReturn = principalNum + rewardNum;
 
-        // ===== CRÉDITO DO PRINCIPAL =====
-        const txId1 = generateTxId();
-        await blockchain.addTransaction({
-            fromAddress: 'Br7ReserveA9k2M8pQ5tN1vB4cD6wE0yU3iL',
-            toAddress: user.walletAddress,
-            amount: stake.amount,
-            fee: 0,
-            timestamp: new Date().toISOString(),
-            type: 'reserve_unstake',
-            txId: txId1
-        });
+        const principalStr = principalNum.toString();
+        const rewardStr = rewardNum.toFixed(8);
 
-        // ===== CRÉDITO DA RECOMPENSA =====
-        const txId2 = generateTxId();
-        await blockchain.addTransaction({
-            fromAddress: null, // sistema
-            toAddress: user.walletAddress,
-            amount: reward,
-            fee: 0,
-            timestamp: new Date().toISOString(),
-            type: 'reserve_reward',
-            txId: txId2
-        });
+        // ===== DEBITA PRINCIPAL + REWARD DO RESERVE =====
+        const totalStr = (principalNum + rewardNum).toFixed(8);
+        await ReserveModel.debit(totalStr, 'reward');
+
+        // ===== CREDITA NO USUÁRIO (atomic) =====
+        await WalletModel.credit(stake.address, principalStr);
+        if (rewardNum > 0) {
+            await WalletModel.credit(stake.address, rewardStr);
+        }
 
         // ===== ATUALIZA O STAKE =====
         stake.status = 'completed';
-        stake.reward = reward;
-        stake.totalReturn = totalReturn;
+        stake.reward = Decimal128.fromString(rewardStr);
+        stake.totalReturn = Decimal128.fromString(totalStr);
+        stake.rewardPaid = true;
         stake.completedAt = new Date();
         await stake.save();
-
-        // ===== ATUALIZA ESTATÍSTICAS DO FUNDO =====
-        await ReserveModel.recordReward(reward);
 
         res.json({
             success: true,
             message: `Unstake realizado! ${totalReturn.toFixed(4)} BRD creditado`,
             data: {
                 stakeId: stake._id,
-                principal: stake.amount,
-                reward,
-                totalReturn,
-                txIdPrincipal: txId1,
-                txIdReward: txId2,
-                newBalance: 'Consulta /api/v1/wallet/balance'
+                principal: principalStr,
+                reward: rewardStr,
+                totalReturn: totalStr,
+                newBalance: 'Consulte /api/v1/wallet/balance/' + stake.address
             }
         });
     })
@@ -277,28 +211,26 @@ router.post(
 
 // ============================================
 // GET /api/v1/reserve-staking/stakes
-// Lista stakes do usuário
 // ============================================
-
 router.get(
     '/stakes',
     authenticate,
     asyncHandler(async (req, res) => {
-        const limit = parseInt(req.query.limit) || 20;
-        const stakes = await ReserveStakeModel.getUserStakes(req.userId, limit);
+        const limit = Math.min(Math.max(1, parseInt(req.query.limit) || 20), 100);
+        const stakes = await ReserveStakeModel.getUserStakes(req.user._id, limit);
 
         const formatted = stakes.map((s) => ({
             id: s._id,
             pool: s.poolName,
             poolKey: s.poolKey,
-            amount: s.amount,
+            amount: s.amount?.toString() || '0',
             apr: s.apr,
             seconds: s.seconds,
             startTime: s.startTime,
             endTime: s.endTime,
             status: s.status,
-            reward: s.reward,
-            totalReturn: s.totalReturn,
+            reward: s.reward?.toString() || '0',
+            totalReturn: s.totalReturn?.toString() || '0',
             txHash: s.txHash,
             completedAt: s.completedAt,
             createdAt: s.createdAt
@@ -316,14 +248,12 @@ router.get(
 
 // ============================================
 // GET /api/v1/reserve-staking/active
-// Stake ativo atual
 // ============================================
-
 router.get(
     '/active',
     authenticate,
     asyncHandler(async (req, res) => {
-        const stake = await ReserveStakeModel.getActiveStake(req.userId);
+        const stake = await ReserveStakeModel.getActiveStake(req.user._id);
 
         if (!stake) {
             return res.json({
@@ -339,17 +269,16 @@ router.get(
                     id: stake._id,
                     pool: stake.poolName,
                     poolKey: stake.poolKey,
-                    amount: stake.amount,
+                    amount: stake.amount.toString(),
                     apr: stake.apr,
                     seconds: stake.seconds,
                     startTime: stake.startTime,
                     endTime: stake.endTime,
                     status: stake.status,
-                    expectedReward: stake.getExpectedReward(),
+                    expectedReward: stake.getExpectedReward().toString(),
                     progress: stake.getProgress(),
                     timeRemaining: stake.getTimeRemaining(),
-                    isReady: stake.isReady(),
-                    txHash: stake.txHash
+                    isReady: stake.isReady()
                 }
             }
         });
@@ -357,7 +286,20 @@ router.get(
 );
 
 // ============================================
+// GET /api/v1/reserve-staking/stats
+// ============================================
+router.get(
+    '/stats',
+    asyncHandler(async (req, res) => {
+        const stats = await ReserveStakeModel.getStats();
+        res.json({
+            success: true,
+            data: stats
+        });
+    })
+);
+
+// ============================================
 // EXPORTS
 // ============================================
-
 module.exports = router;
