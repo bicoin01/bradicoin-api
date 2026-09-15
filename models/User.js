@@ -130,8 +130,34 @@ const userSchema = new mongoose.Schema(
             type: String,
             default: null,
             select: false
+        },
+
+        // ============================================
+        // 📧 VERIFICAÇÃO DE EMAIL
+        // ============================================
+
+        emailVerified: {
+            type: Boolean,
+            default: false
+        },
+
+        // ============================================
+        // 🔑 RESET DE SENHA
+        // ============================================
+
+        resetPasswordToken: {
+            type: String,
+            default: null,
+            select: false
+        },
+
+        resetPasswordExpires: {
+            type: Date,
+            default: null,
+            select: false
         }
     },
+    
     {
         timestamps: true,
 
@@ -144,6 +170,8 @@ const userSchema = new mongoose.Schema(
                 delete ret.lastPasswordChange;
                 delete ret.failedLoginAttempts;
                 delete ret.lockedUntil;
+                delete ret.resetPasswordToken;
+                delete ret.resetPasswordExpires;
                 delete ret.__v;
                 return ret;
             }
@@ -158,6 +186,8 @@ const userSchema = new mongoose.Schema(
                 delete ret.lastPasswordChange;
                 delete ret.failedLoginAttempts;
                 delete ret.lockedUntil;
+                delete ret.resetPasswordToken;
+                delete ret.resetPasswordExpires;
                 delete ret.__v;
                 return ret;
             }
