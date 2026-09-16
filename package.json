@@ -11,8 +11,8 @@
     "clean": "rm -rf node_modules package-lock.json"
   },
   "dependencies": {
-    "@noble/hashes": "^2.0.0",
-    "@noble/secp256k1": "^2.0.0",
+    "@noble/hashes": "2.0.1",
+    "@noble/secp256k1": "2.0.0",
     "bcryptjs": "^2.4.3",
     "compression": "^1.7.4",
     "cors": "^2.8.5",
@@ -29,6 +29,9 @@
     "socket.io": "^4.7.5",
     "speakeasy": "^2.0.0",
     "winston": "^3.14.2"
+  },
+  "overrides": {
+    "@noble/hashes": "2.0.1"
   },
   "devDependencies": {
     "jest": "^29.7.0",
