@@ -32,7 +32,7 @@ const jwt = require('jsonwebtoken');
 // VALIDAÇÃO DE VARIÁVEIS DE AMBIENTE
 // ============================================
 const REQUIRED_ENV = [
-    'MONGO_URI',
+    'MONGODB_URI',
     'JWT_SECRET',
     'RESERVE_ADDRESS',
     'FEE_COLLECTOR_ADDRESS',
@@ -47,8 +47,8 @@ if (missingEnv.length > 0) {
     process.exit(1);
 }
 
-if (!process.env.MONGO_URI.startsWith('mongodb')) {
-    console.error('❌ MONGO_URI inválida. Deve começar com "mongodb://" ou "mongodb+srv://".');
+if (!process.env.MONGODB_URI.startsWith('mongodb')) {
+    console.error('❌ MONGODB_URI inválida. Deve começar com "mongodb://" ou "mongodb+srv://".');
     process.exit(1);
 }
 
@@ -431,7 +431,7 @@ app.use(errorHandler);
 // ============================================
 async function connectMongoDB() {
     try {
-        await mongoose.connect(process.env.MONGO_URI, {
+        await mongoose.connect(process.env.MONGODB_URI, {
             serverSelectionTimeoutMS: 5000,
             socketTimeoutMS: 45000,
             maxPoolSize: 20,
@@ -518,7 +518,7 @@ async function initialize() {
 
         await startAutoMining();
 
-        server.listen(PORT, () => {
+        server.listen(PORT, '0.0.0.0', () => {
             logger.info('');
             logger.info('════════════════════════════════════════');
             logger.info(`✅ BradiChain rodando!`);
