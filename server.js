@@ -80,6 +80,7 @@ const transactionRoutes = require('./routes/transaction');
 const walletRoutes = require('./routes/wallet');
 const reserveRoutes = require('./routes/reserve');
 const reserveStakingRoutes = require('./routes/reserveStaking');
+const { router: airdropRouter } = require('./routes/airdrop');
 
 // ============================================
 // CONFIGURAÇÃO
@@ -296,6 +297,8 @@ logger.info('✅ Rotas: /api/v1/transaction');
 app.use('/api/v1/reserve', reserveRoutes);
 app.use('/api/v1/reserve-staking', reserveStakingRoutes);
 logger.info('✅ Rotas: /api/v1/reserve + /api/v1/reserve-staking');
+app.use('/api/v1/airdrop', airdropRouter);
+logger.info('✅ Rotas: /api/v1/airdrop');
 
 // ============================================
 // ROTAS DE ADMIN
