@@ -85,6 +85,9 @@ const nftRoutes = require('./routes/nft');
 const { router: airdropRouter } = require('./routes/airdrop');
 const governanceRoutes = require('./routes/governance');
 
+// 💰 Motor de preço dinâmico
+const priceEngine = require('./priceEngine');
+
 // ============================================
 // CONFIGURAÇÃO
 // ============================================
@@ -417,6 +420,45 @@ app.get('/api/explorer/stats', (req, res) => {
 logger.info('✅ Rotas: /api/explorer/stats');
 
 // ============================================
+// 💰 PREÇO DINÂMICO
+// ============================================
+
+app.get('/api/market/price', (req, res) => {
+    const state = priceEngine.getPriceState();
+    res.json({
+        success: true,
+        data: {
+            price: state.currentPrice,
+            basePrice: state.basePrice,
+            maxPrice: state.maxPrice,
+            variation24h: state.variation24h,
+            lastUpdate: state.lastUpdate
+        }
+    });
+});
+
+app.get('/api/market/price/history', (req, res) => {
+    const state = priceEngine.getPriceState();
+    res.json({ success: true, data: state.history });
+});
+
+app.post('/api/market/price/recalculate', (req, res) => {
+    const newPrice = priceEngine.calculatePrice(req.body || {});
+    res.json({ success: true, data: { price: newPrice } });
+});
+
+app.post('/api/market/price/buy', (req, res) => {
+    const { amount } = req.body;
+    if (!amount || amount <= 0) {
+        return res.status(400).json({ error: 'Amount inválido' });
+    }
+    const newPrice = priceEngine.applyBoost(Number(amount), 'buy');
+    res.json({ success: true, data: { price: newPrice, amount } });
+});
+
+logger.info('✅ Rotas: /api/market/price*');
+
+// ============================================
 // ROTAS DA API — v1
 // ============================================
 
@@ -644,6 +686,47 @@ async function startAutoMining() {
 }
 
 // ============================================
+// 💰 AUTO-RECALCULADOR DE PREÇO (5 min)
+// ============================================
+function startAutoPriceUpdate() {
+    setInterval(() => {
+        try {
+            let tx24h = 0;
+            let stakingAmount = 0;
+            let newWallets = 0;
+            let burnedAmount = 0;
+
+            // Puxa atividade da blockchain
+            if (typeof blockchain !== 'undefined' && blockchain.chain) {
+                const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+
+                blockchain.chain.forEach((block) => {
+                    (block.transactions || []).forEach((tx) => {
+                        if (tx.timestamp && tx.timestamp >= oneDayAgo) {
+                            tx24h++;
+                        }
+                    });
+                });
+            }
+
+            // Recalcula o preço
+            const newPrice = priceEngine.calculatePrice({
+                tx24h,
+                stakingAmount,
+                newWallets,
+                burnedAmount
+            });
+
+            logger.info(`💰 Preço recalculado: $${newPrice} (TX24h: ${tx24h})`);
+        } catch (err) {
+            logger.error('❌ Erro ao recalcular preço:', err.message);
+        }
+    }, 5 * 60 * 1000); // 5 minutos
+
+    logger.info('💰 Auto-recalculador de preço iniciado (a cada 5min)');
+}
+
+// ============================================
 // INICIALIZAÇÃO
 // ============================================
 async function initialize() {
@@ -665,7 +748,8 @@ async function initialize() {
         logger.info(`📊 Max supply: ${reserve.maxSupply.toString()} BRD`);
 
         await startAutoMining();
-
+        startAutoPriceUpdate();
+        
         server.listen(PORT, '0.0.0.0', () => {
             logger.info('');
             logger.info('════════════════════════════════════════');
