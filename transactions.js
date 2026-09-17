@@ -472,6 +472,44 @@ async function failTransaction(hash, reason) {
 }
 
 // ============================================
+// creditAirdrop — crédito interno de airdrop
+// ============================================
+async function creditAirdrop({ toAddress, amount, campaign, userId }) {
+    const WalletModel = require('./models/Wallet');
+    const BlockchainTx = require('./models/Transaction');
+
+    const toWallet = await WalletModel.findOne({ address: toAddress.toLowerCase() });
+    if (!toWallet) throw new Error('Carteira de destino não existe');
+
+    const nonce = toWallet.nonce || 0;
+
+    const tx = await BlockchainTx.create({
+        fromAddress: process.env.RESERVE_ADDRESS,
+        toAddress: toAddress.toLowerCase(),
+        amount: amount.toString(),
+        fee: '0',
+        nonce,
+        timestamp: Date.now(),
+        type: 'airdrop',
+        status: 'confirmed',
+        signature: 'INTERNAL_AIRDROP',
+        publicKey: 'INTERNAL_AIRDROP',
+        metadata: { campaign, userId }
+    });
+
+    toWallet.balance = (Number(toWallet.balance || 0) + Number(amount)).toString();
+    toWallet.nonce = nonce + 1;
+    await toWallet.save();
+
+    return {
+        txHash: tx.hash || tx._id.toString(),
+        blockIndex: null,
+        amount,
+        newBalance: toWallet.balance
+    };
+}
+
+// ============================================
 // EXPORTS
 // ============================================
 module.exports = {
@@ -492,5 +530,8 @@ module.exports = {
 
     // Minerador
     confirmTransaction,
-    failTransaction
+    failTransaction,
+
+    // Airdrop
+    creditAirdrop
 };
