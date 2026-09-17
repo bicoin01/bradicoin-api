@@ -606,6 +606,58 @@ app.post('/api/validator/register', asyncHandler(async (req, res) => {
 logger.info('✅ Rotas: /api/validator/register');
 
 // ============================================
+// 🪙 TOKEN — Lista pública
+// ============================================
+app.get('/api/v1/token/list', asyncHandler(async (req, res) => {
+    try {
+        let list = [];
+
+        try {
+            const TokenModel = require('./models/Token');
+            list = await TokenModel.find({}).sort({ createdAt: -1 }).limit(50).lean();
+        } catch (_) {}
+
+        if (!list || list.length === 0) {
+            list = [
+                { name: 'Bradicoin',     symbol: 'BRD', supply: 1000000000, price: 12.47, emoji: '⚡', creator: 'BrA1B2C3D4E5' },
+            ];
+        }
+
+        res.json({ success: true, data: list, total: list.length });
+    } catch (err) {
+        logger.error('❌ /api/v1/token/list:', err);
+        res.status(500).json({ success: false, error: 'Could not load tokens', data: [] });
+    }
+}));
+logger.info('✅ Rotas: /api/v1/token/list');
+
+// ============================================
+// 🎨 NFT — Lista pública
+// ============================================
+app.get('/api/v1/nft/list', asyncHandler(async (req, res) => {
+    try {
+        let list = [];
+
+        try {
+            const NFTModel = require('./models/NFT');
+            list = await NFTModel.find({}).sort({ createdAt: -1 }).limit(50).lean();
+        } catch (_) {}
+
+        if (!list || list.length === 0) {
+            list = [
+                { name: 'Neon Skull #042',  collection: 'Neon Skulls',  price: 120.50, emoji: '💀', owner: 'BrN9E8O7S6K5', tokenId: '042' },
+            ];
+        }
+
+        res.json({ success: true, data: list, total: list.length });
+    } catch (err) {
+        logger.error('❌ /api/v1/nft/list:', err);
+        res.status(500).json({ success: false, error: 'Could not load NFTs', data: [] });
+    }
+}));
+logger.info('✅ Rotas: /api/v1/nft/list');
+
+// ============================================
 // 💰 PREÇO DINÂMICO
 // ============================================
 
