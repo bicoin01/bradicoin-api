@@ -283,6 +283,35 @@ app.get('/health/detailed', asyncHandler(async (req, res) => {
     });
 }));
 
+
+// ============================================
+// 📜 EXPLORER — Rotas públicas (frontend)
+// ============================================
+app.get('/api/explorer/transactions', (req, res) => {
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    const offset = parseInt(req.query.offset) || 0;
+    const now = Date.now();
+
+    // Mock de exemplo
+    const txs = [
+        { hash: 'a1b2c3d4e5f6g7h8i9j0', fromAddress: 'BrA1B2C3D4E5F6', toAddress: 'BrG7H8I9J0K1L2', amount: 150.5, fee: 0.5, timestamp: now - 60000, confirmed: true },
+        { hash: 'b2c3d4e5f6g7h8i9j0k1', fromAddress: 'COINBASE', toAddress: 'BrM3N4O5P6Q7R8', amount: 50, fee: 0, timestamp: now - 180000, confirmed: true },
+        { hash: 'c3d4e5f6g7h8i9j0k1l2', fromAddress: 'BrS9T0U1V2W3X4', toAddress: 'BrY5Z6A7B8C9D0', amount: 1000, fee: 1.2, timestamp: now - 360000, confirmed: true },
+        { hash: 'd4e5f6g7h8i9j0k1l2m3', fromAddress: 'BrE1F2G3H4I5J6', toAddress: 'BrK7L8M9N0O1P2', amount: 75.25, fee: 0.3, timestamp: now - 720000, confirmed: false },
+        { hash: 'e5f6g7h8i9j0k1l2m3n4', fromAddress: 'COINBASE', toAddress: 'BrQ3R4S5T6U7V8', amount: 50, fee: 0, timestamp: now - 900000, confirmed: true },
+        { hash: 'f6g7h8i9j0k1l2m3n4o5', fromAddress: 'BrW9X0Y1Z2A3B4', toAddress: 'BrC5D6E7F8G9H0', amount: 500, fee: 0.8, timestamp: now - 1200000, confirmed: true },
+        { hash: 'g7h8i9j0k1l2m3n4o5p6', fromAddress: 'BrI1J2K3L4M5N6', toAddress: 'BrO7P8Q9R0S1T2', amount: 250, fee: 0.6, timestamp: now - 1800000, confirmed: true },
+        { hash: 'h8i9j0k1l2m3n4o5p6q7', fromAddress: 'COINBASE', toAddress: 'BrU3V4W5X6Y7Z8', amount: 50, fee: 0, timestamp: now - 2400000, confirmed: true },
+        { hash: 'i9j0k1l2m3n4o5p6q7r8', fromAddress: 'BrA9B0C1D2E3F4', toAddress: 'BrG5H6I7J8K9L0', amount: 125.75, fee: 0.4, timestamp: now - 3000000, confirmed: true },
+        { hash: 'j0k1l2m3n4o5p6q7r8s9', fromAddress: 'BrM1N2O3P4Q5R6', toAddress: 'BrS7T8U9V0W1X2', amount: 300, fee: 0.7, timestamp: now - 3600000, confirmed: true }
+    ];
+
+    txs.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    const paged = txs.slice(offset, offset + limit);
+
+    res.json({ success: true, data: paged, total: txs.length, limit, offset });
+});
+
 // ============================================
 // ROTAS DA API — v1
 // ============================================
