@@ -474,38 +474,94 @@ async function failTransaction(hash, reason) {
 // ============================================
 // creditAirdrop — crédito interno de airdrop
 // ============================================
+// ⚠️ Usa a mesma estrutura de TransactionModel do submitSignedTransaction
+//    - from / to (não fromAddress/toAddress)
+//    - amount/fee como Decimal128
+//    - NÃO mexe no nonce da carteira de destino
+//    - assina como INTERNAL (bypass da verificação de assinatura)
+// ============================================
 async function creditAirdrop({ toAddress, amount, campaign, userId }) {
-    const WalletModel = require('./models/Wallet');
-    const BlockchainTx = require('./models/Transaction');
+    const toAddr = toAddress.toLowerCase();
 
-    const toWallet = await WalletModel.findOne({ address: toAddress.toLowerCase() });
-    if (!toWallet) throw new Error('Carteira de destino não existe');
+    if (!wallet.isValidAddress(toAddr)) {
+        throw new Error('Endereço de destino inválido');
+    }
 
-    const nonce = toWallet.nonce || 0;
+    const fromAddress = process.env.RESERVE_ADDRESS;
+    if (!fromAddress) {
+        throw new Error('RESERVE_ADDRESS não configurado no .env');
+    }
 
-    const tx = await BlockchainTx.create({
-        fromAddress: process.env.RESERVE_ADDRESS,
-        toAddress: toAddress.toLowerCase(),
-        amount: amount.toString(),
-        fee: '0',
-        nonce,
-        timestamp: Date.now(),
+    // 1. Confere que a carteira de destino existe e está ativa
+    const toWallet = await WalletModel.findOne({ address: toAddr });
+    if (!toWallet) {
+        throw new Error('Carteira de destino não existe');
+    }
+    if (toWallet.status !== 'active') {
+        throw new Error('Carteira de destino inativa');
+    }
+
+    // 2. Monta payload da TX interna
+    const amountNum = parseFloat(amount);
+    if (!Number.isFinite(amountNum) || amountNum <= 0) {
+        throw new Error('Valor do airdrop inválido');
+    }
+
+    const timestamp = new Date().toISOString();
+    const txPayload = {
+        fromAddress,
+        toAddress: toAddr,
+        amount: amountNum,
+        fee: 0,
+        nonce: 0,
+        timestamp,
+        type: 'airdrop'
+    };
+
+    // 3. Assinatura fake (bypass) — mesmo padrão dos outros TXs internos
+    const internalSignature = `INTERNAL_AIRDROP_${campaign}_${Date.now()}`;
+    const hash = calculateTxHash(txPayload, internalSignature);
+
+    // 4. Anti-replay: garante que essa TX ainda não existe
+    const exists = await TransactionModel.findOne({ hash });
+    if (exists) {
+        throw new Error('Transação de airdrop já registrada');
+    }
+
+    // 5. Registra a TX como confirmed
+    const tx = await TransactionModel.create({
+        hash,
+        from: fromAddress,
+        to: toAddr,
+        amount: Decimal128.fromString(amountNum.toString()),
+        fee: Decimal128.fromString('0'),
+        nonce: 0,
+        signature: internalSignature,
+        publicKey: 'INTERNAL',
         type: 'airdrop',
         status: 'confirmed',
-        signature: 'INTERNAL_AIRDROP',
-        publicKey: 'INTERNAL_AIRDROP',
-        metadata: { campaign, userId }
+        timestamp: new Date(timestamp),
+        metadata: { campaign, userId: userId?.toString(), internal: true }
     });
 
-    toWallet.balance = (Number(toWallet.balance || 0) + Number(amount)).toString();
-    toWallet.nonce = nonce + 1;
+    // 6. Credita o saldo do RECEBEDOR (não mexe no nonce dele!)
+    const newBalance = Number(toWallet.balance || 0) + amountNum;
+    toWallet.balance = Decimal128.fromString(newBalance.toString());
     await toWallet.save();
 
+    // 7. Incrementa o nonce do RESERVE (quem "gastou" a TX)
+    await WalletModel.updateOne(
+        { address: fromAddress },
+        { $inc: { nonce: 1 } }
+    );
+
+    console.log(`✅ Airdrop creditado: ${amountNum} BRD → ${toAddr}`);
+
     return {
-        txHash: tx.hash || tx._id.toString(),
+        txHash: hash,
         blockIndex: null,
-        amount,
-        newBalance: toWallet.balance
+        amount: amountNum,
+        newBalance: newBalance.toString()
     };
 }
 
