@@ -1,39 +1,28 @@
-// models/Token.js
-const mongoose = require('mongoose');
+// routes/token.js
+const express = require('express');
+const router = express.Router();
+const rateLimit = require('express-rate-limit');
 
-const TokenSchema = new mongoose.Schema(
-    {
-        ownerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
-        ownerAddress: { type: String, required: true, lowercase: true, index: true },
-        name: { type: String, required: true, trim: true, maxlength: 64 },
-        symbol: { type: String, required: true, uppercase: true, trim: true, maxlength: 10 },
-        supply: { type: Number, required: true, min: 1 },
-        price: { type: Number, default: 1.5 },
-        logo: { type: String, default: null },
-        description: { type: String, default: '', maxlength: 500 },
-        listed: { type: Boolean, default: true, index: true },
-        mintFee: { type: Number, default: 0.016 },
-        txHash: { type: String, default: null }
-    },
-    { timestamps: true }
-);
+const tokenController = require('../controllers/tokenController');
+const { authenticate } = require('../middleware/auth');
 
-TokenSchema.index({ symbol: 1 }, { unique: true });
+const createLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1h
+    max: 10,
+    keyGenerator: (req) => req.user?._id?.toString() || req.ip,
+    message: { success: false, error: 'Muitos tokens criados. Tente novamente em 1 hora.' }
+});
 
-TokenSchema.methods.toPublic = function () {
-    return {
-        id: this._id,
-        name: this.name,
-        symbol: this.symbol,
-        supply: this.supply,
-        price: this.price,
-        logo: this.logo,
-        description: this.description,
-        ownerAddress: this.ownerAddress,
-        listed: this.listed,
-        txHash: this.txHash,
-        createdAt: this.createdAt
-    };
-};
+const queryLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    message: { success: false, error: 'Muitas consultas.' }
+});
 
-module.exports = mongoose.model('Token', TokenSchema);
+router.post('/create', authenticate, createLimiter, tokenController.create);
+router.get('/my', authenticate, queryLimiter, tokenController.myTokens);
+router.get('/marketplace', queryLimiter, tokenController.marketplace);
+router.delete('/:id', authenticate, tokenController.remove);
+
+// ⚠️ Exporta padrão antigo (sem { router }) — wallet.js e transaction.js usam esse
+module.exports = router;
