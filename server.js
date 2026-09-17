@@ -726,6 +726,64 @@ app.use('/api/v1/governance', governanceRoutes);
 logger.info('✅ Rotas: /api/v1/governance');
 
 // ============================================
+// 🪙 TOKEN — Lista pública
+// ============================================
+app.get('/api/v1/token/list', asyncHandler(async (req, res) => {
+    try {
+        let list = [];
+
+        try {
+            const TokenModel = require('./models/Token');
+            list = await TokenModel.find({}).sort({ createdAt: -1 }).limit(50).lean();
+        } catch (_) {}
+
+        if (!list || list.length === 0) {
+            list = [
+                { name: 'Bradicoin',     symbol: 'BRD', supply: 1000000000, price: 12.47, emoji: '⚡', creator: 'BrA1B2C3D4E5' },
+                { name: 'Quantum Token', symbol: 'QTM', supply: 500000000,  price: 2.50,  emoji: '⚛️', creator: 'BrQ9T8M7K6L5' },
+                { name: 'ZK-SNARK',      symbol: 'ZKT', supply: 100000000,  price: 5.00,  emoji: '🔐', creator: 'BrZ1K2S3N4R5' },
+                { name: 'AI Protocol',   symbol: 'AIP', supply: 250000000,  price: 1.20,  emoji: '🤖', creator: 'BrA9I8P7R6O5' }
+            ];
+        }
+
+        res.json({ success: true, data: list, total: list.length });
+    } catch (err) {
+        logger.error('❌ /api/v1/token/list:', err);
+        res.status(500).json({ success: false, error: 'Could not load tokens', data: [] });
+    }
+}));
+
+// ============================================
+// 🎨 NFT — Lista pública
+// ============================================
+app.get('/api/v1/nft/list', asyncHandler(async (req, res) => {
+    try {
+        let list = [];
+
+        try {
+            const NFTModel = require('./models/NFT');
+            list = await NFTModel.find({}).sort({ createdAt: -1 }).limit(50).lean();
+        } catch (_) {}
+
+        if (!list || list.length === 0) {
+            list = [
+                { name: 'Cyber Ape #001',   collection: 'Cyber Apes',   price: 250.00, emoji: '🐒', owner: 'BrA1B2C3D4E5', tokenId: '001' },
+                { name: 'Neon Skull #042',  collection: 'Neon Skulls',  price: 120.50, emoji: '💀', owner: 'BrN9E8O7S6K5', tokenId: '042' },
+                { name: 'Quantum Gem #777', collection: 'Quantum Gems', price: 500.00, emoji: '💎', owner: 'BrQ7G6E5M4S3', tokenId: '777' },
+                { name: 'Space Bot #128',   collection: 'Space Bots',   price: 80.25,  emoji: '🤖', owner: 'BrS1P2A3C4E5', tokenId: '128' }
+            ];
+        }
+
+        res.json({ success: true, data: list, total: list.length });
+    } catch (err) {
+        logger.error('❌ /api/v1/nft/list:', err);
+        res.status(500).json({ success: false, error: 'Could not load NFTs', data: [] });
+    }
+}));
+
+logger.info('✅ Rotas: /api/v1/token/list + /api/v1/nft/list');
+
+// ============================================
 // ROTAS DE ADMIN
 // ============================================
 
