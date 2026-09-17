@@ -304,6 +304,15 @@ logger.info('✅ Rotas: /api/v1/nft');
 app.use('/api/v1/airdrop', airdropRouter);
 logger.info('✅ Rotas: /api/v1/airdrop');
 
+const tokenRoutes = require('./routes/token');
+const nftRoutes = require('./routes/nft');
+
+app.use('/api/v1/token', tokenRoutes);
+logger.info('✅ Rotas: /api/v1/token');
+
+app.use('/api/v1/nft', nftRoutes);
+logger.info('✅ Rotas: /api/v1/nft');
+
 // ============================================
 // ROTAS DE ADMIN
 // ============================================
