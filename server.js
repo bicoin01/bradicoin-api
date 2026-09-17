@@ -83,6 +83,7 @@ const reserveStakingRoutes = require('./routes/reserveStaking');
 const tokenRoutes = require('./routes/token');
 const nftRoutes = require('./routes/nft'); 
 const { router: airdropRouter } = require('./routes/airdrop');
+const governanceRoutes = require('./routes/governance');
 
 // ============================================
 // CONFIGURAÇÃO
@@ -337,6 +338,9 @@ logger.info('✅ Rotas: /api/v1/nft');
 
 app.use('/api/v1/airdrop', airdropRouter);
 logger.info('✅ Rotas: /api/v1/airdrop');
+
+app.use('/api/v1/governance', governanceRoutes);
+logger.info('✅ Rotas: /api/v1/governance');
 
 // ============================================
 // ROTAS DE ADMIN
