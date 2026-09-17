@@ -80,6 +80,8 @@ const transactionRoutes = require('./routes/transaction');
 const walletRoutes = require('./routes/wallet');
 const reserveRoutes = require('./routes/reserve');
 const reserveStakingRoutes = require('./routes/reserveStaking');
+const tokenRoutes = require('./routes/token');
+const nftRoutes = require('./routes/nft'); 
 const { router: airdropRouter } = require('./routes/airdrop');
 
 // ============================================
@@ -297,21 +299,15 @@ logger.info('✅ Rotas: /api/v1/transaction');
 app.use('/api/v1/reserve', reserveRoutes);
 app.use('/api/v1/reserve-staking', reserveStakingRoutes);
 logger.info('✅ Rotas: /api/v1/reserve + /api/v1/reserve-staking');
-app.use('/api/v1/token', require('./routes/token'));
-logger.info('✅ Rotas: /api/v1/token');
-app.use('/api/v1/nft', require('./routes/nft'));
-logger.info('✅ Rotas: /api/v1/nft');
-app.use('/api/v1/airdrop', airdropRouter);
-logger.info('✅ Rotas: /api/v1/airdrop');
-
-const tokenRoutes = require('./routes/token');
-const nftRoutes = require('./routes/nft');
 
 app.use('/api/v1/token', tokenRoutes);
 logger.info('✅ Rotas: /api/v1/token');
 
 app.use('/api/v1/nft', nftRoutes);
 logger.info('✅ Rotas: /api/v1/nft');
+
+app.use('/api/v1/airdrop', airdropRouter);
+logger.info('✅ Rotas: /api/v1/airdrop');
 
 // ============================================
 // ROTAS DE ADMIN
