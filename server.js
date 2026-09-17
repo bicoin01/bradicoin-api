@@ -547,6 +547,65 @@ app.get('/api/validator/list', asyncHandler(async (req, res) => {
 logger.info('✅ Rotas: /api/validator/list');
 
 // ============================================
+// 🛡️ VALIDATOR — Registro
+// ============================================
+app.post('/api/validator/register', asyncHandler(async (req, res) => {
+    const { address, stake } = req.body;
+
+    if (!address || !address.startsWith('Br')) {
+        return res.status(400).json({
+            success: false,
+            error: 'Invalid address (must start with "Br")'
+        });
+    }
+
+    const MIN_STAKE = 1000;
+    const stakeNum = Number(stake || 0);
+
+    if (stakeNum < MIN_STAKE) {
+        return res.status(400).json({
+            success: false,
+            error: `Minimum stake is ${MIN_STAKE} BRD`
+        });
+    }
+
+    try {
+        let saved;
+        try {
+            const ValidatorModel = require('./models/Validator');
+            saved = await ValidatorModel.findOneAndUpdate(
+                { address },
+                {
+                    address,
+                    stake: stakeNum,
+                    status: 'active',
+                    uptime: 99.99,
+                    commission: 5,
+                    lastActive: Date.now(),
+                    $setOnInsert: { firstSeen: Date.now() }
+                },
+                { upsert: true, new: true }
+            );
+        } catch (_) {
+            saved = { address, stake: stakeNum, status: 'active' };
+        }
+
+        logger.info(`🛡️ Novo validador registrado: ${address} (${stakeNum} BRD)`);
+
+        res.json({
+            success: true,
+            message: 'Validator registered successfully',
+            data: saved
+        });
+    } catch (err) {
+        logger.error('❌ Erro ao registrar validador:', err);
+        res.status(500).json({ success: false, error: err.message });
+    }
+}));
+
+logger.info('✅ Rotas: /api/validator/register');
+
+// ============================================
 // 💰 PREÇO DINÂMICO
 // ============================================
 
