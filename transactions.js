@@ -1,21 +1,9 @@
 // transactions.js
 // ============================================
-// Bradicoin Blockchain - Transactions (v3.0)
+// Bradicoin Blockchain - Transactions (v3.1)
 // ============================================
-// 🔐 ARQUITETURA NÃO-CUSTODIAL
-//
-// O cliente assina transações localmente e envia:
-//   - fromAddress, toAddress, amount, fee, nonce, timestamp
-//   - signature, publicKey
-//
-// O servidor:
-//   1. Verifica a assinatura
-//   2. Verifica que publicKey corresponde ao fromAddress
-//   3. Verifica nonce (anti-replay)
-//   4. Verifica saldo
-//   5. Grava em Transaction (pending)
-//   6. Adiciona à mempool do blockchain
-//
+// 🔐 NÃO-CUSTODIAL
+// 🆕 v3.1 — normalização de endereço + hash unificado
 // ============================================
 
 const mongoose = require('mongoose');
@@ -31,11 +19,11 @@ const blockchain = require('./blockchain');
 // ============================================
 // CONSTANTES
 // ============================================
-const MAX_AMOUNT = 1_000_000_000;              // 1 bilhão por TX
-const MAX_FEE = 1000;                          // 1000 BRD de taxa máxima
-const MAX_FUTURE_TIMESTAMP_MS = 5 * 60 * 1000; // 5 min no futuro
-const MAX_PAST_TIMESTAMP_MS = 10 * 60 * 1000;  // 10 min no passado
-const MIN_AMOUNT = 0.00000001;                 // 1 satoshi
+const MAX_AMOUNT = 1_000_000_000;
+const MAX_FEE = 1000;
+const MAX_FUTURE_TIMESTAMP_MS = 5 * 60 * 1000;
+const MAX_PAST_TIMESTAMP_MS = 10 * 60 * 1000;
+const MIN_AMOUNT = 0.00000001;
 
 // ============================================
 // INICIALIZAR
@@ -45,75 +33,27 @@ async function initialize() {
 }
 
 // ============================================
-// VALIDAÇÕES
+// 🆕 HASH UNIFICADO — usado por transactions.js E blockchain.js
 // ============================================
-function validateTransactionPayload(payload) {
-    const { fromAddress, toAddress, amount, fee, nonce, timestamp, type } = payload;
-
-    if (!fromAddress || !toAddress) {
-        throw new Error('fromAddress e toAddress são obrigatórios');
-    }
-
-    if (!wallet.isValidAddress(fromAddress)) {
-        throw new Error('Endereço de origem inválido');
-    }
-
-    if (!wallet.isValidAddress(toAddress)) {
-        throw new Error('Endereço de destino inválido');
-    }
-
-    if (fromAddress === toAddress) {
-        throw new Error('Não é possível enviar para si mesmo');
-    }
-
-    // Amount
-    const amountNum = parseFloat(amount);
-    if (!Number.isFinite(amountNum) || amountNum < MIN_AMOUNT) {
-        throw new Error(`Valor deve ser >= ${MIN_AMOUNT}`);
-    }
-    if (amountNum > MAX_AMOUNT) {
-        throw new Error(`Valor máximo por transação: ${MAX_AMOUNT} BRD`);
-    }
-
-    // Fee
-    const feeNum = parseFloat(fee || '0');
-    if (!Number.isFinite(feeNum) || feeNum < 0 || feeNum > MAX_FEE) {
-        throw new Error(`Taxa deve estar entre 0 e ${MAX_FEE} BRD`);
-    }
-
-    // Nonce
-    if (!Number.isInteger(nonce) || nonce < 0) {
-        throw new Error('Nonce inválido');
-    }
-
-    // Timestamp
-    if (!timestamp) {
-        throw new Error('Timestamp é obrigatório');
-    }
-    const ts = new Date(timestamp).getTime();
-    if (isNaN(ts)) {
-        throw new Error('Timestamp inválido');
-    }
-    const now = Date.now();
-    if (ts > now + MAX_FUTURE_TIMESTAMP_MS) {
-        throw new Error('Timestamp muito no futuro');
-    }
-    if (ts < now - MAX_PAST_TIMESTAMP_MS) {
-        throw new Error('Timestamp muito antigo');
-    }
-
-    // Type
-    const validTypes = ['transfer', 'stake', 'unstake', 'reward', 'mint', 'burn', 'airdrop', 'wallet_creation', 'tip', 'nft_mint', 'nft_transfer'];
-    if (type && !validTypes.includes(type)) {
-        throw new Error('Tipo de transação inválido');
-    }
+// Este é O ÚNICO lugar que calcula hash de tx. Todo o resto chama isto.
+//
+function calculateTxHash(tx, signature) {
+    const payload = JSON.stringify({
+        from: tx.fromAddress || tx.from || null,
+        to: tx.toAddress || tx.to || null,
+        amount: (tx.amount || '0').toString(),
+        fee: (tx.fee || '0').toString(),
+        nonce: tx.nonce || 0,
+        type: tx.type || 'transfer',
+        timestamp: tx.timestamp,
+        signature: signature || tx.signature || 'system'
+    });
+    return bytesToHex(sha256(utf8ToBytes(payload)));
 }
 
 // ============================================
-// STRING CANÔNICA PARA ASSINATURA
+// STRING PARA ASSINATURA
 // ============================================
-// ⚠️ IMPORTANTE: essa string DEVE ser idêntica no client e no server.
-//
 function buildSignableMessage(tx) {
     return [
         tx.fromAddress,
@@ -127,29 +67,58 @@ function buildSignableMessage(tx) {
 }
 
 // ============================================
-// CALCULAR HASH DA TRANSAÇÃO
+// VALIDAÇÕES
 // ============================================
-function calculateTxHash(tx, signature) {
-    const payload = JSON.stringify({
-        fromAddress: tx.fromAddress,
-        toAddress: tx.toAddress,
-        amount: tx.amount.toString(),
-        fee: (tx.fee || '0').toString(),
-        nonce: tx.nonce,
-        timestamp: tx.timestamp,
-        type: tx.type || 'transfer',
-        signature: signature || null
-    });
+function validateTransactionPayload(payload) {
+    const { fromAddress, toAddress, amount, fee, nonce, timestamp, type } = payload;
 
-    return bytesToHex(sha256(utf8ToBytes(payload)));
+    if (!fromAddress || !toAddress) {
+        throw new Error('fromAddress e toAddress são obrigatórios');
+    }
+    if (!wallet.isValidAddress(fromAddress)) {
+        throw new Error('Endereço de origem inválido');
+    }
+    if (!wallet.isValidAddress(toAddress)) {
+        throw new Error('Endereço de destino inválido');
+    }
+    if (wallet.normalizeAddress(fromAddress) === wallet.normalizeAddress(toAddress)) {
+        throw new Error('Não é possível enviar para si mesmo');
+    }
+
+    const amountNum = parseFloat(amount);
+    if (!Number.isFinite(amountNum) || amountNum < MIN_AMOUNT) {
+        throw new Error(`Valor deve ser >= ${MIN_AMOUNT}`);
+    }
+    if (amountNum > MAX_AMOUNT) {
+        throw new Error(`Valor máximo por transação: ${MAX_AMOUNT} BRD`);
+    }
+
+    const feeNum = parseFloat(fee || '0');
+    if (!Number.isFinite(feeNum) || feeNum < 0 || feeNum > MAX_FEE) {
+        throw new Error(`Taxa deve estar entre 0 e ${MAX_FEE} BRD`);
+    }
+
+    if (!Number.isInteger(nonce) || nonce < 0) {
+        throw new Error('Nonce inválido');
+    }
+
+    if (!timestamp) throw new Error('Timestamp é obrigatório');
+    const ts = new Date(timestamp).getTime();
+    if (isNaN(ts)) throw new Error('Timestamp inválido');
+
+    const now = Date.now();
+    if (ts > now + MAX_FUTURE_TIMESTAMP_MS) throw new Error('Timestamp muito no futuro');
+    if (ts < now - MAX_PAST_TIMESTAMP_MS) throw new Error('Timestamp muito antigo');
+
+    const validTypes = ['transfer', 'stake', 'unstake', 'reward', 'mint', 'burn', 'airdrop', 'wallet_creation', 'tip', 'nft_mint', 'nft_transfer'];
+    if (type && !validTypes.includes(type)) {
+        throw new Error('Tipo de transação inválido');
+    }
 }
 
 // ============================================
-// 🖥️ CLIENT-SIDE — CRIAR E ASSINAR
+// CLIENT-SIDE — CRIAR E ASSINAR
 // ============================================
-// Esta função fica aqui para o SDK reusar.
-// No frontend, ela roda no navegador com a privateKey do usuário.
-//
 function createSignedTransaction({
     fromAddress,
     toAddress,
@@ -159,15 +128,17 @@ function createSignedTransaction({
     type = 'transfer',
     privateKey
 }) {
-    if (!privateKey) {
-        throw new Error('Chave privada é obrigatória');
-    }
+    if (!privateKey) throw new Error('Chave privada é obrigatória');
+
+    // 🆕 normaliza antes de assinar (o cliente também usa minúsculas)
+    const fromAddr = wallet.normalizeAddress(fromAddress);
+    const toAddr = wallet.normalizeAddress(toAddress);
 
     const timestamp = new Date().toISOString();
 
     const tx = {
-        fromAddress,
-        toAddress,
+        fromAddress: fromAddr,
+        toAddress: toAddr,
         amount: amount.toString(),
         fee: fee.toString(),
         nonce,
@@ -178,7 +149,6 @@ function createSignedTransaction({
     validateTransactionPayload(tx);
 
     const message = buildSignableMessage(tx);
-
     const secp256k1 = require('@noble/secp256k1');
     const messageBytes = utf8ToBytes(message);
     const messageHash = sha256(messageBytes);
@@ -199,7 +169,7 @@ function createSignedTransaction({
 }
 
 // ============================================
-// 🖥️ SERVER-SIDE — SUBMETER TX JÁ ASSINADA
+// SERVER-SIDE — SUBMETER TX ASSINADA
 // ============================================
 async function submitSignedTransaction({
     fromAddress,
@@ -212,10 +182,13 @@ async function submitSignedTransaction({
     signature,
     publicKey
 }) {
-    // 1. Validações de formato
+    // 🆕 0. NORMALIZA antes de qualquer coisa
+    const fromAddr = wallet.normalizeAddress(fromAddress);
+    const toAddr = wallet.normalizeAddress(toAddress);
+
     const payload = {
-        fromAddress,
-        toAddress,
+        fromAddress: fromAddr,
+        toAddress: toAddr,
         amount,
         fee,
         nonce,
@@ -227,76 +200,59 @@ async function submitSignedTransaction({
     if (!signature || !publicKey) {
         throw new Error('Assinatura e chave pública são obrigatórias');
     }
-
     if (!wallet.isValidPublicKey(publicKey)) {
         throw new Error('Public key inválida');
     }
 
-    // 2. Verifica que publicKey corresponde ao fromAddress
+    // 2. publicKey ↔ address
     const derivedAddress = wallet.deriveAddressFromPublicKey(publicKey);
-    if (derivedAddress !== fromAddress) {
+    if (derivedAddress !== fromAddr) {
         throw new Error('Public key não corresponde ao endereço de origem');
     }
 
-    // 3. Verifica assinatura
+    // 3. Assinatura
     const message = buildSignableMessage(payload);
-    const isValidSig = wallet.verifySignature(message, signature, publicKey);
-
-    if (!isValidSig) {
+    if (!wallet.verifySignature(message, signature, publicKey)) {
         throw new Error('Assinatura inválida');
     }
 
-    // 4. Verifica carteira de origem
-    const senderWallet = await WalletModel.findOne({ address: fromAddress });
+    // 4. Carteira origem
+    const senderWallet = await WalletModel.findOne({ address: fromAddr });
+    if (!senderWallet) throw new Error('Carteira de origem não encontrada');
+    if (senderWallet.status !== 'active') throw new Error('Carteira de origem inativa');
 
-    if (!senderWallet) {
-        throw new Error('Carteira de origem não encontrada');
-    }
-
-    if (senderWallet.status !== 'active') {
-        throw new Error('Carteira de origem inativa');
-    }
-
-    // 5. Verifica nonce (anti-replay)
+    // 5. Nonce
     if (senderWallet.nonce !== nonce) {
-        throw new Error(
-            `Nonce inválido: esperado ${senderWallet.nonce}, recebido ${nonce}`
-        );
+        throw new Error(`Nonce inválido: esperado ${senderWallet.nonce}, recebido ${nonce}`);
     }
 
-    // 6. Verifica saldo
+    // 6. Saldo
     const amountNum = parseFloat(amount);
     const feeNum = parseFloat(fee || '0');
     const totalCost = amountNum + feeNum;
-
     const balanceNum = parseFloat(senderWallet.balance.toString());
     if (balanceNum < totalCost) {
         throw new Error(`Saldo insuficiente: ${balanceNum} < ${totalCost}`);
     }
 
-    // 7. Anti-replay por assinatura
-    const existingSig = await TransactionModel.findOne({ signature });
-    if (existingSig) {
+    // 7. Anti-replay assinatura
+    if (await TransactionModel.findOne({ signature })) {
         throw new Error('Transação já submetida (replay detectado)');
     }
 
-    // 8. Anti-replay por nonce
-    const existingNonce = await TransactionModel.findOne({
-        from: fromAddress,
-        nonce
-    });
-    if (existingNonce) {
+    // 8. Anti-replay nonce
+    if (await TransactionModel.findOne({ from: fromAddr, nonce })) {
         throw new Error('Nonce já usado (replay detectado)');
     }
 
-    // 9. Calcula hash
+    // 9. Hash canônico
     const hash = calculateTxHash(payload, signature);
 
-    // 10. Grava no banco (pending)
+    // 10. Grava pending
     const transaction = await TransactionModel.create({
         hash,
-        from: fromAddress,
-        to: toAddress,
+        from: fromAddr,
+        to: toAddr,
         amount: Decimal128.fromString(amountNum.toString()),
         fee: Decimal128.fromString(feeNum.toString()),
         nonce,
@@ -307,12 +263,12 @@ async function submitSignedTransaction({
         timestamp: new Date(timestamp)
     });
 
-    // 11. Adiciona ao blockchain
+    // 11. Mempool
     try {
         await blockchain.addTransaction({
             hash,
-            fromAddress,
-            toAddress,
+            fromAddress: fromAddr,
+            toAddress: toAddr,
             amount: amountNum,
             fee: feeNum,
             nonce,
@@ -323,7 +279,6 @@ async function submitSignedTransaction({
             status: 'pending'
         });
     } catch (err) {
-        // Rollback: apaga a TX do Mongo se o blockchain recusar
         await TransactionModel.deleteOne({ hash });
         throw err;
     }
@@ -340,46 +295,31 @@ async function submitSignedTransaction({
 }
 
 // ============================================
-// BUSCAR TRANSAÇÃO POR HASH
+// CONSULTAS
 // ============================================
 async function getTransactionByHash(hash) {
-    if (!hash || typeof hash !== 'string') {
-        throw new Error('Hash é obrigatório');
-    }
-
+    if (!hash || typeof hash !== 'string') throw new Error('Hash é obrigatório');
     const tx = await TransactionModel.findOne({ hash });
-
-    if (!tx) {
-        throw new Error('Transação não encontrada');
-    }
-
+    if (!tx) throw new Error('Transação não encontrada');
     return tx.toPublic();
 }
 
-// ============================================
-// BUSCAR TRANSAÇÕES DE UMA CARTEIRA
-// ============================================
 async function getWalletTransactions(address, limit = 50, offset = 0) {
-    if (!wallet.isValidAddress(address)) {
-        throw new Error('Endereço inválido');
-    }
+    const normalized = wallet.normalizeAddress(address);
+    if (!wallet.isValidAddress(normalized)) throw new Error('Endereço inválido');
 
     limit = Math.min(Math.max(1, limit), 100);
     offset = Math.max(0, offset);
 
-    const query = { $or: [{ from: address }, { to: address }] };
+    const query = { $or: [{ from: normalized }, { to: normalized }] };
 
     const [transactions, total] = await Promise.all([
-        TransactionModel.find(query)
-            .sort({ timestamp: -1 })
-            .skip(offset)
-            .limit(limit)
-            .lean(),
+        TransactionModel.find(query).sort({ timestamp: -1 }).skip(offset).limit(limit).lean(),
         TransactionModel.countDocuments(query)
     ]);
 
     return {
-        address,
+        address: normalized,
         total,
         transactions: transactions.map(tx => ({
             hash: tx.hash,
@@ -402,9 +342,6 @@ async function getWalletTransactions(address, limit = 50, offset = 0) {
     };
 }
 
-// ============================================
-// ESTATÍSTICAS
-// ============================================
 async function getTransactionStats() {
     const [total, pending, confirmed, failed, volumeAgg] = await Promise.all([
         TransactionModel.countDocuments({}),
@@ -413,13 +350,7 @@ async function getTransactionStats() {
         TransactionModel.countDocuments({ status: 'failed' }),
         TransactionModel.aggregate([
             { $match: { status: 'confirmed' } },
-            {
-                $group: {
-                    _id: null,
-                    totalVolume: { $sum: { $toDouble: '$amount' } },
-                    totalFees: { $sum: { $toDouble: '$fee' } }
-                }
-            }
+            { $group: { _id: null, totalVolume: { $sum: { $toDouble: '$amount' } }, totalFees: { $sum: { $toDouble: '$fee' } } } }
         ])
     ]);
 
@@ -436,76 +367,41 @@ async function getTransactionStats() {
 }
 
 // ============================================
-// CONFIRMAR TRANSAÇÃO (chamado pelo minerador)
+// MINERADOR
 // ============================================
 async function confirmTransaction(hash, blockIndex, blockHash) {
-    const result = await TransactionModel.findOneAndUpdate(
+    return TransactionModel.findOneAndUpdate(
         { hash, status: 'pending' },
-        {
-            $set: {
-                status: 'confirmed',
-                blockIndex,
-                blockHash,
-                confirmations: 1
-            }
-        },
+        { $set: { status: 'confirmed', blockIndex, blockHash, confirmations: 1 } },
         { new: true }
     );
-    return result;
 }
 
-// ============================================
-// MARCAR COMO FALHA (rollback)
-// ============================================
 async function failTransaction(hash, reason) {
-    const result = await TransactionModel.findOneAndUpdate(
+    return TransactionModel.findOneAndUpdate(
         { hash, status: 'pending' },
-        {
-            $set: {
-                status: 'failed',
-                'metadata.reason': reason
-            }
-        },
+        { $set: { status: 'failed', 'metadata.reason': reason } },
         { new: true }
     );
-    return result;
 }
 
 // ============================================
-// creditAirdrop — crédito interno de airdrop
-// ============================================
-// ⚠️ Usa a mesma estrutura de TransactionModel do submitSignedTransaction
-//    - from / to (não fromAddress/toAddress)
-//    - amount/fee como Decimal128
-//    - NÃO mexe no nonce da carteira de destino
-//    - assina como INTERNAL (bypass da verificação de assinatura)
+// AIRDROP
 // ============================================
 async function creditAirdrop({ toAddress, amount, campaign, userId }) {
-    const toAddr = toAddress.toLowerCase();
+    const toAddr = wallet.normalizeAddress(toAddress);
 
-    if (!wallet.isValidAddress(toAddr)) {
-        throw new Error('Endereço de destino inválido');
-    }
+    if (!wallet.isValidAddress(toAddr)) throw new Error('Endereço de destino inválido');
 
-    const fromAddress = process.env.RESERVE_ADDRESS;
-    if (!fromAddress) {
-        throw new Error('RESERVE_ADDRESS não configurado no .env');
-    }
+    const fromAddress = wallet.normalizeAddress(process.env.RESERVE_ADDRESS);
+    if (!fromAddress) throw new Error('RESERVE_ADDRESS não configurado no .env');
 
-    // 1. Confere que a carteira de destino existe e está ativa
     const toWallet = await WalletModel.findOne({ address: toAddr });
-    if (!toWallet) {
-        throw new Error('Carteira de destino não existe');
-    }
-    if (toWallet.status !== 'active') {
-        throw new Error('Carteira de destino inativa');
-    }
+    if (!toWallet) throw new Error('Carteira de destino não existe');
+    if (toWallet.status !== 'active') throw new Error('Carteira de destino inativa');
 
-    // 2. Monta payload da TX interna
     const amountNum = parseFloat(amount);
-    if (!Number.isFinite(amountNum) || amountNum <= 0) {
-        throw new Error('Valor do airdrop inválido');
-    }
+    if (!Number.isFinite(amountNum) || amountNum <= 0) throw new Error('Valor do airdrop inválido');
 
     const timestamp = new Date().toISOString();
     const txPayload = {
@@ -518,17 +414,13 @@ async function creditAirdrop({ toAddress, amount, campaign, userId }) {
         type: 'airdrop'
     };
 
-    // 3. Assinatura fake (bypass) — mesmo padrão dos outros TXs internos
     const internalSignature = `INTERNAL_AIRDROP_${campaign}_${Date.now()}`;
     const hash = calculateTxHash(txPayload, internalSignature);
 
-    // 4. Anti-replay: garante que essa TX ainda não existe
-    const exists = await TransactionModel.findOne({ hash });
-    if (exists) {
+    if (await TransactionModel.findOne({ hash })) {
         throw new Error('Transação de airdrop já registrada');
     }
 
-    // 5. Registra a TX como confirmed
     const tx = await TransactionModel.create({
         hash,
         from: fromAddress,
@@ -544,16 +436,11 @@ async function creditAirdrop({ toAddress, amount, campaign, userId }) {
         metadata: { campaign, userId: userId?.toString(), internal: true }
     });
 
-    // 6. Credita o saldo do RECEBEDOR (não mexe no nonce dele!)
     const newBalance = Number(toWallet.balance || 0) + amountNum;
     toWallet.balance = Decimal128.fromString(newBalance.toString());
     await toWallet.save();
 
-    // 7. Incrementa o nonce do RESERVE (quem "gastou" a TX)
-    await WalletModel.updateOne(
-        { address: fromAddress },
-        { $inc: { nonce: 1 } }
-    );
+    await WalletModel.updateOne({ address: fromAddress }, { $inc: { nonce: 1 } });
 
     console.log(`✅ Airdrop creditado: ${amountNum} BRD → ${toAddr}`);
 
@@ -570,24 +457,14 @@ async function creditAirdrop({ toAddress, amount, campaign, userId }) {
 // ============================================
 module.exports = {
     initialize,
-
-    // Helpers (usar no client-side)
     buildSignableMessage,
     calculateTxHash,
     createSignedTransaction,
-
-    // Server-side
     submitSignedTransaction,
-
-    // Consultas
     getTransactionByHash,
     getWalletTransactions,
     getTransactionStats,
-
-    // Minerador
     confirmTransaction,
     failTransaction,
-
-    // Airdrop
     creditAirdrop
 };
