@@ -42,32 +42,32 @@ async function startP2P({ blockchain, port = DEFAULT_PORT } = {}) {
     },
   });
 
+  // ── PEER:CONNECT ───────────────────────────────────────
   node.addEventListener('peer:connect', async (evt) => {
     const pid = evt.detail;
 
-    node.addEventListener('peer:connect', async (evt) => {
-  const pid = evt.detail;
+    // ── LIMITE POR SUBNET ─────────────────────────────
+    const ipDiv = require('./ipDiversity');
+    let multiaddrStr = null;
+    try {
+      const conn = node.getConnections(pid)[0];
+      multiaddrStr = conn?.remoteAddr?.toString?.() || null;
+    } catch {}
 
-  // ── LIMITE POR SUBNET ─────────────────────────────
-  const ipDiv = require('./ipDiversity');
-  let multiaddrStr = null;
-  try {
-    const conn = node.getConnections(pid)[0];
-    multiaddrStr = conn?.remoteAddr?.toString?.() || null;
-  } catch {}
+    const reg = ipDiv.register(pid, multiaddrStr);
+    if (!reg.ok) {
+      console.warn(
+        `🚫 eclipse-block: ${pid.toString().substring(0, 16)}... ` +
+        `(subnet ${reg.subnet} cheia: ${reg.current}/${reg.max})`
+      );
+      try { await node.hangUp(pid); } catch {}
+      return;
+    }
+    // ──────────────────────────────────────────────────
 
-  const reg = ipDiv.register(pid, multiaddrStr);
-  if (!reg.ok) {
-    console.warn(
-      `🚫 eclipse-block: ${pid.toString().substring(0, 16)}... ` +
-      `(subnet ${reg.subnet} cheia: ${reg.current}/${reg.max})`
-    );
-    try { await node.hangUp(pid); } catch {}
-    return;
-  }
- 
     console.log(`🔗 Peer conectado: ${pid.toString()}`);
     require('./persistence').markPeersDirty();
+
     try {
       const st = await queryStatus(node, pid);
       const localLatest = blockchain.getLatestBlock();
@@ -82,6 +82,7 @@ async function startP2P({ blockchain, port = DEFAULT_PORT } = {}) {
     }
   });
 
+  // ── PEER:DISCONNECT ────────────────────────────────────
   node.addEventListener('peer:disconnect', (evt) => {
     console.log(`🔌 Peer desconectado: ${evt.detail.toString()}`);
     require('./ipDiversity').unregister(evt.detail);
@@ -91,19 +92,19 @@ async function startP2P({ blockchain, port = DEFAULT_PORT } = {}) {
   await node.start();
 
   require('./persistence').setNode(node);
-  
+
   console.log(`🌐 P2P node iniciado`);
   console.log(`   PeerID: ${peerId.toString()}`);
   for (const addr of node.getMultiaddrs()) console.log(`   ${addr.toString()}`);
 
+  // ── PROTOCOLOS + GOSSIP ────────────────────────────────
   registerStatusProtocol(node, blockchain);
   registerIBDProtocol(node, blockchain);
   await wireGossip(node, blockchain);
 
-    // ── RATE LIMIT + SIZE LIMIT ────────────────────────────
+  // ── RATE LIMIT + SIZE LIMIT ────────────────────────────
   const rateLimit = require('./rateLimit');
   const msgSize = require('./messageSize');
-  const scoring = require('./scoring');
 
   node.services.pubsub.addEventListener('message', (evt) => {
     const from = evt.detail.from;
@@ -120,7 +121,7 @@ async function startP2P({ blockchain, port = DEFAULT_PORT } = {}) {
       if (scoring.get(from) < 30) {
         node.hangUp(from).catch(() => {});
       }
-      return;   // ← descarta a mensagem, não deixa passar
+      return;
     }
 
     // 2. Taxa
@@ -133,7 +134,7 @@ async function startP2P({ blockchain, port = DEFAULT_PORT } = {}) {
       return;
     }
   });
-  
+
   return { node, peerId };
 }
 
