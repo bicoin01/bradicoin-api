@@ -77,6 +77,23 @@ async function startP2P({ blockchain, port = DEFAULT_PORT } = {}) {
   registerIBDProtocol(node, blockchain);
   await wireGossip(node, blockchain);
 
+  // ── RATE LIMIT ─────────────────────────────────────────
+  const rateLimit = require('./rateLimit');
+  const scoring = require('./scoring');
+
+  node.services.pubsub.addEventListener('message', (evt) => {
+    const from = evt.detail.from;
+    if (!from) return;
+
+    if (!rateLimit.allow(from)) {
+      scoring.penalize(from, 10, 'rate-limit');
+      console.warn(`⚠️  rate limit: ${from.toString().substring(0, 16)}...`);
+      if (scoring.get(from) < 30) {
+        node.hangUp(from).catch(() => {});
+      }
+    }
+  });
+  
   return { node, peerId };
 }
 
