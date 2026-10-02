@@ -45,6 +45,7 @@ async function startP2P({ blockchain, port = DEFAULT_PORT } = {}) {
   node.addEventListener('peer:connect', async (evt) => {
     const pid = evt.detail;
     console.log(`🔗 Peer conectado: ${pid.toString()}`);
+    require('./persistence').markPeersDirty();
     try {
       const st = await queryStatus(node, pid);
       const localLatest = blockchain.getLatestBlock();
@@ -61,10 +62,13 @@ async function startP2P({ blockchain, port = DEFAULT_PORT } = {}) {
 
   node.addEventListener('peer:disconnect', (evt) => {
     console.log(`🔌 Peer desconectado: ${evt.detail.toString()}`);
+    require('./persistence').markPeersDirty();
   });
 
   await node.start();
 
+  require('./persistence').setNode(node);
+  
   console.log(`🌐 P2P node iniciado`);
   console.log(`   PeerID: ${peerId.toString()}`);
   for (const addr of node.getMultiaddrs()) console.log(`   ${addr.toString()}`);
@@ -79,6 +83,7 @@ async function startP2P({ blockchain, port = DEFAULT_PORT } = {}) {
 async function stopP2P(node) {
   if (!node) return;
   console.log('🛑 Parando P2P...');
+  require('./persistence').flushSync();
   await node.stop();
   console.log('✅ P2P parado');
 }
