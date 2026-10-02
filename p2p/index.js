@@ -77,20 +77,37 @@ async function startP2P({ blockchain, port = DEFAULT_PORT } = {}) {
   registerIBDProtocol(node, blockchain);
   await wireGossip(node, blockchain);
 
-  // ── RATE LIMIT ─────────────────────────────────────────
+    // ── RATE LIMIT + SIZE LIMIT ────────────────────────────
   const rateLimit = require('./rateLimit');
+  const msgSize = require('./messageSize');
   const scoring = require('./scoring');
 
   node.services.pubsub.addEventListener('message', (evt) => {
     const from = evt.detail.from;
     if (!from) return;
 
+    // 1. Tamanho
+    const sizeCheck = msgSize.check(evt.detail.data);
+    if (!sizeCheck.ok) {
+      scoring.penalize(from, 30, `size-limit:${sizeCheck.reason}`);
+      console.warn(
+        `⚠️  msg grande demais de ${from.toString().substring(0, 16)}... ` +
+        `(${sizeCheck.size} bytes, max ${msgSize.MAX_MESSAGE_BYTES})`
+      );
+      if (scoring.get(from) < 30) {
+        node.hangUp(from).catch(() => {});
+      }
+      return;   // ← descarta a mensagem, não deixa passar
+    }
+
+    // 2. Taxa
     if (!rateLimit.allow(from)) {
       scoring.penalize(from, 10, 'rate-limit');
       console.warn(`⚠️  rate limit: ${from.toString().substring(0, 16)}...`);
       if (scoring.get(from) < 30) {
         node.hangUp(from).catch(() => {});
       }
+      return;
     }
   });
   
