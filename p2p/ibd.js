@@ -103,10 +103,40 @@ async function handleGetBlocks(blockchain, req) {
   return { type: 'blocks', blocks };
 }
 
-async function runIBD(node, blockchain, peerId) {
-  console.log(`🔄 IBD com ${peerId.toString()}`);
+// ── TIMEOUT WRAPPER ────────────────────────────────────────
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`timeout: ${label} (${ms}ms)`)), ms)
+    ),
+  ]);
+}
 
-  const remoteStatus = await queryStatus(node, peerId);
+const IBD_TIMEOUTS = {
+  STATUS:  10_000,   // 10s pra peer responder status
+  DIAL:    10_000,   // 10s pra abrir stream
+  BATCH:   30_000,   // 30s pra peer devolver um batch de blocos
+  TOTAL:   10 * 60_000, // 10min no máximo pro IBD inteiro
+};
+
+async function runIBD(node, blockchain, peerId) {
+  const scoring = require('./scoring');
+  const startAt = Date.now();
+  console.log(`🔄 IBD com ${peerId.toString().substring(0, 16)}...`);
+
+  let remoteStatus;
+  try {
+    remoteStatus = await withTimeout(
+      queryStatus(node, peerId),
+      IBD_TIMEOUTS.STATUS,
+      'queryStatus'
+    );
+  } catch (e) {
+    console.warn(`⏱️  IBD abortado: ${e.message}`);
+    scoring.penalize(peerId, 20, 'ibd-status-timeout');
+    return false;
+  }
   if (!remoteStatus) return false;
 
   const localLatest = blockchain.getLatestBlock();
@@ -115,14 +145,55 @@ async function runIBD(node, blockchain, peerId) {
   console.log(`   local=${localHeight} remoto=${remoteStatus.height}`);
   if (remoteStatus.height <= localHeight) return true;
 
-  const stream = await node.dialProtocol(peerId, PROTOCOL);
+  let stream;
+  try {
+    stream = await withTimeout(
+      node.dialProtocol(peerId, PROTOCOL),
+      IBD_TIMEOUTS.DIAL,
+      'dialProtocol'
+    );
+  } catch (e) {
+    console.warn(`⏱️  IBD abortado: ${e.message}`);
+    scoring.penalize(peerId, 20, 'ibd-dial-timeout');
+    return false;
+  }
 
   let from = localHeight + 1;
   const target = remoteStatus.height;
 
   while (from <= target) {
+    // Timeout total (protege contra peer que responde devagar mas sempre responde)
+    if (Date.now() - startAt > IBD_TIMEOUTS.TOTAL) {
+      console.warn(`⏱️  IBD abortado: timeout total (${IBD_TIMEOUTS.TOTAL}ms)`);
+      scoring.penalize(peerId, 30, 'ibd-total-timeout');
+      try { stream.close?.(); } catch {}
+      return false;
+    }
+
     const to = Math.min(from + BATCH_BLOCKS - 1, target);
-    const blocks = await requestBlocks(stream, from, to);
+
+    let blocks;
+    try {
+      blocks = await withTimeout(
+        requestBlocks(stream, from, to),
+        IBD_TIMEOUTS.BATCH,
+        `batch ${from}-${to}`
+      );
+    } catch (e) {
+      console.warn(`⏱️  IBD abortado: ${e.message}`);
+      scoring.penalize(peerId, 30, 'ibd-batch-timeout');
+      try { stream.close?.(); } catch {}
+      return false;
+    }
+
+    // Se peer não devolveu nada → consideramos mentiroso
+    if (!blocks || blocks.length === 0) {
+      console.warn(`⚠️  IBD: peer não devolveu blocos em ${from}-${to}`);
+      scoring.penalize(peerId, 40, 'ibd-empty-batch');
+      try { stream.close?.(); } catch {}
+      return false;
+    }
+
     for (const blk of blocks) {
       try {
         await blockchain.acceptBlockFromPeer(blk);
@@ -130,11 +201,13 @@ async function runIBD(node, blockchain, peerId) {
         console.error(`  bloco ${blk.index} rejeitado:`, e.message);
       }
     }
+
     console.log(`   IBD: ${to}/${target}`);
     from = to + 1;
   }
 
   console.log(`✅ IBD concluído. Altura: ${blockchain.getLatestBlock()?.index}`);
+  try { stream.close?.(); } catch {}
   return true;
 }
 
