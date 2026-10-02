@@ -1,21 +1,9 @@
 // wallet.js
 // ============================================
-// Bradicoin Blockchain - Wallet (v3.0)
+// Bradicoin Blockchain - Wallet (v3.1)
 // ============================================
 // 🔐 ARQUITETURA NÃO-CUSTODIAL
-//
-// A chave privada NUNCA passa pelo servidor.
-// O cliente (navegador) gera o par de chaves, assina
-// transações localmente e envia apenas:
-//   - publicKey
-//   - address (derivado da publicKey)
-//   - signature (das transações)
-//
-// Este módulo cuida apenas de:
-//   - Validar e persistir publicKey + address
-//   - Consultar saldo/histórico
-//   - Verificar assinaturas
-//
+// 🆕 v3.1 — normalização de endereço (case-insensitive)
 // ============================================
 
 const crypto = require('crypto');
@@ -31,21 +19,31 @@ const blockchain = require('./blockchain');
 // CONSTANTES
 // ============================================
 const ADDRESS_PREFIX = 'Br';
-const ADDRESS_HEX_LENGTH = 38;      // 19 bytes de endereço
-const ADDRESS_REGEX = /^Br[a-fA-F0-9]{38}$/;
-const PUBLIC_KEY_REGEX = /^[a-fA-F0-9]{66}$/; // secp256k1 comprimida (33 bytes)
-const INITIAL_BALANCE = '1000';      // string (Decimal128)
+const ADDRESS_HEX_LENGTH = 38;
+const ADDRESS_REGEX = /^Br[a-fA-F0-9]{38}$/i;   // ← aceita A-F e a-f
+const PUBLIC_KEY_REGEX = /^[a-fA-F0-9]{66}$/;
+const INITIAL_BALANCE = '1000';
+
+// ============================================
+// 🆕 NORMALIZAÇÃO — sempre minúsculo depois do prefixo
+// ============================================
+function normalizeAddress(address) {
+    if (!address || typeof address !== 'string') return address;
+    if (address.length < 3 || !address.startsWith('Br')) return address;
+    // 'Br' + resto em minúsculo (aceita 'BR' ou 'Br' na entrada)
+    return 'Br' + address.slice(2).toLowerCase();
+}
 
 // ============================================
 // INICIALIZAR
 // ============================================
 async function initialize() {
-    await WalletModel.init(); // garante índices
+    await WalletModel.init();
     console.log('✅ Wallet inicializada (não-custodial)');
 }
 
 // ============================================
-// 🔐 VALIDAÇÃO DE ENDEREÇO
+// 🔐 VALIDAÇÃO DE ENDEREÇO (case-insensitive)
 // ============================================
 function isValidAddress(address) {
     if (!address || typeof address !== 'string') return false;
@@ -58,13 +56,8 @@ function isValidPublicKey(publicKey) {
 }
 
 // ============================================
-// 🔐 DERIVAR ENDEREÇO DE UMA PUBLIC KEY
+// 🔐 DERIVAR ENDEREÇO (sempre minúsculo)
 // ============================================
-// Padrão Ethereum-like: endereço = últimos 19 bytes do keccak256(pubKey)
-//
-// IMPORTANTE: essa função é determinística.
-// Se dois clientes gerarem a mesma publicKey, o endereço será igual.
-//
 function deriveAddressFromPublicKey(publicKeyHex) {
     if (!isValidPublicKey(publicKeyHex)) {
         throw new Error('Public key inválida');
@@ -72,38 +65,32 @@ function deriveAddressFromPublicKey(publicKeyHex) {
 
     const pubKeyBytes = hexToBytes(publicKeyHex);
     const hash = keccak_256(pubKeyBytes);
-    const addressBytes = hash.slice(-19); // últimos 19 bytes
+    const addressBytes = hash.slice(-19);
 
-    return ADDRESS_PREFIX + bytesToHex(addressBytes).toUpperCase();
+    // 🆕 sempre minúsculo
+    return ADDRESS_PREFIX + bytesToHex(addressBytes).toLowerCase();
 }
 
 // ============================================
-// 🔐 VALIDAR QUE PUBLIC KEY CORRESPONDE AO ENDEREÇO
+// 🔐 VERIFICAÇÃO
 // ============================================
 function publicKeyMatchesAddress(publicKeyHex, address) {
     try {
         const derived = deriveAddressFromPublicKey(publicKeyHex);
-        return derived === address;
+        const normalized = normalizeAddress(address);
+        return derived === normalized;
     } catch (e) {
         return false;
     }
 }
 
-// ============================================
-// 🔐 VERIFICAR ASSINATURA
-// ============================================
-// Usado pelo transactions.js para validar que quem enviou
-// a transação realmente tem a privateKey correspondente.
-//
 function verifySignature(message, signatureHex, publicKeyHex) {
     try {
         if (!message || !signatureHex || !publicKeyHex) return false;
         if (!isValidPublicKey(publicKeyHex)) return false;
 
         const messageBytes =
-            typeof message === 'string'
-                ? utf8ToBytes(message)
-                : message;
+            typeof message === 'string' ? utf8ToBytes(message) : message;
 
         const messageHash = sha256(messageBytes);
         const signatureBytes = hexToBytes(signatureHex);
@@ -115,19 +102,10 @@ function verifySignature(message, signatureHex, publicKeyHex) {
     }
 }
 
-// ============================================
-// 🔐 RECUPERAR PUBLIC KEY DE UMA ASSINATURA
-// ============================================
-// Útil quando você tem a assinatura e o messageHash,
-// mas não sabe quem assinou.
-//
 function recoverPublicKey(message, signatureHex, recovery) {
     try {
         const messageBytes =
-            typeof message === 'string'
-                ? utf8ToBytes(message)
-                : message;
-
+            typeof message === 'string' ? utf8ToBytes(message) : message;
         const messageHash = sha256(messageBytes);
         const signatureBytes = hexToBytes(signatureHex);
 
@@ -145,28 +123,22 @@ function recoverPublicKey(message, signatureHex, recovery) {
 }
 
 // ============================================
-// REGISTRAR CARTEIRA (recebe publicKey do cliente)
+// REGISTRAR CARTEIRA
 // ============================================
-// ⚠️ NÃO gera par de chaves aqui.
-// O cliente já gerou e mandou apenas { address, publicKey }.
-//
 async function registerWallet({ address, publicKey, userId, username }) {
-    // 1. Validações
-    if (!isValidAddress(address)) {
+    const normalizedAddress = normalizeAddress(address);
+
+    if (!isValidAddress(normalizedAddress)) {
         throw new Error('Endereço inválido');
     }
-
     if (!isValidPublicKey(publicKey)) {
         throw new Error('Public key inválida');
     }
-
-    // 2. Verifica que address = derive(publicKey)
-    if (!publicKeyMatchesAddress(publicKey, address)) {
+    if (!publicKeyMatchesAddress(publicKey, normalizedAddress)) {
         throw new Error('Public key não corresponde ao endereço informado');
     }
 
-    // 3. Verifica se já existe
-    const existing = await WalletModel.findOne({ address });
+    const existing = await WalletModel.findOne({ address: normalizedAddress });
     if (existing) {
         throw new Error('Carteira já registrada');
     }
@@ -178,9 +150,8 @@ async function registerWallet({ address, publicKey, userId, username }) {
         }
     }
 
-    // 4. Salva no Mongo
     const wallet = await WalletModel.create({
-        address,
+        address: normalizedAddress,
         publicKey,
         userId: userId || null,
         balance: '0',
@@ -188,21 +159,19 @@ async function registerWallet({ address, publicKey, userId, username }) {
         status: 'active'
     });
 
-    console.log(`👤 Carteira registrada: ${address}`);
+    console.log(`👤 Carteira registrada: ${normalizedAddress}`);
 
-    // 5. Transação de criação (com saldo inicial, se configurado)
     if (parseFloat(INITIAL_BALANCE) > 0) {
         try {
             await blockchain.addTransaction({
-                fromAddress: null, // sistema
-                toAddress: address,
+                fromAddress: null,
+                toAddress: normalizedAddress,
                 amount: parseFloat(INITIAL_BALANCE),
                 type: 'wallet_creation'
             });
             console.log(`💰 Saldo inicial pendente: ${INITIAL_BALANCE} BRD`);
         } catch (e) {
             console.error('Erro ao adicionar saldo inicial:', e.message);
-            // não falha o registro por causa disso
         }
     }
 
@@ -213,15 +182,16 @@ async function registerWallet({ address, publicKey, userId, username }) {
 // CONSULTAR SALDO
 // ============================================
 async function getBalance(address) {
-    if (!isValidAddress(address)) {
+    const normalized = normalizeAddress(address);
+    if (!isValidAddress(normalized)) {
         throw new Error('Endereço inválido');
     }
 
-    const walletDoc = await WalletModel.findOne({ address });
+    const walletDoc = await WalletModel.findOne({ address: normalized });
 
     if (!walletDoc) {
         return {
-            address,
+            address: normalized,
             exists: false,
             balance: '0',
             pending: '0',
@@ -231,20 +201,18 @@ async function getBalance(address) {
         };
     }
 
-    // Saldo confirmado (no Wallet)
     const confirmedBalance = parseFloat(walletDoc.balance.toString());
 
-    // Saldo pendente (na mempool do blockchain)
     let pendingBalance = 0;
     if (blockchain.pendingTransactions) {
         for (const tx of blockchain.pendingTransactions) {
-            if (tx.toAddress === address) pendingBalance += parseFloat(tx.amount);
-            if (tx.fromAddress === address) pendingBalance -= parseFloat(tx.amount);
+            if (tx.toAddress === normalized) pendingBalance += parseFloat(tx.amount);
+            if (tx.fromAddress === normalized) pendingBalance -= parseFloat(tx.amount);
         }
     }
 
     return {
-        address,
+        address: normalized,
         exists: true,
         balance: confirmedBalance.toFixed(8),
         pending: pendingBalance.toFixed(8),
@@ -259,24 +227,23 @@ async function getBalance(address) {
 // HISTÓRICO
 // ============================================
 async function getHistory(address, limit = 50) {
-    if (!isValidAddress(address)) {
+    const normalized = normalizeAddress(address);
+    if (!isValidAddress(normalized)) {
         throw new Error('Endereço inválido');
     }
 
     const Transaction = require('./models/Transaction');
 
-    // 1. Histórico confirmado (MongoDB)
     const confirmed = await Transaction.find({
-        $or: [{ from: address }, { to: address }],
+        $or: [{ from: normalized }, { to: normalized }],
         status: 'confirmed'
     })
         .sort({ timestamp: -1 })
         .limit(limit)
         .lean();
 
-    // 2. Pendentes (mempool)
     const pending = (blockchain.pendingTransactions || [])
-        .filter(tx => tx.fromAddress === address || tx.toAddress === address)
+        .filter(tx => tx.fromAddress === normalized || tx.toAddress === normalized)
         .map(tx => ({
             from: tx.fromAddress,
             to: tx.toAddress,
@@ -288,7 +255,6 @@ async function getHistory(address, limit = 50) {
             hash: tx.hash || null
         }));
 
-    // 3. Junta e ordena
     const all = [
         ...confirmed.map(tx => ({
             from: tx.from,
@@ -305,18 +271,18 @@ async function getHistory(address, limit = 50) {
     ];
 
     all.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-
     return all.slice(0, limit);
 }
 
 // ============================================
-// BUSCAR CARTEIRA
+// BUSCAR
 // ============================================
 async function getByAddress(address) {
-    if (!isValidAddress(address)) {
+    const normalized = normalizeAddress(address);
+    if (!isValidAddress(normalized)) {
         throw new Error('Endereço inválido');
     }
-    return WalletModel.findOne({ address });
+    return WalletModel.findOne({ address: normalized });
 }
 
 async function getByUserId(userId) {
@@ -325,32 +291,35 @@ async function getByUserId(userId) {
 }
 
 async function getPublicKey(address) {
-    if (!isValidAddress(address)) {
+    const normalized = normalizeAddress(address);
+    if (!isValidAddress(normalized)) {
         throw new Error('Endereço inválido');
     }
-    const wallet = await WalletModel.findOne({ address }).select('publicKey');
+    const wallet = await WalletModel.findOne({ address: normalized }).select('publicKey');
     return wallet ? wallet.publicKey : null;
 }
 
 // ============================================
-// ATUALIZAR SALDO (chamado pelo minerador)
+// SALDO
 // ============================================
 async function creditBalance(address, amountStr) {
-    if (!isValidAddress(address)) {
+    const normalized = normalizeAddress(address);
+    if (!isValidAddress(normalized)) {
         throw new Error('Endereço inválido');
     }
-    return WalletModel.credit(address, amountStr);
+    return WalletModel.credit(normalized, amountStr);
 }
 
 async function debitBalance(address, amountStr) {
-    if (!isValidAddress(address)) {
+    const normalized = normalizeAddress(address);
+    if (!isValidAddress(normalized)) {
         throw new Error('Endereço inválido');
     }
-    return WalletModel.debit(address, amountStr);
+    return WalletModel.debit(normalized, amountStr);
 }
 
 // ============================================
-// ESTATÍSTICAS DA REDE
+// STATS
 // ============================================
 async function getNetworkStats() {
     const [totalWallets, activeWallets, totalBalanceAgg] = await Promise.all([
@@ -358,12 +327,7 @@ async function getNetworkStats() {
         WalletModel.countDocuments({ status: 'active' }),
         WalletModel.aggregate([
             { $match: { status: 'active' } },
-            {
-                $group: {
-                    _id: null,
-                    total: { $sum: { $toDouble: '$balance' } }
-                }
-            }
+            { $group: { _id: null, total: { $sum: { $toDouble: '$balance' } } } }
         ])
     ]);
 
@@ -379,6 +343,9 @@ async function getNetworkStats() {
 // ============================================
 module.exports = {
     initialize,
+
+    // 🆕
+    normalizeAddress,
 
     // Validações
     isValidAddress,
