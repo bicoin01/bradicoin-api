@@ -8,7 +8,29 @@ const BATCH_HEADERS = 2000;
 const BATCH_BLOCKS = 128;
 
 function registerIBDProtocol(node, blockchain) {
-  node.handle(PROTOCOL, async ({ stream }) => {
+  node.handle(PROTOCOL, async ({ stream, connection }) => {
+    const streamLimit = require('./streamLimit');
+    const scoring = require('./scoring');
+    const peerId = connection.remotePeer;
+
+    // ── LIMITE DE STREAMS ─────────────────────────────
+    const check = streamLimit.canOpen(peerId);
+    if (!check.ok) {
+      console.warn(
+        `🚫 stream-block: ${peerId.toString().substring(0, 16)}... ` +
+        `(${check.reason}: ${check.active || check.opened}/${check.max})`
+      );
+      scoring.penalize(peerId, 20, `stream-limit:${check.reason}`);
+      if (scoring.get(peerId) < 30) {
+        node.hangUp(peerId).catch(() => {});
+      }
+      try { stream.abort?.(); } catch {}
+      try { stream.close?.(); } catch {}
+      return;
+    }
+    const streamId = check.streamId;
+    // ──────────────────────────────────────────────────
+
     try {
       await pipe(
         stream.source,
@@ -35,6 +57,9 @@ function registerIBDProtocol(node, blockchain) {
       );
     } catch (e) {
       console.error('[ibd] handler:', e.message);
+    } finally {
+      // ── LIBERA O STREAM ─────────────────────────────
+      streamLimit.close(peerId, streamId);
     }
   });
   console.log(`📡 protocolo ${PROTOCOL} registrado`);
