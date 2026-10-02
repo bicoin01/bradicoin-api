@@ -136,11 +136,10 @@ const transactionSchema = new mongoose.Schema(
         // ============================================
         status: {
             type: String,
-            enum: ['pending', 'confirmed', 'failed'],
+            enum: ['pending', 'confirmed', 'failed', 'reverted'],   // 🆕 'reverted'
             default: 'pending',
             index: true
         },
-
         // ============================================
         // 📦 BLOCO
         // ============================================
@@ -231,10 +230,16 @@ transactionSchema.index(
     { unique: true, name: 'unique_signature' }
 );
 
-// 🔐 Anti-replay: nonce + from únicos
+// 🔐 Anti-replay: nonce + from únicos (só pendentes/confirmadas)
 transactionSchema.index(
     { from: 1, nonce: 1 },
-    { unique: true, name: 'unique_from_nonce' }
+    {
+        unique: true,
+        name: 'unique_from_nonce',
+        partialFilterExpression: {
+            status: { $in: ['pending', 'confirmed'] }
+        }
+    }
 );
 
 // Histórico de uma carteira
@@ -323,6 +328,21 @@ transactionSchema.statics.findPending = async function (limit = 100) {
 transactionSchema.statics.isNonceUsed = async function (address, nonce) {
     const tx = await this.findOne({ from: address, nonce });
     return !!tx;
+};
+
+// Verifica se nonce foi usado (anti-replay)
+transactionSchema.statics.isNonceUsed = async function (address, nonce) {
+    const tx = await this.findOne({ from: address, nonce });
+    return !!tx;
+};
+
+// 🆕 v4.0 — Marca TXs como revertidas (usado no reorg)
+transactionSchema.statics.markReverted = async function (hashes) {
+    if (!hashes || hashes.length === 0) return { modifiedCount: 0 };
+    return this.updateMany(
+        { hash: { $in: hashes } },
+        { $set: { status: 'reverted' } }
+    );
 };
 
 // ============================================
