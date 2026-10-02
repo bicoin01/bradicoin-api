@@ -60,6 +60,7 @@ if (process.env.JWT_SECRET.length < 32) {
 // ============================================
 // IMPORTAÇÕES LOCAIS
 // ============================================
+const { startP2P, stopP2P } = require('./p2p');
 const blockchain = require('./blockchain');
 const wallet = require('./wallet');
 const transactions = require('./transactions');
@@ -101,6 +102,7 @@ const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || APP_URL)
     .split(',')
     .map((o) => o.trim())
     .filter(Boolean);
+
 
 // ============================================
 // INICIALIZAÇÃO DO EXPRESS
@@ -1023,6 +1025,11 @@ function startAutoPriceUpdate() {
 }
 
 // ============================================
+// 🆕 v4.0 — Referência global do P2P
+// ============================================
+let p2pNode = null;
+
+// ============================================
 // INICIALIZAÇÃO
 // ============================================
 async function initialize() {
@@ -1037,6 +1044,14 @@ async function initialize() {
         await wallet.initialize();
         await transactions.initialize();
 
+         // 🆕 v4.0 — sobe a camada P2P descentralizada
+        const p2pResult = await startP2P({
+            blockchain,
+            port: parseInt(process.env.P2P_PORT) || 4001
+        });
+        p2pNode = p2pResult.node;
+        logger.info(`🌐 P2P rodando (PeerID: ${p2pNode.peerId.toString()})`);
+        
         const { ReserveModel } = require('./models/Reserve');
         const reserve = await ReserveModel.getReserve();
         logger.info(`🏦 Reserve: ${reserve.address}`);
@@ -1086,6 +1101,13 @@ async function shutdown(signal) {
 
     if (miningInterval) clearInterval(miningInterval);
 
+     // 🆕 v4.0 — desliga P2P graciosamente
+    try {
+        if (p2pNode) await stopP2P(p2pNode);
+    } catch (e) {
+        logger.error('Erro ao parar P2P:', e.message);
+    }
+    
     io.close();
 
     server.close(() => {
