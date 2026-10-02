@@ -330,12 +330,6 @@ transactionSchema.statics.isNonceUsed = async function (address, nonce) {
     return !!tx;
 };
 
-// Verifica se nonce foi usado (anti-replay)
-transactionSchema.statics.isNonceUsed = async function (address, nonce) {
-    const tx = await this.findOne({ from: address, nonce });
-    return !!tx;
-};
-
 // 🆕 v4.0 — Marca TXs como revertidas (usado no reorg)
 transactionSchema.statics.markReverted = async function (hashes) {
     if (!hashes || hashes.length === 0) return { modifiedCount: 0 };
