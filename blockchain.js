@@ -55,7 +55,7 @@ if (!/^Br[a-fA-F0-9]{38}$/.test(CONFIG.feeCollectorAddress)) {
 }
 
 // ============================================
-// HELPERS (idênticos v3.1)
+// HELPERS
 // ============================================
 function normalizeTx(tx) {
     if (!tx) return null;
@@ -100,7 +100,7 @@ class Block {
         this.nonce = nonce || 0;
         this.minerAddress = minerAddress || null;
         this.minerSignature = minerSignature || null;
-        this.difficulty = difficulty || CONFIG.difficulty;  // 🆕
+        this.difficulty = difficulty || CONFIG.difficulty;
         this.hash = hash || this.calculateHash();
     }
 
@@ -111,7 +111,7 @@ class Block {
             previousHash: this.previousHash,
             nonce: this.nonce,
             minerAddress: this.minerAddress,
-            difficulty: this.difficulty,          // 🆕
+            difficulty: this.difficulty,
             txHashes: this.transactions.map(tx => tx.hash).filter(Boolean).sort()
         });
         return bytesToHex(sha256(utf8ToBytes(payload)));
@@ -140,7 +140,7 @@ class Block {
             previousHash: this.previousHash,
             hash: this.hash,
             nonce: this.nonce,
-            difficulty: this.difficulty,          // 🆕
+            difficulty: this.difficulty,
             minerAddress: this.minerAddress,
             minerSignature: this.minerSignature
         };
@@ -148,7 +148,7 @@ class Block {
 }
 
 // ============================================
-// CLASSE BLOCKCHAIN (extends EventEmitter)
+// CLASSE BLOCKCHAIN
 // ============================================
 class Blockchain extends EventEmitter {
     constructor() {
@@ -159,14 +159,13 @@ class Blockchain extends EventEmitter {
         this.mining = false;
         this.maxChainCache = 100;
 
-        // 🆕 v4.0 — estado P2P
         this._chainwork = 0n;
         this._orphanPool = [];
         this._currentDifficulty = CONFIG.difficulty;
     }
 
     // ============================================
-    // CONSULTAS P2P (usadas pelos módulos p2p/*)
+    // CONSULTAS P2P
     // ============================================
     getChainwork() {
         return this._chainwork.toString();
@@ -229,7 +228,6 @@ class Blockchain extends EventEmitter {
             this.pendingTransactions = pending.map(normalizeTx);
             console.log(`⏳ ${pending.length} transações pendentes carregadas`);
 
-            // 🆕 v4.0 — recalcula chainwork e dificuldade corrente
             this._chainwork = 0n;
             for (const b of this.chain) {
                 this._chainwork += blockWork(b.difficulty || CONFIG.difficulty);
@@ -256,7 +254,7 @@ class Blockchain extends EventEmitter {
             transactions: [],
             previousHash: '0'.repeat(64),
             nonce: 0,
-            difficulty: CONFIG.difficulty,     // 🆕
+            difficulty: CONFIG.difficulty,
             minerAddress: null,
             minerSignature: null
         });
@@ -268,6 +266,23 @@ class Blockchain extends EventEmitter {
 
         await BlockModel.create(genesis.toObject());
         return genesis;
+    }
+
+    // ============================================
+    // HASH CANÔNICO DA TX (implementação local — SEM require circular)
+    // ============================================
+    calculateTxHash(tx) {
+        const payload = JSON.stringify({
+            from: tx.fromAddress || tx.from || null,
+            to: tx.toAddress || tx.to || null,
+            amount: safeToString(tx.amount),
+            fee: safeToString(tx.fee, '0'),
+            nonce: tx.nonce || 0,
+            type: tx.type || 'transfer',
+            timestamp: safeToString(tx.timestamp || new Date().toISOString()),
+            signature: tx.signature || 'system'
+        });
+        return bytesToHex(sha256(utf8ToBytes(payload)));
     }
 
     // ============================================
@@ -352,29 +367,14 @@ class Blockchain extends EventEmitter {
         const normalized = normalizeTx(savedTx.toObject());
         this.pendingTransactions.push(normalized);
 
-        // 🆕 v4.0 — propaga para a rede
         this.emit('tx:new', normalized);
 
         return { hash: savedTx.hash, status: 'pending', message: 'Transação adicionada à fila' };
     }
 
     // ============================================
-    // HASH CANÔNICO DA TX
+    // ASSINATURA (usada pelo addTransaction)
     // ============================================
-    calculateTxHash(tx) {
-        const payload = JSON.stringify({
-            from: tx.fromAddress || tx.from || null,
-            to: tx.toAddress || tx.to,
-            amount: safeToString(tx.amount),
-            fee: safeToString(tx.fee, '0'),
-            nonce: tx.nonce || 0,
-            type: tx.type || 'transfer',
-            timestamp: safeToString(tx.timestamp || new Date().toISOString()),
-            signature: tx.signature || 'system'
-        });
-        return bytesToHex(sha256(utf8ToBytes(payload)));
-    }
-
     buildSignableMessage(tx) {
         return [
             tx.fromAddress,
@@ -408,7 +408,6 @@ class Blockchain extends EventEmitter {
 
             const newIndex = previousBlock.index + 1;
 
-            // 🆕 v4.0 — retarget dinâmico
             const nextDifficulty = computeNextDifficulty(
                 newIndex, this.chain, this._currentDifficulty
             );
@@ -419,12 +418,11 @@ class Blockchain extends EventEmitter {
                 transactions: txsToMine,
                 previousHash: previousBlock.hash,
                 nonce: 0,
-                difficulty: nextDifficulty,         // 🆕
+                difficulty: nextDifficulty,
                 minerAddress: minerAddress || null,
                 minerSignature: null
             });
 
-            // PoW com dificuldade dinâmica
             while (!newBlock.meetsDifficulty(nextDifficulty)) {
                 newBlock.nonce++;
                 newBlock.hash = newBlock.calculateHash();
@@ -454,7 +452,6 @@ class Blockchain extends EventEmitter {
             this.chain.push(newBlock);
             if (this.chain.length > this.maxChainCache) this.chain.shift();
 
-            // 🆕 v4.0 — atualiza chainwork + dificuldade
             this._chainwork += blockWork(nextDifficulty);
             this._currentDifficulty = nextDifficulty;
 
@@ -462,7 +459,6 @@ class Blockchain extends EventEmitter {
 
             console.log(`⛏️  Bloco ${newBlock.index} minerado: ${newBlock.hash.substring(0, 16)}... (${txsToMine.length} TXs, diff=${nextDifficulty})`);
 
-            // 🆕 v4.0 — propaga para a rede
             this.emit('block:new', newBlock.toObject());
 
             return newBlock.toObject();
@@ -472,7 +468,7 @@ class Blockchain extends EventEmitter {
     }
 
     // ============================================
-    // APLICAR TRANSAÇÕES (com suporte a reversão)
+    // APLICAR TRANSAÇÕES
     // ============================================
     async applyTransactions(transactions) {
         for (const rawTx of transactions) {
@@ -511,10 +507,9 @@ class Blockchain extends EventEmitter {
     }
 
     // ============================================
-    // 🆕 v4.0 — REVERTER TRANSAÇÕES (rollback no reorg)
+    // REVERTER TRANSAÇÕES
     // ============================================
     async _revertTransactions(transactions) {
-        // Ordem inversa
         for (const rawTx of [...transactions].reverse()) {
             try {
                 const tx = normalizeTx(rawTx);
@@ -546,22 +541,19 @@ class Blockchain extends EventEmitter {
     }
 
     // ============================================
-    // 🆕 v4.0 — ACEITAR BLOCO VINDO DE PEER
+    // ACEITAR BLOCO VINDO DE PEER
     // ============================================
     async acceptBlockFromPeer(blockData) {
         const block = new Block(blockData);
 
-        // 1. PoW válido?
         if (!block.meetsDifficulty(block.difficulty)) {
             throw new Error(`Bloco ${block.index}: PoW inválido (diff=${block.difficulty})`);
         }
 
-        // 2. Hash bate?
         if (block.calculateHash() !== block.hash) {
             throw new Error(`Bloco ${block.index}: hash inválido`);
         }
 
-        // 3. Fork choice
         const decision = decideFork(this.chain, block.toObject(), this._orphanPool);
 
         if (decision.action === 'reject') {
@@ -570,7 +562,7 @@ class Blockchain extends EventEmitter {
 
         if (decision.action === 'orphan') {
             if (this._orphanPool.length >= CONFIG.maxOrphanPool) {
-                this._orphanPool.shift();  // descarta o mais antigo
+                this._orphanPool.shift();
             }
             this._orphanPool.push(decision.block);
             console.log(`🟡 Órfão guardado: #${block.index} (pool=${this._orphanPool.length})`);
@@ -587,7 +579,7 @@ class Blockchain extends EventEmitter {
     }
 
     // ============================================
-    // 🆕 v4.0 — HELPER: anexa bloco ao tip
+    // HELPER: ANEXA BLOCO
     // ============================================
     async _appendBlock(blockData) {
         const block = new Block(blockData);
@@ -631,12 +623,11 @@ class Blockchain extends EventEmitter {
     }
 
     // ============================================
-    // 🆕 v4.0 — REORG (fork choice + rollback)
+    // REORG
     // ============================================
     async _reorg(newChain) {
         console.log(`🔀 REORG: ${this.chain.length} → ${newChain.length} blocos`);
 
-        // 1. Descobre ponto de divergência
         let forkPoint = 0;
         for (let i = 0; i < Math.min(this.chain.length, newChain.length); i++) {
             if (this.chain[i].hash === newChain[i].hash) {
@@ -646,7 +637,6 @@ class Blockchain extends EventEmitter {
             }
         }
 
-        // 2. Reverte blocos desfeitos (do tip até forkPoint+1)
         const revertedBlocks = this.chain.slice(forkPoint + 1);
         for (const blk of [...revertedBlocks].reverse()) {
             const txs = (blk.transactions || []).map(normalizeTx);
@@ -654,13 +644,11 @@ class Blockchain extends EventEmitter {
             console.log(`↩️  Revertido bloco #${blk.index} (${txs.length} TXs)`);
         }
 
-        // 3. Remove do Mongo os blocos desfeitos
         const revertedIndexes = revertedBlocks.map(b => b.index);
         if (revertedIndexes.length > 0) {
             await BlockModel.deleteMany({ index: { $in: revertedIndexes } });
         }
 
-        // 4. Aplica novos blocos (do forkPoint+1 até o fim)
         const newBlocks = newChain.slice(forkPoint + 1);
         for (const blk of newBlocks) {
             await this.applyTransactions(blk.transactions || []);
@@ -684,12 +672,10 @@ class Blockchain extends EventEmitter {
             }
         }
 
-        // 5. Troca a chain local
         this.chain = newChain.map(b => new Block(b));
         this._chainwork = chainworkOf(newChain);
         this._currentDifficulty = newChain[newChain.length - 1].difficulty;
 
-        // 6. Limpa órfãos que já foram incorporados
         const usedHashes = new Set(newChain.map(b => b.hash));
         this._orphanPool = this._orphanPool.filter(o => !usedHashes.has(o.hash));
 
@@ -734,10 +720,10 @@ class Blockchain extends EventEmitter {
         return {
             totalBlocks,
             cachedBlocks: this.chain.length,
-            difficulty: this._currentDifficulty,           // 🆕 atual
+            difficulty: this._currentDifficulty,
             baseDifficulty: CONFIG.difficulty,
-            chainwork: this._chainwork.toString(),         // 🆕
-            orphanPoolSize: this._orphanPool.length,       // 🆕
+            chainwork: this._chainwork.toString(),
+            orphanPoolSize: this._orphanPool.length,
             blockReward: CONFIG.blockReward.toString(),
             pendingTransactions: this.pendingTransactions.length,
             latestBlock: latest ? {
@@ -752,7 +738,7 @@ class Blockchain extends EventEmitter {
     }
 
     // ============================================
-    // VALIDAÇÃO DA CHAIN
+    // VALIDAÇÃO
     // ============================================
     async isValid() {
         for (let i = 1; i < this.chain.length; i++) {
