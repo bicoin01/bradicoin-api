@@ -44,6 +44,28 @@ async function startP2P({ blockchain, port = DEFAULT_PORT } = {}) {
 
   node.addEventListener('peer:connect', async (evt) => {
     const pid = evt.detail;
+
+    node.addEventListener('peer:connect', async (evt) => {
+  const pid = evt.detail;
+
+  // ── LIMITE POR SUBNET ─────────────────────────────
+  const ipDiv = require('./ipDiversity');
+  let multiaddrStr = null;
+  try {
+    const conn = node.getConnections(pid)[0];
+    multiaddrStr = conn?.remoteAddr?.toString?.() || null;
+  } catch {}
+
+  const reg = ipDiv.register(pid, multiaddrStr);
+  if (!reg.ok) {
+    console.warn(
+      `🚫 eclipse-block: ${pid.toString().substring(0, 16)}... ` +
+      `(subnet ${reg.subnet} cheia: ${reg.current}/${reg.max})`
+    );
+    try { await node.hangUp(pid); } catch {}
+    return;
+  }
+ 
     console.log(`🔗 Peer conectado: ${pid.toString()}`);
     require('./persistence').markPeersDirty();
     try {
@@ -62,6 +84,7 @@ async function startP2P({ blockchain, port = DEFAULT_PORT } = {}) {
 
   node.addEventListener('peer:disconnect', (evt) => {
     console.log(`🔌 Peer desconectado: ${evt.detail.toString()}`);
+    require('./ipDiversity').unregister(evt.detail);
     require('./persistence').markPeersDirty();
   });
 
