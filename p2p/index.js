@@ -1,12 +1,47 @@
 // p2p/index.js
-const { createLibp2p } = require('libp2p');
-const { tcp } = require('@libp2p/tcp');
-const { webSockets } = require('@libp2p/websockets');
-const { noise } = require('@chainsafe/libp2p-noise');
-const { yamux } = require('@chainsafe/libp2p-yamux');
-const { identify } = require('@libp2p/identify');
-const { ping } = require('@libp2p/ping');
+// ============================================
+// Bradicoin P2P — orquestrador (CJS + dynamic ESM)
+// ============================================
+// ⚠️ libp2p moderno (v2/v3) é ESM puro. Como o projeto é CJS,
+//    carregamos via import() dinâmico dentro de loadLibp2p().
+// ============================================
 
+let createLibp2p, tcp, webSockets, noise, yamux, identify, ping;
+let _libp2pLoaded = false;
+
+async function loadLibp2p() {
+  if (_libp2pLoaded) return;
+
+  const [
+    libp2pMod,
+    tcpMod,
+    wsMod,
+    noiseMod,
+    yamuxMod,
+    identifyMod,
+    pingMod,
+  ] = await Promise.all([
+    import('libp2p'),
+    import('@libp2p/tcp'),
+    import('@libp2p/websockets'),
+    import('@chainsafe/libp2p-noise'),
+    import('@chainsafe/libp2p-yamux'),
+    import('@libp2p/identify'),
+    import('@libp2p/ping'),
+  ]);
+
+  createLibp2p = libp2pMod.createLibp2p;
+  tcp          = tcpMod.tcp;
+  webSockets   = wsMod.webSockets;
+  noise        = noiseMod.noise;
+  yamux        = yamuxMod.yamux;
+  identify     = identifyMod.identify;
+  ping         = pingMod.ping;
+
+  _libp2pLoaded = true;
+}
+
+// ── Módulos internos (CJS puro, sem problema) ────────────
 const { loadOrCreateIdentity } = require('./identity');
 const { registerStatusProtocol, queryStatus } = require('./status');
 const { buildGossipService, wireGossip } = require('./gossip');
@@ -18,6 +53,9 @@ const DEFAULT_PORT = parseInt(process.env.P2P_PORT) || 4001;
 
 async function startP2P({ blockchain, port = DEFAULT_PORT } = {}) {
   if (!blockchain) throw new Error('blockchain obrigatório');
+
+  // ⚠️ Carrega libp2p (ESM) antes de qualquer uso
+  await loadLibp2p();
 
   const { privateKey, peerId } = await loadOrCreateIdentity();
   const discovery = buildDiscoveryServices();
