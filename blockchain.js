@@ -625,4 +625,284 @@ class Blockchain extends EventEmitter {
 
     // ============================================
     // HELPER: ANEXA BLOCO
-    //
+    // 🆕 [5] chama _processOrphans no fim
+    // ============================================
+    async _appendBlock(blockData) {
+        const block = new Block(blockData);
+
+        await this.applyTransactions(block.transactions);
+
+        try {
+            await BlockModel.create(block.toObject());
+        } catch (e) {
+            if (e.code === 11000) return block.toObject();
+            throw e;
+        }
+
+        const txHashes = block.transactions.map(t => t.hash).filter(Boolean);
+        if (txHashes.length) {
+            await TransactionModel.updateMany(
+                { hash: { $in: txHashes } },
+                {
+                    $set: {
+                        status: 'confirmed',
+                        blockIndex: block.index,
+                        blockHash: block.hash,
+                        confirmations: 1
+                    }
+                }
+            );
+        }
+
+        this.chain.push(block);
+        if (this.chain.length > this.maxChainCache) this.chain.shift();
+
+        this._chainwork += blockWork(block.difficulty);
+        this._currentDifficulty = block.difficulty;
+
+        const set = new Set(txHashes);
+        this.pendingTransactions = this.pendingTransactions.filter(t => !set.has(t.hash));
+
+        this.emit('block:new', block.toObject());
+        console.log(`📥 Bloco ${block.index} aceito da rede (diff=${block.difficulty})`);
+
+        // 🆕 [5]
+        await this._processOrphans().catch(e =>
+            console.error('processOrphans (append):', e.message)
+        );
+
+        return block.toObject();
+    }
+
+    // ============================================
+    // REORG
+    // 🆕 [1] revert simétrico
+    // 🆕 [4] valida PoW dos blocos novos
+    // 🆕 [5] processa órfãos no fim
+    // ============================================
+    async _reorg(newChain) {
+        console.log(`🔀 REORG: ${this.chain.length} → ${newChain.length} blocos`);
+
+        // 🆕 [4] Valida PoW de TODOS os blocos da nova chain
+        for (const blk of newChain) {
+            const b = new Block(blk);
+            if (b.calculateHash() !== b.hash) {
+                throw new Error(`Reorg rejeitado: bloco ${b.index} hash inválido`);
+            }
+            if (!b.meetsDifficulty(b.difficulty)) {
+                throw new Error(`Reorg rejeitado: bloco ${b.index} sem PoW válido`);
+            }
+        }
+
+        // Acha fork point comparando por hash (funciona mesmo com cache parcial,
+        // porque newChain tem ancestrais vindos do Mongo)
+        let forkPoint = -1;
+        const cachedByHash = new Map(this.chain.map(b => [b.hash, b]));
+        for (const blk of newChain) {
+            if (cachedByHash.has(blk.hash)) {
+                forkPoint = blk.index;
+            } else {
+                break;
+            }
+        }
+
+        if (forkPoint === -1) {
+            throw new Error('Reorg rejeitado: fork point não encontrado no cache');
+        }
+
+        // Blocos a reverter: tudo em this.chain com index > forkPoint
+        const revertedBlocks = this.chain.filter(b => b.index > forkPoint);
+        for (const blk of [...revertedBlocks].reverse()) {
+            const txs = (blk.transactions || []).map(normalizeTx);
+            await this._revertTransactions(txs);
+            console.log(`↩️  Revertido bloco #${blk.index} (${txs.length} TXs)`);
+        }
+
+        const revertedIndexes = revertedBlocks.map(b => b.index);
+        if (revertedIndexes.length > 0) {
+            await BlockModel.deleteMany({ index: { $in: revertedIndexes } });
+        }
+
+        // Aplica blocos novos (index > forkPoint)
+        const newBlocks = newChain.filter(blk => blk.index > forkPoint);
+        for (const blk of newBlocks) {
+            await this.applyTransactions(blk.transactions || []);
+            try {
+                await BlockModel.create(blk);
+            } catch (e) {
+                if (e.code !== 11000) console.error('reorg persist:', e.message);
+            }
+            const txHashes = (blk.transactions || []).map(t => t.hash).filter(Boolean);
+            if (txHashes.length) {
+                await TransactionModel.updateMany(
+                    { hash: { $in: txHashes } },
+                    {
+                        $set: {
+                            status: 'confirmed',
+                            blockIndex: blk.index,
+                            blockHash: blk.hash
+                        }
+                    }
+                );
+            }
+        }
+
+        this.chain = newChain.map(b => new Block(b));
+        if (this.chain.length > this.maxChainCache) {
+            this.chain = this.chain.slice(-this.maxChainCache);
+        }
+
+        this._chainwork = chainworkOf(newChain);
+        this._currentDifficulty = newChain[newChain.length - 1].difficulty;
+
+        const usedHashes = new Set(newChain.map(b => b.hash));
+        this._orphanPool = this._orphanPool.filter(o => !usedHashes.has(o.hash));
+
+        console.log(`✅ Reorg concluída. Altura: ${this.getLatestBlock().index}, chainwork=${this._chainwork}`);
+
+        this.emit('block:new', this.getLatestBlock().toObject());
+
+        // 🆕 [5]
+        await this._processOrphans().catch(e =>
+            console.error('processOrphans (reorg):', e.message)
+        );
+
+        return this.getLatestBlock().toObject();
+    }
+
+    // ============================================
+    // ÓRFÃOS
+    // 🆕 [5]
+    // ============================================
+    async _processOrphans() {
+        if (this._processingOrphans) return;
+        if (this._orphanPool.length === 0) return;
+
+        this._processingOrphans = true;
+        try {
+            let changed = true;
+            let rounds = 0;
+            const MAX_ROUNDS = 10;
+
+            while (changed && rounds < MAX_ROUNDS) {
+                changed = false;
+                rounds++;
+
+                const remaining = [];
+                for (const orphan of this._orphanPool) {
+                    try {
+                        const result = await this.acceptBlockFromPeer(orphan);
+                        if (result && !result.orphan) {
+                            changed = true;
+                            console.log(`♻️  Órfão #${orphan.index} reaproveitado`);
+                        } else {
+                            remaining.push(orphan);
+                        }
+                    } catch (_) {
+                        remaining.push(orphan);
+                    }
+                }
+                this._orphanPool = remaining;
+            }
+        } finally {
+            this._processingOrphans = false;
+        }
+    }
+
+    // ============================================
+    // CONSULTAS
+    // ============================================
+    getLatestBlock() {
+        if (this.chain.length === 0) return null;
+        return this.chain[this.chain.length - 1];
+    }
+
+    async getBlockByIndex(index) {
+        const cached = this.chain.find(b => b.index === index);
+        if (cached) return cached;
+        const block = await BlockModel.findOne({ index }).lean();
+        if (!block) throw new Error('Bloco não encontrado');
+        return block;
+    }
+
+    async getBlockByHash(hash) {
+        const block = await BlockModel.findOne({ hash }).lean();
+        if (!block) throw new Error('Bloco não encontrado');
+        return block;
+    }
+
+    async getBlocks(limit = 20, offset = 0) {
+        return BlockModel.find().sort({ index: -1 }).skip(offset).limit(limit).lean();
+    }
+
+    async getChainInfo() {
+        const [totalBlocks, latest] = await Promise.all([
+            BlockModel.countDocuments({}),
+            BlockModel.findOne().sort({ index: -1 }).lean()
+        ]);
+
+        return {
+            totalBlocks,
+            cachedBlocks: this.chain.length,
+            difficulty: this._currentDifficulty,
+            baseDifficulty: CONFIG.difficulty,
+            chainwork: this._chainwork.toString(),
+            orphanPoolSize: this._orphanPool.length,
+            blockReward: CONFIG.blockReward.toString(),
+            pendingTransactions: this.pendingTransactions.length,
+            latestBlock: latest ? {
+                index: latest.index,
+                hash: latest.hash,
+                timestamp: latest.timestamp,
+                difficulty: latest.difficulty,
+                transactionsCount: (latest.transactions || []).length
+            } : null,
+            isValid: await this.isValid()
+        };
+    }
+
+    // ============================================
+    // VALIDAÇÃO
+    // ============================================
+    async isValid() {
+        for (let i = 1; i < this.chain.length; i++) {
+            const current = this.chain[i];
+            const previous = this.chain[i - 1];
+
+            if (current.calculateHash() !== current.hash) {
+                console.log(`❌ Bloco ${current.index}: hash inválido`);
+                return false;
+            }
+            if (current.previousHash !== previous.hash) {
+                console.log(`❌ Bloco ${current.index}: link quebrado`);
+                return false;
+            }
+            if (!current.meetsDifficulty(current.difficulty || CONFIG.difficulty)) {
+                console.log(`❌ Bloco ${current.index}: PoW inválido`);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // ============================================
+    // LIMPEZA
+    // ============================================
+    clearPendingTransactions() {
+        const count = this.pendingTransactions.length;
+        this.pendingTransactions = [];
+        return { message: 'Mempool limpa', count };
+    }
+
+    getPendingTransactions(limit = 100) {
+        return this.pendingTransactions.slice(0, limit);
+    }
+}
+
+// ============================================
+// EXPORTA INSTÂNCIA ÚNICA
+// ============================================
+module.exports = new Blockchain();
+module.exports.CONFIG = CONFIG;
+module.exports.Block = Block;
+module.exports.normalizeTx = normalizeTx;
