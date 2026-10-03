@@ -1,6 +1,8 @@
 // models/Wallet.js
 // ============================================
-// Schema da Carteira - Bradicoin (v2.0)
+// Schema da Carteira - Bradicoin (v2.1)
+// ============================================
+// 🆕 v2.1 — revertDebit / revertCredit (reorg-safe)
 // ============================================
 
 const mongoose = require('mongoose');
@@ -29,8 +31,6 @@ const walletSchema = new mongoose.Schema(
             }
         },
 
-        // 🔐 Chave pública secp256k1 comprimida (66 chars hex)
-        // Usada para verificar assinaturas de transações
         publicKey: {
             type: String,
             required: true,
@@ -42,20 +42,12 @@ const walletSchema = new mongoose.Schema(
             }
         },
 
-        // ============================================
-        // 💰 SALDO (Decimal128 para precisão)
-        // ============================================
         balance: {
             type: Decimal128,
             default: () => Decimal128.fromString('0'),
             required: true
         },
 
-        // ============================================
-        // 🔐 NONCE (anti-replay attack)
-        // ============================================
-        // Incrementa a cada transação enviada.
-        // Backend só aceita TX com nonce === wallet.nonce
         nonce: {
             type: Number,
             default: 0,
@@ -63,9 +55,6 @@ const walletSchema = new mongoose.Schema(
             min: 0
         },
 
-        // ============================================
-        // 📊 ESTATÍSTICAS
-        // ============================================
         totalSent: {
             type: Decimal128,
             default: () => Decimal128.fromString('0')
@@ -87,9 +76,6 @@ const walletSchema = new mongoose.Schema(
             min: 0
         },
 
-        // ============================================
-        // 🎁 AIRDROPS
-        // ============================================
         lastAirdropAt: {
             type: Date,
             default: null
@@ -101,9 +87,6 @@ const walletSchema = new mongoose.Schema(
             min: 0
         },
 
-        // ============================================
-        // 🚦 STATUS
-        // ============================================
         status: {
             type: String,
             enum: ['active', 'frozen', 'closed'],
@@ -117,9 +100,8 @@ const walletSchema = new mongoose.Schema(
         toJSON: {
             transform(doc, ret) {
                 delete ret.__v;
-                delete ret.publicKey; // não expor em APIs públicas
+                delete ret.publicKey;
 
-                // Converte Decimal128 para string (JSON não suporta)
                 if (ret.balance) ret.balance = ret.balance.toString();
                 if (ret.totalSent) ret.totalSent = ret.totalSent.toString();
                 if (ret.totalReceived) ret.totalReceived = ret.totalReceived.toString();
@@ -148,8 +130,6 @@ const walletSchema = new mongoose.Schema(
 // ============================================
 // MÉTODOS DE INSTÂNCIA
 // ============================================
-
-// Retorna dados públicos (para API)
 walletSchema.methods.toPublic = function () {
     return {
         id: this._id,
@@ -166,14 +146,12 @@ walletSchema.methods.toPublic = function () {
     };
 };
 
-// Verifica se pode pegar airdrop (cooldown 6h)
 walletSchema.methods.canClaimAirdrop = function () {
     if (!this.lastAirdropAt) return true;
     const SIX_HOURS = 6 * 60 * 60 * 1000;
     return Date.now() - this.lastAirdropAt.getTime() >= SIX_HOURS;
 };
 
-// Tempo até o próximo airdrop (ms)
 walletSchema.methods.timeUntilNextAirdrop = function () {
     if (!this.lastAirdropAt) return 0;
     const SIX_HOURS = 6 * 60 * 60 * 1000;
@@ -181,7 +159,6 @@ walletSchema.methods.timeUntilNextAirdrop = function () {
     return Math.max(0, SIX_HOURS - elapsed);
 };
 
-// Helper: retorna saldo como number (para cálculos internos)
 walletSchema.methods.getBalanceNumber = function () {
     return parseFloat(this.balance.toString());
 };
@@ -190,8 +167,8 @@ walletSchema.methods.getBalanceNumber = function () {
 // MÉTODOS ESTÁTICOS (operações atômicas)
 // ============================================
 
-// 🔐 DEBITAR (atômico — sem race condition)
-// Uso: await Wallet.debit('BrABC...', '100.50')
+// 🔐 DEBITAR
+// ⚠️ NÃO use para reverter: use revertDebit
 walletSchema.statics.debit = async function (address, amountStr, session = null) {
     const amountDecimal = Decimal128.fromString(amountStr.toString());
 
@@ -209,7 +186,7 @@ walletSchema.statics.debit = async function (address, amountStr, session = null)
                 balance: Decimal128.fromString(`-${amountStr}`),
                 nonce: 1,
                 txCount: 1,
-                totalSent: Decimal128.fromString(`${amountStr}`)
+                totalSent: amountDecimal
             }
         },
         options
@@ -222,7 +199,8 @@ walletSchema.statics.debit = async function (address, amountStr, session = null)
     return wallet;
 };
 
-// 🔐 CREDITAR (atômico)
+// 🔐 CREDITAR
+// ⚠️ NÃO use para reverter: use revertCredit
 walletSchema.statics.credit = async function (address, amountStr, session = null) {
     const amountDecimal = Decimal128.fromString(amountStr.toString());
 
@@ -248,12 +226,67 @@ walletSchema.statics.credit = async function (address, amountStr, session = null
     return wallet;
 };
 
-// 🔐 INCREMENTAR NONCE (para validar TX)
+// 🔁 REVERTER DÉBITO (reorg-safe)
+// Devolve saldo ao from e decrementa o nonce
+walletSchema.statics.revertDebit = async function (address, amountStr, session = null) {
+    const amountDecimal = Decimal128.fromString(amountStr.toString());
+
+    const options = { new: true };
+    if (session) options.session = session;
+
+    const wallet = await this.findOneAndUpdate(
+        { address },
+        {
+            $inc: {
+                balance: amountDecimal,
+                nonce: -1,
+                txCount: -1,
+                totalSent: Decimal128.fromString(`-${amountStr}`)
+            }
+        },
+        options
+    );
+
+    if (!wallet) {
+        throw new Error(`revertDebit: carteira ${address} não encontrada`);
+    }
+
+    return wallet;
+};
+
+// 🔁 REVERTER CRÉDITO (reorg-safe)
+// Retira saldo do to (o nonce dele NÃO foi mexido no credit, então não mexe aqui)
+walletSchema.statics.revertCredit = async function (address, amountStr, session = null) {
+    const amountDecimal = Decimal128.fromString(amountStr.toString());
+
+    const options = { new: true };
+    if (session) options.session = session;
+
+    const wallet = await this.findOneAndUpdate(
+        { address },
+        {
+            $inc: {
+                balance: Decimal128.fromString(`-${amountStr}`),
+                txCount: -1,
+                totalReceived: Decimal128.fromString(`-${amountStr}`)
+            }
+        },
+        options
+    );
+
+    if (!wallet) {
+        throw new Error(`revertCredit: carteira ${address} não encontrada`);
+    }
+
+    return wallet;
+};
+
+// 🔐 INCREMENTAR NONCE (validação com expectedNonce)
 walletSchema.statics.incrementNonce = async function (address, expectedNonce) {
     const wallet = await this.findOneAndUpdate(
         {
             address,
-            nonce: expectedNonce // só incrementa se o nonce bater
+            nonce: expectedNonce
         },
         {
             $inc: { nonce: 1 }
@@ -271,7 +304,6 @@ walletSchema.statics.incrementNonce = async function (address, expectedNonce) {
 // ============================================
 // ÍNDICES
 // ============================================
-
 walletSchema.index({ userId: 1 }, { unique: true });
 walletSchema.index({ address: 1 }, { unique: true });
 walletSchema.index({ status: 1 });
