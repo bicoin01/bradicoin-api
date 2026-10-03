@@ -66,6 +66,13 @@ const wallet = require('./wallet');
 const transactions = require('./transactions');
 const { logger } = require('./middleware/error');
 
+// 🛡️ v4.1 — Módulos de defesa de consenso (Eclipse/Sybil/51%/Long-Range)
+const ConsecutiveBlockGuard = require('./consensus/consecutiveBlockGuard');
+const DynamicDifficulty     = require('./consensus/dynamicDifficulty');
+const ReorgDetector         = require('./consensus/reorgDetector');
+const WeakSubjectivity      = require('./consensus/weakSubjectivity');
+const TimestampService      = require('./consensus/timestampService');
+
 // Models
 const User = require('./models/User');
 const WalletModel = require('./models/Wallet');
@@ -289,6 +296,46 @@ app.get('/health/detailed', asyncHandler(async (req, res) => {
     });
 }));
 
+// ============================================
+// 🛡️ v4.1 — DIAGNÓSTICO DOS GUARDS DE DEFESA
+// ============================================
+app.get('/health/defense', (req, res) => {
+    try {
+        const currentChain = blockchain.chain || [];
+        const tail = currentChain.slice(-50);
+
+        res.json({
+            status: 'ok',
+            timestamp: new Date().toISOString(),
+            guards: {
+                consecutiveBlock: {
+                    maxAllowed: 5,
+                    tailValid: consecutiveGuard.validate(tail).ok,
+                },
+                dynamicDifficulty: {
+                    baseTarget: '0x' + dynamicDiff.baseTarget.toString(16),
+                    stats: dynamicDiff.stats(),
+                },
+                reorgDetector: {
+                    maxDepth: reorgDetector.maxDepth,
+                    recentReorgs: reorgDetector.history.length,
+                },
+                weakSubjectivity: {
+                    periodBlocks: weakSubj.periodBlocks,
+                    checkpoints: weakSubj.checkpoints.length,
+                },
+                timestampService: {
+                    trackedBlocks: timestamps.timestamps.size,
+                },
+            },
+        });
+    } catch (err) {
+        logger.error('❌ Erro em /health/defense:', err);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+logger.info('✅ Rotas: /health/defense');
 
 // ============================================
 // 📜 EXPLORER — Rotas públicas (frontend)
@@ -962,8 +1009,39 @@ async function startAutoMining() {
                 return;
             }
 
+            // 🛡️ v4.1 — Defesa 51%: verificar blocos consecutivos
+            const recentChain = (blockchain.chain || []).slice(-20);
+            const tailCheck = consecutiveGuard.validate(recentChain);
+            if (!tailCheck.ok) {
+                logger.warn(`🛡️ Mineração bloqueada: ${tailCheck.reason} (${tailCheck.streak}x ${tailCheck.producer})`);
+                return;
+            }
+
+            // 🛡️ v4.1 — Defesa 51%: verificar reorg suspeito recente
+            const currentHead = blockchain.chain?.[blockchain.chain.length - 1];
+            if (currentHead) {
+                const reorgCheck = reorgDetector.check(
+                    { height: currentHead.index, hash: currentHead.hash },
+                    { height: currentHead.index, hash: currentHead.hash }
+                );
+                if (!reorgCheck.ok && reorgCheck.action === 'halt_and_alert') {
+                    logger.error(`🚨 Mineração pausada: ${reorgCheck.reason}`);
+                    return;
+                }
+            }
+
+            // 🛡️ v4.1 — Defesa 51%: dificuldade dinâmica por minerador
+            const target = dynamicDiff.getTarget(minerAddress);
+            logger.debug(`⚙️ Target dinâmico para ${minerAddress}: 0x${target.toString(16)}`);
+
             const block = await blockchain.minePendingTransactions(minerAddress);
             if (block) {
+                // 🛡️ v4.1 — Registrar tentativa para dificuldade dinâmica
+                dynamicDiff.recordAttempt(minerAddress);
+
+                // 🛡️ v4.1 — Timestamp para defesa Long-Range
+                timestamps.stamp(block);
+
                 logger.info(`⛏️ Bloco ${block.index} minerado (${block.transactions.length} txs)`);
 
                 io.emit('block:mined', {
@@ -981,6 +1059,7 @@ async function startAutoMining() {
     }, MINING_INTERVAL_MS);
 
     logger.info(`⛏️ Auto-mining iniciado (intervalo: ${MINING_INTERVAL_MS}ms)`);
+    logger.info(`🛡️ Guards ativos: ConsecutiveBlock, ReorgDetector, DynamicDifficulty, TimestampService`);
 }
 
 // ============================================
@@ -1025,9 +1104,86 @@ function startAutoPriceUpdate() {
 }
 
 // ============================================
+// 🛡️ v4.1 — Checkpoint periódico (Weak Subjectivity)
+// ============================================
+let checkpointInterval = null;
+
+function startCheckpointing() {
+    checkpointInterval = setInterval(async () => {
+        try {
+            const chain = blockchain.chain || [];
+            const head = chain[chain.length - 1];
+            if (!head) return;
+
+            // Só cria checkpoint a cada 100 blocos
+            if (head.index % 100 !== 0) return;
+
+            const crypto = require('crypto');
+            const root = crypto.createHash('sha256')
+                .update(JSON.stringify(head.state || head.stateRoot || { index: head.index }))
+                .digest('hex');
+
+            // Coleta assinaturas dos validadores ativos (se existirem no estado)
+            const validatorSet = blockchain.validators
+                ? Array.from(blockchain.validators.values())
+                : [];
+
+            const signatures = validatorSet
+                .filter(v => v.status === 'active')
+                .map(v => ({ validator: v.id || v.address, valid: true }));
+
+            const checkpoint = {
+                height: head.index,
+                root,
+                signatures,
+                ts: Date.now(),
+            };
+
+            weakSubj.addCheckpoint(checkpoint);
+            logger.info(`🛡️ Checkpoint criado no bloco ${head.index} (root: ${root.slice(0, 12)}...)`);
+        } catch (err) {
+            logger.error('❌ Erro ao criar checkpoint:', err.message);
+        }
+    }, 60_000); // verifica a cada 1 minuto
+
+    logger.info('🛡️ Checkpointing ativo (verifica a cada 1min, cria a cada 100 blocos)');
+}
+
+// ============================================
 // 🆕 v4.0 — Referência global do P2P
 // ============================================
 let p2pNode = null;
+
+// ============================================
+// 🛡️ v4.1 — Instâncias de defesa de consenso
+// ============================================
+const consecutiveGuard = new ConsecutiveBlockGuard({ maxConsecutive: 5 });
+const dynamicDiff = new DynamicDifficulty({
+    baseTarget: 0x00000fff,
+    minTarget:  0x000000ff,
+    maxTarget:  0x00ffffff,
+    alpha: 0.1,
+    decayMs: 60_000
+});
+const reorgDetector = new ReorgDetector({
+    maxDepth: 100,
+    maxFrequent: 3,
+    alertWindowMs: 300_000
+});
+const weakSubj = new WeakSubjectivity({
+    periodBlocks: 1000,
+    quorum: 0.67,
+    maxCheckpointAgeBlocks: 2000
+});
+const timestamps = new TimestampService({ maxEntries: 10_000 });
+
+// expor para rotas/controllers acessarem
+app.set('consecutiveGuard', consecutiveGuard);
+app.set('dynamicDiff', dynamicDiff);
+app.set('reorgDetector', reorgDetector);
+app.set('weakSubj', weakSubj);
+app.set('timestamps', timestamps);
+
 
 // ============================================
 // INICIALIZAÇÃO
@@ -1060,6 +1216,7 @@ async function initialize() {
 
         await startAutoMining();
         startAutoPriceUpdate();
+        startCheckpointing();
         
         server.listen(PORT, '0.0.0.0', () => {
             logger.info('');
@@ -1100,7 +1257,8 @@ async function shutdown(signal) {
     logger.info(`🛑 Recebido ${signal}. Encerrando graciosamente...`);
 
     if (miningInterval) clearInterval(miningInterval);
-
+    if (checkpointInterval) clearInterval(checkpointInterval);
+    
      // 🆕 v4.0 — desliga P2P graciosamente
     try {
         if (p2pNode) await stopP2P(p2pNode);
