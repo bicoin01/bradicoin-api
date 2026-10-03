@@ -118,6 +118,36 @@ const app = express();
 const server = http.createServer(app);
 
 // ============================================
+// 🛡️ v4.1 — Instâncias de defesa de consenso
+// ============================================
+const consecutiveGuard = new ConsecutiveBlockGuard({ maxConsecutive: 5 });
+const dynamicDiff = new DynamicDifficulty({
+    baseTarget: 0x00000fff,
+    minTarget:  0x000000ff,
+    maxTarget:  0x00ffffff,
+    alpha: 0.1,
+    decayMs: 60_000
+});
+const reorgDetector = new ReorgDetector({
+    maxDepth: 100,
+    maxFrequent: 3,
+    alertWindowMs: 300_000
+});
+const weakSubj = new WeakSubjectivity({
+    periodBlocks: 1000,
+    quorum: 0.67,
+    maxCheckpointAgeBlocks: 2000
+});
+const timestamps = new TimestampService({ maxEntries: 10_000 });
+
+// expor para rotas/controllers acessarem
+app.set('consecutiveGuard', consecutiveGuard);
+app.set('dynamicDiff', dynamicDiff);
+app.set('reorgDetector', reorgDetector);
+app.set('weakSubj', weakSubj);
+app.set('timestamps', timestamps);
+
+// ============================================
 // SOCKET.IO (com auth)
 // ============================================
 const io = socketIo(server, {
@@ -984,6 +1014,7 @@ async function connectMongoDB() {
 // ============================================
 let miningInterval = null;
 let miningLock = false;
+let lastKnownHead = null;
 
 const MINING_INTERVAL_MS = parseInt(process.env.MINING_INTERVAL_MS) || 30000;
 
@@ -1017,18 +1048,24 @@ async function startAutoMining() {
                 return;
             }
 
-            // 🛡️ v4.1 — Defesa 51%: verificar reorg suspeito recente
-            const currentHead = blockchain.chain?.[blockchain.chain.length - 1];
-            if (currentHead) {
-                const reorgCheck = reorgDetector.check(
-                    { height: currentHead.index, hash: currentHead.hash },
-                    { height: currentHead.index, hash: currentHead.hash }
-                );
-                if (!reorgCheck.ok && reorgCheck.action === 'halt_and_alert') {
-                    logger.error(`🚨 Mineração pausada: ${reorgCheck.reason}`);
-                    return;
+            // 🛡️ v4.1 — Defesa 51%: detectar reorg real
+            const chain = blockchain.chain || [];
+            const currentHead = chain[chain.length - 1];
+
+            if (currentHead && lastKnownHead) {
+                // Se o lastKnownHead não está mais na chain = reorg aconteceu
+                const prevStillInChain = chain.some(b => b.hash === lastKnownHead.hash);
+                if (!prevStillInChain) {
+                    const reorgCheck = reorgDetector.check(currentHead, lastKnownHead);
+                    if (!reorgCheck.ok && reorgCheck.action === 'halt_and_alert') {
+                        logger.error(`🚨 Reorg detectado! Mineração pausada: ${reorgCheck.reason}`);
+                        return;
+                    }
+                    logger.warn(`⚠️ Reorg detectado (profundidade: ${lastKnownHead.index - currentHead.index})`);
                 }
             }
+
+            if (currentHead) lastKnownHead = currentHead;
 
             // 🛡️ v4.1 — Defesa 51%: dificuldade dinâmica por minerador
             const target = dynamicDiff.getTarget(minerAddress);
@@ -1153,37 +1190,6 @@ function startCheckpointing() {
 // 🆕 v4.0 — Referência global do P2P
 // ============================================
 let p2pNode = null;
-
-// ============================================
-// 🛡️ v4.1 — Instâncias de defesa de consenso
-// ============================================
-const consecutiveGuard = new ConsecutiveBlockGuard({ maxConsecutive: 5 });
-const dynamicDiff = new DynamicDifficulty({
-    baseTarget: 0x00000fff,
-    minTarget:  0x000000ff,
-    maxTarget:  0x00ffffff,
-    alpha: 0.1,
-    decayMs: 60_000
-});
-const reorgDetector = new ReorgDetector({
-    maxDepth: 100,
-    maxFrequent: 3,
-    alertWindowMs: 300_000
-});
-const weakSubj = new WeakSubjectivity({
-    periodBlocks: 1000,
-    quorum: 0.67,
-    maxCheckpointAgeBlocks: 2000
-});
-const timestamps = new TimestampService({ maxEntries: 10_000 });
-
-// expor para rotas/controllers acessarem
-app.set('consecutiveGuard', consecutiveGuard);
-app.set('dynamicDiff', dynamicDiff);
-app.set('reorgDetector', reorgDetector);
-app.set('weakSubj', weakSubj);
-app.set('timestamps', timestamps);
-
 
 // ============================================
 // INICIALIZAÇÃO
