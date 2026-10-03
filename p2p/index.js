@@ -5,6 +5,7 @@
 // ⚠️ libp2p moderno (v2/v3) é ESM puro. Como o projeto é CJS,
 //    carregamos via import() dinâmico dentro de loadLibp2p().
 // ============================================
+const { loadEsm } = require('load-esm');
 
 let createLibp2p, tcp, webSockets, noise, yamux, identify, ping;
 let _libp2pLoaded = false;
@@ -12,23 +13,14 @@ let _libp2pLoaded = false;
 async function loadLibp2p() {
   if (_libp2pLoaded) return;
 
-  const [
-    libp2pMod,
-    tcpMod,
-    wsMod,
-    noiseMod,
-    yamuxMod,
-    identifyMod,
-    pingMod,
-  ] = await Promise.all([
-    import('libp2p'),
-    import('@libp2p/tcp'),
-    import('@libp2p/websockets'),
-    import('@chainsafe/libp2p-noise'),
-    import('@chainsafe/libp2p-yamux'),
-    import('@libp2p/identify'),
-    import('@libp2p/ping'),
-  ]);
+  // Usa load-esm para importar os módulos ESM de forma segura
+  const libp2pMod = await loadEsm('libp2p');
+  const tcpMod = await loadEsm('@libp2p/tcp');
+  const wsMod = await loadEsm('@libp2p/websockets');
+  const noiseMod = await loadEsm('@chainsafe/libp2p-noise');
+  const yamuxMod = await loadEsm('@chainsafe/libp2p-yamux');
+  const identifyMod = await loadEsm('@libp2p/identify');
+  const pingMod = await loadEsm('@libp2p/ping');
 
   createLibp2p = libp2pMod.createLibp2p;
   tcp          = tcpMod.tcp;
