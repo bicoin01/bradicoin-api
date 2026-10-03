@@ -1,21 +1,20 @@
 // blockchain.js
 // ============================================
-// Bradicoin Blockchain - Core (v4.0 - PoW Puro)
+// Bradicoin Blockchain - Core (v4.1 - PoW Puro)
 // ============================================
 // 🔗 CONSENSO: PoW puro com retarget
 // ✅ Saldo materializado no MongoDB (rápido)
 // ✅ Sem emissão infinita (só taxas)
 // ✅ Verificação de assinatura obrigatória
 // ✅ Atomic updates
-// 🔧 v4.0 - DESCENTRALIZAÇÃO:
-//   - EventEmitter (gossip P2P)
-//   - acceptBlockFromPeer (entrada da rede)
-//   - chainwork + fork choice (consensus/forkChoice)
-//   - retarget dinâmico (consensus/retarget)
-//   - _reorg com rollback de saldos
-//   - _orphanPool
-//   - getBlockByIndexOrNull / getBlockByHashOrNull (IBD)
-//   - emit('tx:new') e emit('block:new')
+//
+// 🔧 v4.1 (fixes reorg-safe):
+//   [1] _revertTransactions usa revertDebit/revertCredit (nonce simétrico)
+//   [2] decideFork/tryBuildAltChain async + fetchBlockByHash (Mongo)
+//   [3] retarget busca RETARGET_INTERVAL blocos do Mongo
+//   [4] _reorg valida PoW dos blocos novos
+//   [5] _processOrphans() reprocessa órfãos após append/reorg
+//   [6] addTransaction normaliza timestamp (assinatura == hash canônico)
 // ============================================
 
 const mongoose = require('mongoose');
@@ -29,8 +28,11 @@ const BlockModel = require('./models/Block');
 const TransactionModel = require('./models/Transaction');
 const WalletModel = require('./models/Wallet');
 
-// 🆕 v4.0 — consenso descentralizado
-const { computeNextDifficulty, blockWork } = require('./consensus/retarget');
+const {
+    computeNextDifficulty,
+    blockWork,
+    RETARGET_INTERVAL
+} = require('./consensus/retarget');
 const { decideFork, chainworkOf } = require('./consensus/forkChoice');
 
 // ============================================
@@ -162,6 +164,7 @@ class Blockchain extends EventEmitter {
         this._chainwork = 0n;
         this._orphanPool = [];
         this._currentDifficulty = CONFIG.difficulty;
+        this._processingOrphans = false;
     }
 
     // ============================================
@@ -177,13 +180,13 @@ class Blockchain extends EventEmitter {
 
     async getBlockByIndexOrNull(index) {
         const cached = this.chain.find(b => b.index === index);
-        if (cached) return cached;
+        if (cached) return cached.toObject();
         return BlockModel.findOne({ index }).lean();
     }
 
     async getBlockByHashOrNull(hash) {
         const cached = this.chain.find(b => b.hash === hash);
-        if (cached) return cached;
+        if (cached) return cached.toObject();
         return BlockModel.findOne({ hash }).lean();
     }
 
@@ -269,7 +272,7 @@ class Blockchain extends EventEmitter {
     }
 
     // ============================================
-    // HASH CANÔNICO DA TX (implementação local — SEM require circular)
+    // HASH CANÔNICO DA TX
     // ============================================
     calculateTxHash(tx) {
         const payload = JSON.stringify({
@@ -279,7 +282,7 @@ class Blockchain extends EventEmitter {
             fee: safeToString(tx.fee, '0'),
             nonce: tx.nonce || 0,
             type: tx.type || 'transfer',
-            timestamp: safeToString(tx.timestamp || new Date().toISOString()),
+            timestamp: safeToString(tx.timestamp),
             signature: tx.signature || 'system'
         });
         return bytesToHex(sha256(utf8ToBytes(payload)));
@@ -294,6 +297,11 @@ class Blockchain extends EventEmitter {
         }
         if (!transaction.toAddress) {
             throw new Error('Destinatário obrigatório');
+        }
+
+        // 🆕 [6] Normaliza timestamp ANTES de tudo (assinatura == hash canônico)
+        if (!transaction.timestamp) {
+            transaction.timestamp = new Date().toISOString();
         }
 
         const amount = parseFloat(transaction.amount);
@@ -319,12 +327,13 @@ class Blockchain extends EventEmitter {
             if (!isValid) throw new Error('Assinatura inválida');
 
             const expectedAddress = wallet.deriveAddressFromPublicKey(transaction.publicKey);
-            if (expectedAddress !== transaction.fromAddress) {
+            const normalizedFrom = wallet.normalizeAddress(transaction.fromAddress);
+            if (expectedAddress !== normalizedFrom) {
                 throw new Error('Public key não corresponde ao endereço de origem');
             }
 
             const walletDoc = await WalletModel.findOne({
-                address: transaction.fromAddress,
+                address: normalizedFrom,
                 status: 'active'
             });
             if (!walletDoc) throw new Error('Carteira de origem não encontrada ou inativa');
@@ -359,7 +368,7 @@ class Blockchain extends EventEmitter {
             signature: transaction.signature || 'system',
             publicKey: transaction.publicKey || 'system',
             status: 'pending',
-            timestamp: new Date(transaction.timestamp || Date.now()),
+            timestamp: new Date(transaction.timestamp),
             metadata: transaction.metadata || {}
         };
 
@@ -373,7 +382,7 @@ class Blockchain extends EventEmitter {
     }
 
     // ============================================
-    // ASSINATURA (usada pelo addTransaction)
+    // ASSINATURA
     // ============================================
     buildSignableMessage(tx) {
         return [
@@ -385,6 +394,30 @@ class Blockchain extends EventEmitter {
             safeToString(tx.timestamp),
             tx.type || 'transfer'
         ].join('|');
+    }
+
+    // ============================================
+    // RETARGET (busca do Mongo)
+    // 🆕 [3]
+    // ============================================
+    async _computeNextDifficultyFor(nextIndex) {
+        if (nextIndex === 0) return this._currentDifficulty;
+        if (nextIndex % RETARGET_INTERVAL !== 0) return this._currentDifficulty;
+
+        const startIdx = nextIndex - RETARGET_INTERVAL;
+        if (startIdx < 0) return this._currentDifficulty;
+
+        const blocks = await BlockModel.find({
+            index: { $gte: startIdx, $lte: nextIndex - 1 }
+        })
+            .sort({ index: 1 })
+            .lean();
+
+        if (blocks.length < RETARGET_INTERVAL) {
+            return this._currentDifficulty;
+        }
+
+        return computeNextDifficulty(nextIndex, blocks, this._currentDifficulty);
     }
 
     // ============================================
@@ -408,9 +441,7 @@ class Blockchain extends EventEmitter {
 
             const newIndex = previousBlock.index + 1;
 
-            const nextDifficulty = computeNextDifficulty(
-                newIndex, this.chain, this._currentDifficulty
-            );
+            const nextDifficulty = await this._computeNextDifficultyFor(newIndex);
 
             const newBlock = new Block({
                 index: newIndex,
@@ -461,6 +492,11 @@ class Blockchain extends EventEmitter {
 
             this.emit('block:new', newBlock.toObject());
 
+            // 🆕 [5] Tenta pescar órfãos que dependiam desse bloco
+            await this._processOrphans().catch(e =>
+                console.error('processOrphans (miner):', e.message)
+            );
+
             return newBlock.toObject();
         } finally {
             this.mining = false;
@@ -508,6 +544,7 @@ class Blockchain extends EventEmitter {
 
     // ============================================
     // REVERTER TRANSAÇÕES
+    // 🆕 [1] usa revertDebit/revertCredit (simétricos ao apply)
     // ============================================
     async _revertTransactions(transactions) {
         for (const rawTx of [...transactions].reverse()) {
@@ -520,15 +557,15 @@ class Blockchain extends EventEmitter {
                 const isSystemTx = !fromAddr;
 
                 if (isSystemTx) {
-                    await WalletModel.debit(toAddr, amountStr);
+                    await WalletModel.revertCredit(toAddr, amountStr);
                 } else {
                     const totalDebit = (parseFloat(amountStr) + parseFloat(feeStr)).toFixed(8);
-                    await WalletModel.debit(toAddr, amountStr);
-                    await WalletModel.credit(fromAddr, totalDebit);
+                    await WalletModel.revertCredit(toAddr, amountStr);
+                    await WalletModel.revertDebit(fromAddr, totalDebit);
 
                     if (parseFloat(feeStr) > 0) {
                         try {
-                            await WalletModel.debit(CONFIG.feeCollectorAddress, feeStr);
+                            await WalletModel.revertCredit(CONFIG.feeCollectorAddress, feeStr);
                         } catch (e) {
                             console.error('Erro ao reverter fee:', e.message);
                         }
@@ -542,6 +579,7 @@ class Blockchain extends EventEmitter {
 
     // ============================================
     // ACEITAR BLOCO VINDO DE PEER
+    // 🆕 [2] decideFork agora é async + fetchBlockByHash
     // ============================================
     async acceptBlockFromPeer(blockData) {
         const block = new Block(blockData);
@@ -554,7 +592,12 @@ class Blockchain extends EventEmitter {
             throw new Error(`Bloco ${block.index}: hash inválido`);
         }
 
-        const decision = decideFork(this.chain, block.toObject(), this._orphanPool);
+        const decision = await decideFork(
+            this.chain,
+            block.toObject(),
+            this._orphanPool,
+            (hash) => this.getBlockByHashOrNull(hash)
+        );
 
         if (decision.action === 'reject') {
             throw new Error(`Bloco ${block.index}: ${decision.reason}`);
@@ -576,209 +619,10 @@ class Blockchain extends EventEmitter {
         if (decision.action === 'reorg') {
             return await this._reorg(decision.newChain);
         }
+
+        throw new Error(`Ação desconhecida: ${decision.action}`);
     }
 
     // ============================================
     // HELPER: ANEXA BLOCO
-    // ============================================
-    async _appendBlock(blockData) {
-        const block = new Block(blockData);
-
-        await this.applyTransactions(block.transactions);
-
-        try {
-            await BlockModel.create(block.toObject());
-        } catch (e) {
-            if (e.code === 11000) return block.toObject();
-            throw e;
-        }
-
-        const txHashes = block.transactions.map(t => t.hash).filter(Boolean);
-        if (txHashes.length) {
-            await TransactionModel.updateMany(
-                { hash: { $in: txHashes } },
-                {
-                    $set: {
-                        status: 'confirmed',
-                        blockIndex: block.index,
-                        blockHash: block.hash,
-                        confirmations: 1
-                    }
-                }
-            );
-        }
-
-        this.chain.push(block);
-        if (this.chain.length > this.maxChainCache) this.chain.shift();
-
-        this._chainwork += blockWork(block.difficulty);
-        this._currentDifficulty = block.difficulty;
-
-        const set = new Set(txHashes);
-        this.pendingTransactions = this.pendingTransactions.filter(t => !set.has(t.hash));
-
-        this.emit('block:new', block.toObject());
-        console.log(`📥 Bloco ${block.index} aceito da rede (diff=${block.difficulty})`);
-        return block.toObject();
-    }
-
-    // ============================================
-    // REORG
-    // ============================================
-    async _reorg(newChain) {
-        console.log(`🔀 REORG: ${this.chain.length} → ${newChain.length} blocos`);
-
-        let forkPoint = 0;
-        for (let i = 0; i < Math.min(this.chain.length, newChain.length); i++) {
-            if (this.chain[i].hash === newChain[i].hash) {
-                forkPoint = i;
-            } else {
-                break;
-            }
-        }
-
-        const revertedBlocks = this.chain.slice(forkPoint + 1);
-        for (const blk of [...revertedBlocks].reverse()) {
-            const txs = (blk.transactions || []).map(normalizeTx);
-            await this._revertTransactions(txs);
-            console.log(`↩️  Revertido bloco #${blk.index} (${txs.length} TXs)`);
-        }
-
-        const revertedIndexes = revertedBlocks.map(b => b.index);
-        if (revertedIndexes.length > 0) {
-            await BlockModel.deleteMany({ index: { $in: revertedIndexes } });
-        }
-
-        const newBlocks = newChain.slice(forkPoint + 1);
-        for (const blk of newBlocks) {
-            await this.applyTransactions(blk.transactions || []);
-            try {
-                await BlockModel.create(blk);
-            } catch (e) {
-                if (e.code !== 11000) console.error('reorg persist:', e.message);
-            }
-            const txHashes = (blk.transactions || []).map(t => t.hash).filter(Boolean);
-            if (txHashes.length) {
-                await TransactionModel.updateMany(
-                    { hash: { $in: txHashes } },
-                    {
-                        $set: {
-                            status: 'confirmed',
-                            blockIndex: blk.index,
-                            blockHash: blk.hash
-                        }
-                    }
-                );
-            }
-        }
-
-        this.chain = newChain.map(b => new Block(b));
-        this._chainwork = chainworkOf(newChain);
-        this._currentDifficulty = newChain[newChain.length - 1].difficulty;
-
-        const usedHashes = new Set(newChain.map(b => b.hash));
-        this._orphanPool = this._orphanPool.filter(o => !usedHashes.has(o.hash));
-
-        console.log(`✅ Reorg concluída. Altura: ${this.getLatestBlock().index}, chainwork=${this._chainwork}`);
-
-        this.emit('block:new', this.getLatestBlock().toObject());
-        return this.getLatestBlock().toObject();
-    }
-
-    // ============================================
-    // CONSULTAS
-    // ============================================
-    getLatestBlock() {
-        if (this.chain.length === 0) return null;
-        return this.chain[this.chain.length - 1];
-    }
-
-    async getBlockByIndex(index) {
-        const cached = this.chain.find(b => b.index === index);
-        if (cached) return cached;
-        const block = await BlockModel.findOne({ index }).lean();
-        if (!block) throw new Error('Bloco não encontrado');
-        return block;
-    }
-
-    async getBlockByHash(hash) {
-        const block = await BlockModel.findOne({ hash }).lean();
-        if (!block) throw new Error('Bloco não encontrado');
-        return block;
-    }
-
-    async getBlocks(limit = 20, offset = 0) {
-        return BlockModel.find().sort({ index: -1 }).skip(offset).limit(limit).lean();
-    }
-
-    async getChainInfo() {
-        const [totalBlocks, latest] = await Promise.all([
-            BlockModel.countDocuments({}),
-            BlockModel.findOne().sort({ index: -1 }).lean()
-        ]);
-
-        return {
-            totalBlocks,
-            cachedBlocks: this.chain.length,
-            difficulty: this._currentDifficulty,
-            baseDifficulty: CONFIG.difficulty,
-            chainwork: this._chainwork.toString(),
-            orphanPoolSize: this._orphanPool.length,
-            blockReward: CONFIG.blockReward.toString(),
-            pendingTransactions: this.pendingTransactions.length,
-            latestBlock: latest ? {
-                index: latest.index,
-                hash: latest.hash,
-                timestamp: latest.timestamp,
-                difficulty: latest.difficulty,
-                transactionsCount: (latest.transactions || []).length
-            } : null,
-            isValid: await this.isValid()
-        };
-    }
-
-    // ============================================
-    // VALIDAÇÃO
-    // ============================================
-    async isValid() {
-        for (let i = 1; i < this.chain.length; i++) {
-            const current = this.chain[i];
-            const previous = this.chain[i - 1];
-
-            if (current.calculateHash() !== current.hash) {
-                console.log(`❌ Bloco ${current.index}: hash inválido`);
-                return false;
-            }
-            if (current.previousHash !== previous.hash) {
-                console.log(`❌ Bloco ${current.index}: link quebrado`);
-                return false;
-            }
-            if (!current.meetsDifficulty(current.difficulty || CONFIG.difficulty)) {
-                console.log(`❌ Bloco ${current.index}: PoW inválido`);
-                return false;
-            }
-        }
-        return true;
-    }
-
-    // ============================================
-    // LIMPEZA
-    // ============================================
-    clearPendingTransactions() {
-        const count = this.pendingTransactions.length;
-        this.pendingTransactions = [];
-        return { message: 'Mempool limpa', count };
-    }
-
-    getPendingTransactions(limit = 100) {
-        return this.pendingTransactions.slice(0, limit);
-    }
-}
-
-// ============================================
-// EXPORTA INSTÂNCIA ÚNICA
-// ============================================
-module.exports = new Blockchain();
-module.exports.CONFIG = CONFIG;
-module.exports.Block = Block;
-module.exports.normalizeTx = normalizeTx;
+    //
