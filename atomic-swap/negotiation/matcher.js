@@ -133,4 +133,29 @@ class Matcher {
             effectivePair,
             viable,
             reason,
-            expiresAt: order.expires
+            expiresAt: order.expiresAt,
+            order
+        };
+    }
+
+    /**
+     * Verifica se um par tem liquidez (ordens abertas).
+     */
+    hasLiquidity(fromChain, fromToken, toChain, toToken) {
+        const matches = this.findMatches({
+            fromChain, fromToken, toChain, toToken, maxResults: 1
+        });
+        return matches.length > 0;
+    }
+
+    /**
+     * Retorna os melhores pares disponíveis (com mais ordens).
+     */
+    getTopPairs(limit = 20) {
+        const pairs = orderBook.getAllPairs();
+        return pairs.sort((a, b) => b.count - a.count).slice(0, limit);
+    }
+}
+
+module.exports = new Matcher();
+module.exports.Matcher = Matcher;
