@@ -473,3 +473,38 @@ class BitcoinLikeAdapter extends BaseAdapter {
             return true;
         } catch (_) {
             return false;
+        }
+    }
+}
+
+// ============================================
+// HELPER: witness stack → finalScriptWitness
+// ============================================
+function witnessStackToScriptWitness(witness) {
+    let buffer = Buffer.allocUnsafe(0);
+
+    function writeVarInt(i) {
+        const currentLen = buffer.length;
+        if (i < 0xfd) {
+            buffer = Buffer.concat([buffer, Buffer.from([i])]);
+        } else if (i <= 0xffff) {
+            buffer = Buffer.concat([buffer, Buffer.from([0xfd]), (() => { const b = Buffer.alloc(2); b.writeUInt16LE(i); return b; })()]);
+        } else if (i <= 0xffffffff) {
+            buffer = Buffer.concat([buffer, Buffer.from([0xfe]), (() => { const b = Buffer.alloc(4); b.writeUInt32LE(i); return b; })()]);
+        } else {
+            const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(i));
+            buffer = Buffer.concat([buffer, Buffer.from([0xff]), b]);
+        }
+        return buffer.length - currentLen;
+    }
+
+    writeVarInt(witness.length);
+    for (const w of witness) {
+        writeVarInt(w.length);
+        buffer = Buffer.concat([buffer, w]);
+    }
+    return buffer;
+}
+
+module.exports = BitcoinLikeAdapter;
+module.exports.CHAIN_CONFIGS = CHAIN_CONFIGS;
