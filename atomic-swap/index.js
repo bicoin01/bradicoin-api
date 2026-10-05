@@ -1,5 +1,10 @@
 // atomic-swap/index.js
 const htlc = require('./engine/htlc');
+const swapEngine = require('./engine/swapEngine');
+const swapState = require('./engine/swapState');
+const timelock = require('./security/timelock');
+const secretManager = require('./security/secretManager');
+
 const BradicoinAdapter = require('./chains/bradicoinAdapter');
 const BitcoinLikeAdapter = require('./chains/bitcoinAdapter');
 const EvmAdapter = require('./chains/evmAdapter');
@@ -7,9 +12,6 @@ const SolanaAdapter = require('./chains/solanaAdapter');
 const TezosAdapter = require('./chains/tezosAdapter');
 const MoneroAdapter = require('./chains/moneroAdapter');
 
-// ============================================
-// REGISTRO DE ADAPTERS
-// ============================================
 const adapters = {
     bradicoin: new BradicoinAdapter(),
     bitcoin: new BitcoinLikeAdapter('bitcoin'),
@@ -47,8 +49,15 @@ function listChains() {
     }));
 }
 
+// Inicia o watchdog do engine
+swapEngine.startWatchdog();
+
 module.exports = {
     htlc,
+    swapEngine,
+    swapState,
+    timelock,
+    secretManager,
     adapters,
     getAdapter,
     listChains
