@@ -93,6 +93,9 @@ const nftRoutes = require('./routes/nft');
 const { router: airdropRouter } = require('./routes/airdrop');
 const governanceRoutes = require('./routes/governance');
 
+const atomicSwapRoutes = require('./routes/atomicSwap');
+const atomicSwap = require('./atomic-swap');
+
 // 💰 Motor de preço dinâmico
 const priceEngine = require('./priceEngine');
 
