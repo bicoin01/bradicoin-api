@@ -429,4 +429,93 @@ class EvmAdapter extends BaseAdapter {
             token: swap.token,
             amount: ethers.formatEther(swap.amount),
             hashlock: swap.hashlock,
-            timelock: Number(swap.timelock
+            timelock: Number(swap.timelock),
+            claimed: swap.claimed,
+            refunded: swap.refunded,
+            preimage: swap.preimage,
+            status
+        };
+    }
+
+    // ============================================
+    // BALANCE
+    // ============================================
+    async getBalance(address) {
+        if (!this.provider) {
+            return { address, balance: 0, symbol: this.symbol };
+        }
+
+        try {
+            const balanceWei = await this.provider.getBalance(address);
+            return {
+                address,
+                balance: parseFloat(ethers.formatEther(balanceWei)),
+                balanceWei: balanceWei.toString(),
+                symbol: this.symbol
+            };
+        } catch (e) {
+            console.error(`${this.name} getBalance:`, e.message);
+            return { address, balance: 0, symbol: this.symbol };
+        }
+    }
+
+    // ============================================
+    // CONFIRMAÇÕES
+    // ============================================
+    async waitForConfirmations(txHash, required = this.confirmations) {
+        if (!this.provider) throw new Error('Provider não configurado');
+
+        const start = Date.now();
+        const timeout = 30 * 60 * 1000;
+
+        while (Date.now() - start < timeout) {
+            try {
+                const receipt = await this.provider.getTransactionReceipt(txHash);
+                if (receipt && receipt.blockNumber) {
+                    const currentBlock = await this.provider.getBlockNumber();
+                    const confirmations = currentBlock - receipt.blockNumber + 1;
+
+                    if (confirmations >= required) {
+                        return { confirmed: true, confirmations, blockNumber: receipt.blockNumber };
+                    }
+                }
+            } catch (e) {
+                console.warn(`Aguardando confirm: ${e.message}`);
+            }
+            await new Promise(r => setTimeout(r, 15_000));
+        }
+
+        throw new Error(`Timeout aguardando ${required} confirmações`);
+    }
+
+    // ============================================
+    // VALIDAÇÃO
+    // ============================================
+    isValidAddress(address) {
+        try {
+            return ethers.isAddress(address);
+        } catch (_) {
+            return false;
+        }
+    }
+
+    // ============================================
+    // INFO ÚTIL
+    // ============================================
+    getInfo() {
+        return {
+            chainKey: this.chainKey,
+            name: this.name,
+            symbol: this.symbol,
+            chainId: this.chainId,
+            network: this.networkName,
+            isTestnet: this.isTestnet,
+            address: this.wallet?.address || null,
+            contract: this.htlcContract ? this.htlcContract.target : null,
+            explorer: this.explorer
+        };
+    }
+}
+
+module.exports = EvmAdapter;
+module.exports.EVM_CHAINS = EVM_CHAINS;
