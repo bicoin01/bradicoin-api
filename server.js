@@ -1228,6 +1228,29 @@ async function initialize() {
         });
         p2pNode = p2pResult.node;
         logger.info(`🌐 P2P rodando (PeerID: ${p2pNode.peerId.toString()})`);
+
+                // ============================================
+        // 🔄 ATOMIC SWAP — Inicializa Order Book + Gossip
+        // ============================================
+        try {
+            const { initGossip, orderBook } = require('./atomic-swap/negotiation');
+
+            // Carrega ordens abertas do Mongo
+            await orderBook.loadFromMongo();
+            orderBook.startCleanup();
+
+            // Inicializa gossip P2P
+            initGossip({
+                node: p2pNode,
+                peerId: p2pNode.peerId.toString(),
+                privateKey: process.env.SWAP_PRIVATE_KEY || null,
+                publicKey: process.env.SWAP_PUBLIC_KEY || null
+            });
+
+            logger.info('📡 SwapGossip P2P inicializado');
+        } catch (e) {
+            logger.error('❌ Erro ao inicializar SwapGossip:', e.message);
+        }
         
         const { ReserveModel } = require('./models/Reserve');
         const reserve = await ReserveModel.getReserve();
