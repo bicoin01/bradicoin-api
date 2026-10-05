@@ -149,6 +149,7 @@ app.set('dynamicDiff', dynamicDiff);
 app.set('reorgDetector', reorgDetector);
 app.set('weakSubj', weakSubj);
 app.set('timestamps', timestamps);
+app.set('atomicSwap', atomicSwap);
 
 // ============================================
 // SOCKET.IO (com auth)
@@ -302,6 +303,13 @@ const txLimiter = rateLimit({
     max: 20,
     keyGenerator: (req) => req.user?._id?.toString() || req.ip,
     message: { success: false, error: 'Muitas transações. Tente novamente em 1 minuto.' }
+});
+
+const swapLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    keyGenerator: (req) => req.user?._id?.toString() || req.ip,
+    message: { success: false, error: 'Muitas operações de swap. Tente novamente em 1 minuto.' }
 });
 
 app.use('/api', generalLimiter);
@@ -806,6 +814,10 @@ logger.info('✅ Rotas: /api/v1/airdrop');
 
 app.use('/api/v1/governance', governanceRoutes);
 logger.info('✅ Rotas: /api/v1/governance');
+
+app.use('/api/atomic-swap', swapLimiter, atomicSwapRoutes);
+logger.info('✅ Rotas: /api/atomic-swap');
+logger.info(`🔄 Atomic Swap: ${atomicSwap.listChains().length} chains registradas`);
 
 // ============================================
 // 🪙 TOKEN — Lista pública
