@@ -1,12 +1,12 @@
 // models/ReserveStake.js
 // ============================================
 // Staking do Fundo de Reserva - Bradicoin
-// APR: 130% (2min/30min) | 50% (1h/1d)
-// ⚠️ USO PESSOAL / LABORATÓRIO
+// APR: 20% (todos os pools)
 // ============================================
 //
-// ⚠️ AVISO: estes APRs são insustentáveis para uso público.
-// Se algum dia tornar isto público, reduza para 5-15%.
+// ⚠️ AVISO: 20% APR é sustentável apenas se o Reserve
+// tiver um fundo que gere retorno suficiente para pagar
+// os stakers sem secar. Monitore o Reserve regularmente.
 //
 // ============================================
 
@@ -18,10 +18,10 @@ const { Decimal128 } = mongoose.Schema.Types;
 // ============================================
 // Adicionado maxStake para proteger o Reserve de 1 stake gigante
 const POOLS = {
-    '2min':  { name: '2 Minutes',  seconds: 120,   apr: 130, minStake: '1',  maxStake: '1000',   icon: '⚡' },
-    '30min': { name: '30 Minutes', seconds: 1800,  apr: 130, minStake: '1',  maxStake: '10000',  icon: '⏱️' },
-    '1h':    { name: '1 Hour',     seconds: 3600,  apr: 50,  minStake: '1',  maxStake: '50000',  icon: '⌛' },
-    '1d':    { name: '1 Day',      seconds: 86400, apr: 50,  minStake: '10', maxStake: '100000', icon: '📅' }
+    '2min':  { name: '2 Minutes',  seconds: 120,   apr: 20, minStake: '1',  maxStake: '1000',   icon: '⚡' },
+    '30min': { name: '30 Minutes', seconds: 1800,  apr: 20, minStake: '1',  maxStake: '10000',  icon: '⏱️' },
+    '1h':    { name: '1 Hour',     seconds: 3600,  apr: 20, minStake: '1',  maxStake: '50000',  icon: '⌛' },
+    '1d':    { name: '1 Day',      seconds: 86400, apr: 20, minStake: '10', maxStake: '100000', icon: '📅' }
 };
 
 // ============================================
@@ -109,7 +109,6 @@ const ReserveStakeSchema = new mongoose.Schema({
         default: () => Decimal128.fromString('0')
     },
 
-    // ✅ NOVO: controle de pagamento
     rewardPaid: {
         type: Boolean,
         default: false
@@ -120,7 +119,6 @@ const ReserveStakeSchema = new mongoose.Schema({
         default: null
     },
 
-    // ✅ NOVO: referência à transação
     transactionId: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Transaction',
@@ -158,7 +156,6 @@ const ReserveStakeSchema = new mongoose.Schema({
 // ============================================
 // 🔐 ÍNDICE ÚNICO PARCIAL
 // ============================================
-// Impede 2 stakes ativos do mesmo usuário
 ReserveStakeSchema.index(
     { userId: 1 },
     {
@@ -175,7 +172,6 @@ ReserveStakeSchema.index({ createdAt: -1 });
 // ============================================
 // HELPERS
 // ============================================
-
 function calcReward(amountStr, seconds, apr) {
     const amount = parseFloat(amountStr.toString());
     const years = seconds / 31536000;
@@ -185,7 +181,6 @@ function calcReward(amountStr, seconds, apr) {
 // ============================================
 // MÉTODOS DE INSTÂNCIA
 // ============================================
-
 ReserveStakeSchema.methods.isReady = function () {
     return Date.now() >= this.endTime.getTime();
 };
@@ -230,7 +225,6 @@ ReserveStakeSchema.methods.toPublic = function () {
 // ============================================
 // STATICS
 // ============================================
-
 ReserveStakeSchema.statics.POOLS = POOLS;
 ReserveStakeSchema.statics.calcReward = calcReward;
 
@@ -242,7 +236,6 @@ ReserveStakeSchema.statics.getUserStakes = async function (userId, limit = 20) {
     return this.find({ userId }).sort({ createdAt: -1 }).limit(limit).lean();
 };
 
-// ✅ NOVO: busca stakes prontos para pagar reward
 ReserveStakeSchema.statics.getReadyToClaim = async function (limit = 100) {
     return this.find({
         status: 'active',
@@ -253,7 +246,6 @@ ReserveStakeSchema.statics.getReadyToClaim = async function (limit = 100) {
         .lean();
 };
 
-// ✅ NOVO: estatísticas
 ReserveStakeSchema.statics.getStats = async function () {
     const [totalStakes, activeStakes, totalStakedAgg, avgAprAgg] = await Promise.all([
         this.countDocuments({}),
@@ -289,8 +281,6 @@ ReserveStakeSchema.statics.getStats = async function () {
 // ============================================
 // HOOKS
 // ============================================
-
-// Auto-popula poolName, apr, seconds baseado no poolKey
 ReserveStakeSchema.pre('validate', function (next) {
     if (this.poolKey && POOLS[this.poolKey]) {
         const pool = POOLS[this.poolKey];
