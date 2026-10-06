@@ -2,6 +2,7 @@
 // ============================================
 // Staking do Fundo de Reserva - Bradicoin
 // APR: 20% (todos os pools)
+// Pools: 24h / 7d / 30d
 // ============================================
 //
 // ⚠️ AVISO: 20% APR é sustentável apenas se o Reserve
@@ -16,12 +17,10 @@ const { Decimal128 } = mongoose.Schema.Types;
 // ============================================
 // POOLS
 // ============================================
-// Adicionado maxStake para proteger o Reserve de 1 stake gigante
 const POOLS = {
-    '2min':  { name: '2 Minutes',  seconds: 120,   apr: 20, minStake: '1',  maxStake: '1000',   icon: '⚡' },
-    '30min': { name: '30 Minutes', seconds: 1800,  apr: 20, minStake: '1',  maxStake: '10000',  icon: '⏱️' },
-    '1h':    { name: '1 Hour',     seconds: 3600,  apr: 20, minStake: '1',  maxStake: '50000',  icon: '⌛' },
-    '1d':    { name: '1 Day',      seconds: 86400, apr: 20, minStake: '10', maxStake: '100000', icon: '📅' }
+    '24h': { name: '24 Hours', seconds: 86400,   apr: 20, minStake: '1',   maxStake: '50000',   icon: '📅' },
+    '7d':  { name: '7 Days',   seconds: 604800,  apr: 20, minStake: '10',  maxStake: '250000',  icon: '📆' },
+    '30d': { name: '30 Days',  seconds: 2592000, apr: 20, minStake: '100', maxStake: '1000000', icon: '🗓️' }
 };
 
 // ============================================
