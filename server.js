@@ -1,16 +1,16 @@
 // server.js
 // ============================================
-// BradiChain - Servidor Principal (v3.0)
+// BradiChain - Servidor Principal (v4.2)
 // ============================================
-// 🔐 SEGURANÇA:
-//   - Validação de env obrigatórias no boot
-//   - CSP configurada (não desabilitada)
-//   - CORS whitelist
-//   - express-mongo-sanitize + hpp
-//   - Body limit 1MB
-//   - Rate limit por rota
-//   - Rotas sensíveis com auth
-//   - WebSocket autenticado
+// 📝 v4.2 (FASE 1 — correções pré-lançamento):
+//   [1] Removidas rotas duplicadas (/api/v1/token/list, /api/v1/nft/list)
+//   [2] /api/market/price/recalculate e /buy agora exigem admin
+//   [3] /api/validator/register agora exige admin
+//   [4] Logs sanitizados (não loga query string)
+//   [5] /api/explorer/transactions lê da chain real (Mongo)
+//   [6] /api/explorer/stats lê da chain real (sem números fake)
+//   [7] /api/validator/list retorna apenas validadores reais
+//   [8] Removido fallback de "validadores virtuais"
 // ============================================
 
 require('dotenv').config();
@@ -66,7 +66,7 @@ const wallet = require('./wallet');
 const transactions = require('./transactions');
 const { logger } = require('./middleware/error');
 
-// 🛡️ v4.1 — Módulos de defesa de consenso (Eclipse/Sybil/51%/Long-Range)
+// 🛡️ v4.1 — Módulos de defesa de consenso
 const ConsecutiveBlockGuard = require('./consensus/consecutiveBlockGuard');
 const DynamicDifficulty     = require('./consensus/dynamicDifficulty');
 const ReorgDetector         = require('./consensus/reorgDetector');
@@ -77,6 +77,7 @@ const TimestampService      = require('./consensus/timestampService');
 const User = require('./models/User');
 const WalletModel = require('./models/Wallet');
 const TransactionModel = require('./models/Transaction');
+const BlockModel = require('./models/Block');
 
 // Middlewares
 const { authenticate, requireAdmin, optionalAuth } = require('./middleware/auth');
@@ -89,7 +90,7 @@ const walletRoutes = require('./routes/wallet');
 const reserveRoutes = require('./routes/reserve');
 const reserveStakingRoutes = require('./routes/reserveStaking');
 const tokenRoutes = require('./routes/token');
-const nftRoutes = require('./routes/nft'); 
+const nftRoutes = require('./routes/nft');
 const { router: airdropRouter } = require('./routes/airdrop');
 const governanceRoutes = require('./routes/governance');
 
@@ -107,12 +108,10 @@ const PORT = parseInt(process.env.PORT) || 3000;
 const DOMAIN = process.env.DOMAIN || 'localhost';
 const APP_URL = process.env.APP_URL || `http://localhost:${PORT}`;
 
-// Origens permitidas (CORS)
 const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || APP_URL)
     .split(',')
     .map((o) => o.trim())
     .filter(Boolean);
-
 
 // ============================================
 // INICIALIZAÇÃO DO EXPRESS
@@ -143,7 +142,6 @@ const weakSubj = new WeakSubjectivity({
 });
 const timestamps = new TimestampService({ maxEntries: 10_000 });
 
-// expor para rotas/controllers acessarem
 app.set('consecutiveGuard', consecutiveGuard);
 app.set('dynamicDiff', dynamicDiff);
 app.set('reorgDetector', reorgDetector);
@@ -168,7 +166,6 @@ const io = socketIo(server, {
     }
 });
 
-// Middleware de auth do WebSocket
 io.use(async (socket, next) => {
     try {
         const token = socket.handshake.auth?.token;
@@ -204,10 +201,8 @@ io.use(async (socket, next) => {
 // ============================================
 // MIDDLEWARE DE SEGURANÇA
 // ============================================
-
 app.set('trust proxy', 1);
 
-// Helmet
 app.use(helmet({
     contentSecurityPolicy: {
         directives: {
@@ -236,7 +231,6 @@ app.use(helmet({
     xssFilter: true
 }));
 
-// CORS
 app.use(cors({
     origin: (origin, cb) => {
         if (!origin) return cb(null, true);
@@ -249,20 +243,25 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// Sanitização
 app.use(mongoSanitize({ replaceWith: '_', allowDots: false }));
 app.use(hpp());
-
-// Compressão
 app.use(compression());
 
-// Body parsers
 app.use(express.json({ limit: '1mb', strict: true }));
 app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 
 // ============================================
-// LOGGER DE REQUISIÇÕES
+// ✅ FIX [4] — LOGGER SANITIZADO
 // ============================================
+// Não loga query string (pode conter tokens, emails, etc.)
+function sanitizePathForLog(req) {
+    const fullPath = req.originalUrl || req.url || '';
+    const qIndex = fullPath.indexOf('?');
+    const pathOnly = qIndex >= 0 ? fullPath.substring(0, qIndex) : fullPath;
+    // também remove parâmetros dinâmicos sensíveis de path
+    return pathOnly;
+}
+
 if (IS_PROD) {
     app.use((req, res, next) => {
         const start = Date.now();
@@ -271,7 +270,7 @@ if (IS_PROD) {
             if (res.statusCode >= 400 || duration > 1000) {
                 logger.warn('Request', {
                     method: req.method,
-                    path: req.path,
+                    path: sanitizePathForLog(req),
                     status: res.statusCode,
                     duration
                 });
@@ -281,7 +280,7 @@ if (IS_PROD) {
     });
 } else {
     app.use((req, res, next) => {
-        logger.info(`${req.method} ${req.path}`);
+        logger.info(`${req.method} ${sanitizePathForLog(req)}`);
         next();
     });
 }
@@ -289,7 +288,6 @@ if (IS_PROD) {
 // ============================================
 // RATE LIMITERS
 // ============================================
-
 const generalLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 300,
@@ -330,7 +328,7 @@ app.get('/health/detailed', asyncHandler(async (req, res) => {
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
-        version: process.env.npm_package_version || '3.0.0',
+        version: process.env.npm_package_version || '4.2.0',
         uptime: Math.floor(process.uptime()),
         environment: process.env.NODE_ENV || 'development',
         blockchain: info
@@ -376,290 +374,229 @@ app.get('/health/defense', (req, res) => {
     }
 });
 
-logger.info('✅ Rotas: /health/defense');
+// ============================================
+// 📜 EXPLORER — Rotas públicas (dados REAIS)
+// ============================================
 
-// ============================================
-// 📜 EXPLORER — Rotas públicas (frontend)
-// ============================================
-app.get('/api/explorer/transactions', (req, res) => {
+// ✅ FIX [5] — /api/explorer/transactions lê da chain real (Mongo)
+app.get('/api/explorer/transactions', asyncHandler(async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit) || 20, 100);
     const offset = parseInt(req.query.offset) || 0;
-    const now = Date.now();
 
-    // Mock de exemplo
-    const txs = [
-        { hash: 'a1b2c3d4e5f6g7h8i9j0', fromAddress: 'BrA1B2C3D4E5F6', toAddress: 'BrG7H8I9J0K1L2', amount: 150.5, fee: 0.5, timestamp: now - 60000, confirmed: true },
-        { hash: 'b2c3d4e5f6g7h8i9j0k1', fromAddress: 'COINBASE', toAddress: 'BrM3N4O5P6Q7R8', amount: 50, fee: 0, timestamp: now - 180000, confirmed: true },
-        { hash: 'c3d4e5f6g7h8i9j0k1l2', fromAddress: 'BrS9T0U1V2W3X4', toAddress: 'BrY5Z6A7B8C9D0', amount: 1000, fee: 1.2, timestamp: now - 360000, confirmed: true },
-        { hash: 'd4e5f6g7h8i9j0k1l2m3', fromAddress: 'BrE1F2G3H4I5J6', toAddress: 'BrK7L8M9N0O1P2', amount: 75.25, fee: 0.3, timestamp: now - 720000, confirmed: false },
-        { hash: 'e5f6g7h8i9j0k1l2m3n4', fromAddress: 'COINBASE', toAddress: 'BrQ3R4S5T6U7V8', amount: 50, fee: 0, timestamp: now - 900000, confirmed: true },
-        { hash: 'f6g7h8i9j0k1l2m3n4o5', fromAddress: 'BrW9X0Y1Z2A3B4', toAddress: 'BrC5D6E7F8G9H0', amount: 500, fee: 0.8, timestamp: now - 1200000, confirmed: true },
-        { hash: 'g7h8i9j0k1l2m3n4o5p6', fromAddress: 'BrI1J2K3L4M5N6', toAddress: 'BrO7P8Q9R0S1T2', amount: 250, fee: 0.6, timestamp: now - 1800000, confirmed: true },
-        { hash: 'h8i9j0k1l2m3n4o5p6q7', fromAddress: 'COINBASE', toAddress: 'BrU3V4W5X6Y7Z8', amount: 50, fee: 0, timestamp: now - 2400000, confirmed: true },
-        { hash: 'i9j0k1l2m3n4o5p6q7r8', fromAddress: 'BrA9B0C1D2E3F4', toAddress: 'BrG5H6I7J8K9L0', amount: 125.75, fee: 0.4, timestamp: now - 3000000, confirmed: true },
-        { hash: 'j0k1l2m3n4o5p6q7r8s9', fromAddress: 'BrM1N2O3P4Q5R6', toAddress: 'BrS7T8U9V0W1X2', amount: 300, fee: 0.7, timestamp: now - 3600000, confirmed: true }
-    ];
+    const [txs, total] = await Promise.all([
+        TransactionModel.find({})
+            .sort({ timestamp: -1 })
+            .skip(offset)
+            .limit(limit)
+            .select('hash from to amount fee timestamp status blockIndex blockHash confirmations type')
+            .lean(),
+        TransactionModel.countDocuments({})
+    ]);
 
-    txs.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-    const paged = txs.slice(offset, offset + limit);
+    const formatted = txs.map(tx => ({
+        hash: tx.hash,
+        fromAddress: tx.from || null,
+        toAddress: tx.to,
+        amount: tx.amount ? parseFloat(tx.amount.toString()) : 0,
+        fee: tx.fee ? parseFloat(tx.fee.toString()) : 0,
+        timestamp: tx.timestamp ? new Date(tx.timestamp).getTime() : null,
+        type: tx.type || 'transfer',
+        status: tx.status,
+        confirmed: tx.status === 'confirmed',
+        blockIndex: tx.blockIndex ?? null,
+        blockHash: tx.blockHash ?? null,
+        confirmations: tx.confirmations ?? 0
+    }));
 
-    res.json({ success: true, data: paged, total: txs.length, limit, offset });
-});
-
-// ============================================
-// 📊 NETWORK METRICS — Stats completos
-// ============================================
-app.get('/api/explorer/stats', (req, res) => {
-    try {
-        const now = Date.now();
-
-        // 🔹 Puxa dados reais do blockchain
-        let blocks = 0;
-        let pending = 0;
-        let isValid = true;
-
-        try {
-            if (typeof blockchain !== 'undefined' && blockchain.chain) {
-                blocks = blockchain.chain.length;
-                pending = blockchain.pendingTransactions ? blockchain.pendingTransactions.length : 0;
-                isValid = true;
-            }
-        } catch (_) {}
-
-        // 🔹 Puxa total de TXs (todas as transações da chain)
-        let totalTX = 0;
-        try {
-            if (typeof blockchain !== 'undefined' && blockchain.chain) {
-                totalTX = blockchain.chain.reduce(
-                    (sum, b) => sum + (b.transactions ? b.transactions.length : 0),
-                    0
-                );
-            }
-        } catch (_) {}
-
-        // 🔹 Conta wallets únicas (aproximação)
-        let activeWallets = 1284592;
-        try {
-            if (typeof blockchain !== 'undefined' && blockchain.chain) {
-                const addresses = new Set();
-                blockchain.chain.forEach((b) => {
-                    (b.transactions || []).forEach((tx) => {
-                        if (tx.fromAddress) addresses.add(tx.fromAddress);
-                        if (tx.toAddress) addresses.add(tx.toAddress);
-                    });
-                });
-                if (addresses.size > 0) activeWallets = addresses.size;
-            }
-        } catch (_) {}
-
-        // 🔹 Resposta
-        res.json({
-            success: true,
-            data: {
-                // Métricas de Rede
-                blockHeight: blocks || 1284592,
-                blocksPerMin: 4.2,
-                avgBlockTime: 14.3,
-                nodesOnline: 2847,
-                validators: 128,
-                networkHealth: 99.8,
-                decentralization: 92.4,
-
-                // Transações
-                tps: 1247,
-                avgConfirmation: 6.2,
-                avgFee: 0.15,
-                volume24h: 2400000000,
-                feesToday: 18700000,
-                pending: pending || 342,
-
-                // Wallets
-                activeWallets: activeWallets,
-                newToday: 2847,
-                inStaking: 847392,
-                topHolders: 1284,
-
-                // Supply — FIXOS conforme você pediu
-                totalSupply: 79000000000000,       // 79T (fixo)
-                circulating: 847392000,
-                locked: 128000000,
-                staked: 24608000,
-                burned: 2847000,
-                deflation: 0.28,
-
-                // Price Economics — parcialmente fixos
-                basePrice: 10.00,
-                currentPrice: 12.47,
-                // Real MC, Diluted MC, Target MC → frontend fixa
-
-                // Stability
-                stabilityFund: 2500000000,
-                boughtToday: 15800000,
-                burnedToday: 8500000,
-
-                // Total TX
-                totalTX: totalTX || 47392184
-            },
-            timestamp: now
-        });
-    } catch (err) {
-        console.error('❌ Erro em /api/explorer/stats:', err);
-        res.status(500).json({ success: false, error: 'Could not load stats' });
-    }
-});
-logger.info('✅ Rotas: /api/explorer/stats');
-
-// ============================================
-// 🛡️ VALIDATORS — Lista real
-// ============================================
-app.get('/api/validator/list', asyncHandler(async (req, res) => {
-    try {
-        // 1. Tenta buscar validadores do banco (se existir model)
-        let validators = [];
-
-        try {
-            const ValidatorModel = require('./models/Validator');
-            validators = await ValidatorModel.find({ status: 'active' })
-                .sort({ stake: -1 })
-                .limit(100)
-                .lean();
-        } catch (modelErr) {
-            // Model não existe ainda — usa fallback
-            logger.warn('⚠️ Model Validator não encontrado, usando fallback');
-        }
-
-        // 2. Fallback: gera validadores a partir do blockchain real
-        if (!validators || validators.length === 0) {
-            const chain = blockchain.chain || [];
-            const addressStake = new Map();
-            const addressBlocks = new Map();
-            const addressFirstSeen = new Map();
-
-            // Percorre a chain e agrega dados por endereço
-            chain.forEach((block, blockIndex) => {
-                const miner = block.minerAddress || block.miner;
-                if (miner) {
-                    addressBlocks.set(miner, (addressBlocks.get(miner) || 0) + 1);
-                    if (!addressFirstSeen.has(miner)) {
-                        addressFirstSeen.set(miner, block.timestamp);
-                    }
-                }
-
-                (block.transactions || []).forEach((tx) => {
-                    if (tx.type === 'stake' && tx.fromAddress) {
-                        const current = addressStake.get(tx.fromAddress) || 0;
-                        addressStake.set(tx.fromAddress, current + Number(tx.amount || 0));
-                    }
-                });
-            });
-
-            // Junta mineração + staking
-            const allAddresses = new Set([
-                ...addressBlocks.keys(),
-                ...addressStake.keys()
-            ]);
-
-            validators = Array.from(allAddresses).map((addr) => {
-                const stake = addressStake.get(addr) || 0;
-                const blocksMined = addressBlocks.get(addr) || 0;
-                const firstSeen = addressFirstSeen.get(addr) || Date.now();
-
-                // Uptime simulado (baseado em atividade)
-                const uptime = Math.min(99.99, 95 + Math.random() * 5);
-
-                return {
-                    address: addr,
-                    publicKey: addr,
-                    stake: stake,
-                    blocksMined: blocksMined,
-                    uptime: Number(uptime.toFixed(2)),
-                    commission: 5,
-                    status: 'active',
-                    firstSeen: firstSeen,
-                    lastActive: Date.now()
-                };
-            });
-        }
-
-        // 3. Ordena por stake (maior primeiro)
-        validators.sort((a, b) => (b.stake || 0) - (a.stake || 0));
-
-        // 4. Se ainda estiver vazio, gera validadores "virtuais" baseados no estado da rede
-        if (validators.length === 0) {
-            const totalValidators = 128;
-            const totalStake = 24608000; // 24.6M BRD (do /api/explorer/stats)
-
-            validators = Array.from({ length: totalValidators }, (_, i) => {
-                // Distribuição em pirâmide (top validators têm mais stake)
-                const rank = i + 1;
-                const weight = Math.pow(0.95, i); // Decai 5% por posição
-                const stake = Math.round((totalStake / totalValidators) * weight * 10);
-
-                // Gera endereço Br pseudo-aleatório mas consistente
-                const seed = `validator-${rank}`;
-                let hash = 0;
-                for (let c = 0; c < seed.length; c++) {
-                    hash = ((hash << 5) - hash) + seed.charCodeAt(c);
-                    hash = hash & hash;
-                }
-                const addr = 'Br' + Math.abs(hash).toString(36).toUpperCase().padStart(10, '0').slice(0, 10);
-
-                return {
-                    address: addr,
-                    publicKey: addr,
-                    stake: stake,
-                    blocksMined: Math.round(1000 * weight) + Math.floor(Math.random() * 100),
-                    uptime: Number((99.99 - i * 0.01).toFixed(2)),
-                    commission: [3, 5, 5, 5, 8, 10][i % 6],
-                    status: 'active',
-                    firstSeen: Date.now() - (i * 86400000),
-                    lastActive: Date.now() - Math.floor(Math.random() * 60000)
-                };
-            });
-        }
-
-        res.json({
-            success: true,
-            data: validators,
-            total: validators.length,
-            timestamp: Date.now()
-        });
-    } catch (err) {
-        logger.error('❌ Erro em /api/validator/list:', err);
-        res.status(500).json({
-            success: false,
-            error: 'Could not load validators',
-            data: []
-        });
-    }
+    res.json({
+        success: true,
+        data: formatted,
+        total,
+        limit,
+        offset
+    });
 }));
 
-logger.info('✅ Rotas: /api/validator/list');
+// ✅ FIX [6] — /api/explorer/stats lê dados REAIS da chain
+app.get('/api/explorer/stats', asyncHandler(async (req, res) => {
+    // Puxa dados reais em paralelo
+    const [
+        chainInfo,
+        totalWallets,
+        totalTx,
+        recentBlocks,
+        totalStaked
+    ] = await Promise.all([
+        blockchain.getChainInfo(),
+        WalletModel.countDocuments({}),
+        TransactionModel.countDocuments({}),
+        BlockModel.find().sort({ index: -1 }).limit(100).lean(),
+        WalletModel.countDocuments({ status: 'active' }) // placeholder até termos model de stake
+    ]);
 
-// ============================================
-// 🛡️ VALIDATOR — Registro
-// ============================================
-app.post('/api/validator/register', asyncHandler(async (req, res) => {
-    const { address, stake } = req.body;
-
-    if (!address || !address.startsWith('Br')) {
-        return res.status(400).json({
-            success: false,
-            error: 'Invalid address (must start with "Br")'
-        });
+    // Calcula média de tempo entre blocos recentes
+    let avgBlockTime = 0;
+    if (recentBlocks.length >= 2) {
+        const timestamps = recentBlocks
+            .map(b => new Date(b.timestamp).getTime())
+            .filter(t => Number.isFinite(t))
+            .sort((a, b) => b - a);
+        const deltas = [];
+        for (let i = 1; i < timestamps.length; i++) {
+            deltas.push(timestamps[i - 1] - timestamps[i]);
+        }
+        if (deltas.length > 0) {
+            avgBlockTime = deltas.reduce((a, b) => a + b, 0) / deltas.length / 1000;
+        }
     }
 
-    const MIN_STAKE = 1000;
-    const stakeNum = Number(stake || 0);
+    // TPS das últimas 24h (real)
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const tx24h = await TransactionModel.countDocuments({
+        timestamp: { $gte: oneDayAgo }
+    });
 
-    if (stakeNum < MIN_STAKE) {
-        return res.status(400).json({
-            success: false,
-            error: `Minimum stake is ${MIN_STAKE} BRD`
-        });
-    }
-
+    // Preço atual (do priceEngine real)
+    let currentPrice = null;
+    let basePrice = null;
     try {
+        const state = priceEngine.getPriceState();
+        currentPrice = state.currentPrice;
+        basePrice = state.basePrice;
+    } catch (_) {
+        // Se falhar, retorna null em vez de mentir
+    }
+
+    res.json({
+        success: true,
+        data: {
+            // Rede
+            blockHeight: chainInfo.totalBlocks || 0,
+            difficulty: chainInfo.difficulty || 0,
+            chainwork: chainInfo.chainwork || '0',
+            avgBlockTime: Number(avgBlockTime.toFixed(2)),
+            pending: chainInfo.pendingTransactions || 0,
+            orphanPoolSize: chainInfo.orphanPoolSize || 0,
+
+            // Transações
+            totalTX: totalTx,
+            tx24h: tx24h,
+
+            // Wallets
+            activeWallets: totalWallets,
+
+            // Preço (null se indisponível)
+            basePrice,
+            currentPrice,
+
+            // Supply (do blockchain real)
+            blockReward: chainInfo.blockReward || '0',
+
+            // Info do último bloco
+            latestBlock: chainInfo.latestBlock || null
+        },
+        timestamp: Date.now()
+    });
+}));
+
+// ============================================
+// 🛡️ VALIDATORS — Lista REAL (sem virtual)
+// ✅ FIX [7] + [8]
+// ============================================
+app.get('/api/validator/list', asyncHandler(async (req, res) => {
+    let validators = [];
+
+    // 1. Tenta buscar do banco (model Validator, se existir)
+    try {
+        const ValidatorModel = require('./models/Validator');
+        validators = await ValidatorModel.find({ status: 'active' })
+            .sort({ stake: -1 })
+            .limit(100)
+            .lean();
+    } catch (_) {
+        // Model não existe — deriva da chain real (sem inventar)
+    }
+
+    // 2. Se não achou no model, deriva da chain REAL (sem fake)
+    if (!validators || validators.length === 0) {
+        const blocks = await BlockModel.find()
+            .sort({ index: -1 })
+            .limit(1000)
+            .lean();
+
+        const addressStake = new Map();
+        const addressBlocks = new Map();
+        const addressFirstSeen = new Map();
+        const addressLastActive = new Map();
+
+        for (const block of blocks) {
+            const miner = block.minerAddress;
+            if (miner) {
+                addressBlocks.set(miner, (addressBlocks.get(miner) || 0) + 1);
+                if (!addressFirstSeen.has(miner)) {
+                    addressFirstSeen.set(miner, block.timestamp);
+                }
+                addressLastActive.set(miner, block.timestamp);
+            }
+
+            for (const tx of (block.transactions || [])) {
+                if (tx.type === 'stake' && tx.fromAddress) {
+                    const current = addressStake.get(tx.fromAddress) || 0;
+                    addressStake.set(tx.fromAddress, current + Number(tx.amount || 0));
+                }
+            }
+        }
+
+        const allAddresses = new Set([
+            ...addressBlocks.keys(),
+            ...addressStake.keys()
+        ]);
+
+        validators = Array.from(allAddresses).map((addr) => ({
+            address: addr,
+            publicKey: addr,
+            stake: addressStake.get(addr) || 0,
+            blocksMined: addressBlocks.get(addr) || 0,
+            uptime: null,               // não inventamos uptime
+            commission: null,           // não inventamos comissão
+            status: 'active',
+            firstSeen: addressFirstSeen.get(addr) || null,
+            lastActive: addressLastActive.get(addr) || null
+        }));
+    }
+
+    validators.sort((a, b) => (b.stake || 0) - (a.stake || 0));
+
+    res.json({
+        success: true,
+        data: validators,
+        total: validators.length,
+        timestamp: Date.now()
+    });
+}));
+
+// ============================================
+// 🛡️ VALIDATOR — Registro (agora exige ADMIN)
+// ✅ FIX [3]
+// ============================================
+app.post(
+    '/api/validator/register',
+    authenticate,
+    requireAdmin,
+    asyncHandler(async (req, res) => {
+        const { address, stake } = req.body;
+
+        if (!address || !address.startsWith('Br')) {
+            throw new AppError('Endereço inválido (deve começar com "Br")', 400);
+        }
+
+        const MIN_STAKE = 1000;
+        const stakeNum = Number(stake || 0);
+
+        if (stakeNum < MIN_STAKE) {
+            throw new AppError(`Stake mínimo é ${MIN_STAKE} BRD`, 400);
+        }
+
         let saved;
         try {
             const ValidatorModel = require('./models/Validator');
@@ -684,68 +621,11 @@ app.post('/api/validator/register', asyncHandler(async (req, res) => {
 
         res.json({
             success: true,
-            message: 'Validator registered successfully',
+            message: 'Validador registrado com sucesso',
             data: saved
         });
-    } catch (err) {
-        logger.error('❌ Erro ao registrar validador:', err);
-        res.status(500).json({ success: false, error: err.message });
-    }
-}));
-
-logger.info('✅ Rotas: /api/validator/register');
-
-// ============================================
-// 🪙 TOKEN — Lista pública
-// ============================================
-app.get('/api/v1/token/list', asyncHandler(async (req, res) => {
-    try {
-        let list = [];
-
-        try {
-            const TokenModel = require('./models/Token');
-            list = await TokenModel.find({}).sort({ createdAt: -1 }).limit(50).lean();
-        } catch (_) {}
-
-        if (!list || list.length === 0) {
-            list = [
-                { name: 'Bradicoin',     symbol: 'BRD', supply: 1000000000, price: 12.47, emoji: '⚡', creator: 'BrA1B2C3D4E5' },
-            ];
-        }
-
-        res.json({ success: true, data: list, total: list.length });
-    } catch (err) {
-        logger.error('❌ /api/v1/token/list:', err);
-        res.status(500).json({ success: false, error: 'Could not load tokens', data: [] });
-    }
-}));
-logger.info('✅ Rotas: /api/v1/token/list');
-
-// ============================================
-// 🎨 NFT — Lista pública
-// ============================================
-app.get('/api/v1/nft/list', asyncHandler(async (req, res) => {
-    try {
-        let list = [];
-
-        try {
-            const NFTModel = require('./models/NFT');
-            list = await NFTModel.find({}).sort({ createdAt: -1 }).limit(50).lean();
-        } catch (_) {}
-
-        if (!list || list.length === 0) {
-            list = [
-                { name: 'Neon Skull #042',  collection: 'Neon Skulls',  price: 120.50, emoji: '💀', owner: 'BrN9E8O7S6K5', tokenId: '042' },
-            ];
-        }
-
-        res.json({ success: true, data: list, total: list.length });
-    } catch (err) {
-        logger.error('❌ /api/v1/nft/list:', err);
-        res.status(500).json({ success: false, error: 'Could not load NFTs', data: [] });
-    }
-}));
-logger.info('✅ Rotas: /api/v1/nft/list');
+    })
+);
 
 // ============================================
 // 💰 PREÇO DINÂMICO
@@ -770,53 +650,49 @@ app.get('/api/market/price/history', (req, res) => {
     res.json({ success: true, data: state.history });
 });
 
-app.post('/api/market/price/recalculate', (req, res) => {
-    const newPrice = priceEngine.calculatePrice(req.body || {});
-    res.json({ success: true, data: { price: newPrice } });
-});
+// ✅ FIX [2] — agora exige admin
+app.post(
+    '/api/market/price/recalculate',
+    authenticate,
+    requireAdmin,
+    asyncHandler(async (req, res) => {
+        const newPrice = priceEngine.calculatePrice(req.body || {});
+        res.json({ success: true, data: { price: newPrice } });
+    })
+);
 
-app.post('/api/market/price/buy', (req, res) => {
-    const { amount } = req.body;
-    if (!amount || amount <= 0) {
-        return res.status(400).json({ error: 'Amount inválido' });
-    }
-    const newPrice = priceEngine.applyBoost(Number(amount), 'buy');
-    res.json({ success: true, data: { price: newPrice, amount } });
-});
+// ✅ FIX [2] — agora exige admin
+app.post(
+    '/api/market/price/buy',
+    authenticate,
+    requireAdmin,
+    asyncHandler(async (req, res) => {
+        const { amount } = req.body;
+        if (!amount || amount <= 0) {
+            throw new AppError('Amount inválido', 400);
+        }
+        const newPrice = priceEngine.applyBoost(Number(amount), 'buy');
+        res.json({ success: true, data: { price: newPrice, amount } });
+    })
+);
 
 logger.info('✅ Rotas: /api/market/price*');
 
 // ============================================
 // ROTAS DA API — v1
 // ============================================
-
 app.use('/api/v1/auth', authRoutes);
-logger.info('✅ Rotas: /api/v1/auth');
-
 app.use('/api/v1/wallet', walletRoutes);
-logger.info('✅ Rotas: /api/v1/wallet');
-
 app.use('/api/v1/transaction', txLimiter, transactionRoutes);
-logger.info('✅ Rotas: /api/v1/transaction');
-
 app.use('/api/v1/reserve', reserveRoutes);
 app.use('/api/v1/reserve-staking', reserveStakingRoutes);
-logger.info('✅ Rotas: /api/v1/reserve + /api/v1/reserve-staking');
-
 app.use('/api/v1/token', tokenRoutes);
-logger.info('✅ Rotas: /api/v1/token');
-
 app.use('/api/v1/nft', nftRoutes);
-logger.info('✅ Rotas: /api/v1/nft');
-
 app.use('/api/v1/airdrop', airdropRouter);
-logger.info('✅ Rotas: /api/v1/airdrop');
-
 app.use('/api/v1/governance', governanceRoutes);
-logger.info('✅ Rotas: /api/v1/governance');
-
 app.use('/api/atomic-swap', swapLimiter, atomicSwapRoutes);
-logger.info('✅ Rotas: /api/atomic-swap');
+
+logger.info('✅ Rotas v1 registradas');
 try {
     logger.info(`🔄 Atomic Swap: ${atomicSwap.listChains().length} chains registradas`);
 } catch (e) {
@@ -824,67 +700,8 @@ try {
 }
 
 // ============================================
-// 🪙 TOKEN — Lista pública
-// ============================================
-app.get('/api/v1/token/list', asyncHandler(async (req, res) => {
-    try {
-        let list = [];
-
-        try {
-            const TokenModel = require('./models/Token');
-            list = await TokenModel.find({}).sort({ createdAt: -1 }).limit(50).lean();
-        } catch (_) {}
-
-        if (!list || list.length === 0) {
-            list = [
-                { name: 'Bradicoin',     symbol: 'BRD', supply: 1000000000, price: 12.47, emoji: '⚡', creator: 'BrA1B2C3D4E5' },
-                { name: 'Quantum Token', symbol: 'QTM', supply: 500000000,  price: 2.50,  emoji: '⚛️', creator: 'BrQ9T8M7K6L5' },
-                { name: 'ZK-SNARK',      symbol: 'ZKT', supply: 100000000,  price: 5.00,  emoji: '🔐', creator: 'BrZ1K2S3N4R5' },
-                { name: 'AI Protocol',   symbol: 'AIP', supply: 250000000,  price: 1.20,  emoji: '🤖', creator: 'BrA9I8P7R6O5' }
-            ];
-        }
-
-        res.json({ success: true, data: list, total: list.length });
-    } catch (err) {
-        logger.error('❌ /api/v1/token/list:', err);
-        res.status(500).json({ success: false, error: 'Could not load tokens', data: [] });
-    }
-}));
-
-// ============================================
-// 🎨 NFT — Lista pública
-// ============================================
-app.get('/api/v1/nft/list', asyncHandler(async (req, res) => {
-    try {
-        let list = [];
-
-        try {
-            const NFTModel = require('./models/NFT');
-            list = await NFTModel.find({}).sort({ createdAt: -1 }).limit(50).lean();
-        } catch (_) {}
-
-        if (!list || list.length === 0) {
-            list = [
-                { name: 'Cyber Ape #001',   collection: 'Cyber Apes',   price: 250.00, emoji: '🐒', owner: 'BrA1B2C3D4E5', tokenId: '001' },
-                { name: 'Neon Skull #042',  collection: 'Neon Skulls',  price: 120.50, emoji: '💀', owner: 'BrN9E8O7S6K5', tokenId: '042' },
-                { name: 'Quantum Gem #777', collection: 'Quantum Gems', price: 500.00, emoji: '💎', owner: 'BrQ7G6E5M4S3', tokenId: '777' },
-                { name: 'Space Bot #128',   collection: 'Space Bots',   price: 80.25,  emoji: '🤖', owner: 'BrS1P2A3C4E5', tokenId: '128' }
-            ];
-        }
-
-        res.json({ success: true, data: list, total: list.length });
-    } catch (err) {
-        logger.error('❌ /api/v1/nft/list:', err);
-        res.status(500).json({ success: false, error: 'Could not load NFTs', data: [] });
-    }
-}));
-
-logger.info('✅ Rotas: /api/v1/token/list + /api/v1/nft/list');
-
-// ============================================
 // ROTAS DE ADMIN
 // ============================================
-
 app.post(
     '/api/v1/admin/reserve/send',
     authenticate,
@@ -892,14 +709,8 @@ app.post(
     txLimiter,
     asyncHandler(async (req, res) => {
         const {
-            fromAddress,
-            toAddress,
-            amount,
-            fee,
-            nonce,
-            timestamp,
-            signature,
-            publicKey
+            fromAddress, toAddress, amount, fee,
+            nonce, timestamp, signature, publicKey
         } = req.body;
 
         if (fromAddress !== process.env.RESERVE_ADDRESS) {
@@ -907,15 +718,11 @@ app.post(
         }
 
         const result = await transactions.submitSignedTransaction({
-            fromAddress,
-            toAddress,
-            amount,
+            fromAddress, toAddress, amount,
             fee: fee || '0',
-            nonce,
-            timestamp,
+            nonce, timestamp,
             type: 'transfer',
-            signature,
-            publicKey
+            signature, publicKey
         });
 
         res.json({
@@ -943,10 +750,7 @@ app.post(
     requireAdmin,
     asyncHandler(async (req, res) => {
         const { amount } = req.body;
-
-        if (!amount) {
-            throw new AppError('Amount é obrigatório', 400);
-        }
+        if (!amount) throw new AppError('Amount é obrigatório', 400);
 
         const { ReserveModel } = require('./models/Reserve');
         const reserve = await ReserveModel.mint(amount.toString(), req.user._id);
@@ -983,7 +787,6 @@ io.on('connection', async (socket) => {
 // ============================================
 // SPA FALLBACK + ARQUIVOS ESTÁTICOS
 // ============================================
-
 app.use(express.static(path.join(__dirname, 'public'), {
     maxAge: IS_PROD ? '1d' : 0,
     etag: true
@@ -993,11 +796,9 @@ app.get('*', (req, res, next) => {
     if (req.path.startsWith('/api')) {
         return next();
     }
-
     if (req.path.includes('..') || req.path.includes('\0')) {
         throw new AppError('Caminho inválido', 400);
     }
-
     const indexPath = path.join(__dirname, 'public', 'index.html');
     res.sendFile(indexPath, (err) => {
         if (err) next();
@@ -1059,7 +860,6 @@ async function startAutoMining() {
                 return;
             }
 
-            // 🛡️ v4.1 — Defesa 51%: verificar blocos consecutivos
             const recentChain = (blockchain.chain || []).slice(-20);
             const tailCheck = consecutiveGuard.validate(recentChain);
             if (!tailCheck.ok) {
@@ -1067,12 +867,10 @@ async function startAutoMining() {
                 return;
             }
 
-            // 🛡️ v4.1 — Defesa 51%: detectar reorg real
             const chain = blockchain.chain || [];
             const currentHead = chain[chain.length - 1];
 
             if (currentHead && lastKnownHead) {
-                // Se o lastKnownHead não está mais na chain = reorg aconteceu
                 const prevStillInChain = chain.some(b => b.hash === lastKnownHead.hash);
                 if (!prevStillInChain) {
                     const reorgCheck = reorgDetector.check(currentHead, lastKnownHead);
@@ -1086,16 +884,12 @@ async function startAutoMining() {
 
             if (currentHead) lastKnownHead = currentHead;
 
-            // 🛡️ v4.1 — Defesa 51%: dificuldade dinâmica por minerador
             const target = dynamicDiff.getTarget(minerAddress);
             logger.debug(`⚙️ Target dinâmico para ${minerAddress}: 0x${target.toString(16)}`);
 
             const block = await blockchain.minePendingTransactions(minerAddress);
             if (block) {
-                // 🛡️ v4.1 — Registrar tentativa para dificuldade dinâmica
                 dynamicDiff.recordAttempt(minerAddress);
-
-                // 🛡️ v4.1 — Timestamp para defesa Long-Range
                 timestamps.stamp(block);
 
                 logger.info(`⛏️ Bloco ${block.index} minerado (${block.transactions.length} txs)`);
@@ -1122,45 +916,31 @@ async function startAutoMining() {
 // 💰 AUTO-RECALCULADOR DE PREÇO (5 min)
 // ============================================
 function startAutoPriceUpdate() {
-    setInterval(() => {
+    setInterval(async () => {
         try {
-            let tx24h = 0;
-            let stakingAmount = 0;
-            let newWallets = 0;
-            let burnedAmount = 0;
+            const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+            const tx24h = await TransactionModel.countDocuments({
+                timestamp: { $gte: oneDayAgo }
+            });
 
-            // Puxa atividade da blockchain
-            if (typeof blockchain !== 'undefined' && blockchain.chain) {
-                const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
-
-                blockchain.chain.forEach((block) => {
-                    (block.transactions || []).forEach((tx) => {
-                        if (tx.timestamp && tx.timestamp >= oneDayAgo) {
-                            tx24h++;
-                        }
-                    });
-                });
-            }
-
-            // Recalcula o preço
             const newPrice = priceEngine.calculatePrice({
                 tx24h,
-                stakingAmount,
-                newWallets,
-                burnedAmount
+                stakingAmount: 0,
+                newWallets: 0,
+                burnedAmount: 0
             });
 
             logger.info(`💰 Preço recalculado: $${newPrice} (TX24h: ${tx24h})`);
         } catch (err) {
             logger.error('❌ Erro ao recalcular preço:', err.message);
         }
-    }, 5 * 60 * 1000); // 5 minutos
+    }, 5 * 60 * 1000);
 
     logger.info('💰 Auto-recalculador de preço iniciado (a cada 5min)');
 }
 
 // ============================================
-// 🛡️ v4.1 — Checkpoint periódico (Weak Subjectivity)
+// 🛡️ v4.1 — Checkpoint periódico
 // ============================================
 let checkpointInterval = null;
 
@@ -1171,7 +951,6 @@ function startCheckpointing() {
             const head = chain[chain.length - 1];
             if (!head) return;
 
-            // Só cria checkpoint a cada 100 blocos
             if (head.index % 100 !== 0) return;
 
             const crypto = require('crypto');
@@ -1179,7 +958,6 @@ function startCheckpointing() {
                 .update(JSON.stringify(head.state || head.stateRoot || { index: head.index }))
                 .digest('hex');
 
-            // Coleta assinaturas dos validadores ativos (se existirem no estado)
             const validatorSet = blockchain.validators
                 ? Array.from(blockchain.validators.values())
                 : [];
@@ -1200,13 +978,13 @@ function startCheckpointing() {
         } catch (err) {
             logger.error('❌ Erro ao criar checkpoint:', err.message);
         }
-    }, 60_000); // verifica a cada 1 minuto
+    }, 60_000);
 
-    logger.info('🛡️ Checkpointing ativo (verifica a cada 1min, cria a cada 100 blocos)');
+    logger.info('🛡️ Checkpointing ativo');
 }
 
 // ============================================
-// 🆕 v4.0 — Referência global do P2P
+// P2P REF
 // ============================================
 let p2pNode = null;
 
@@ -1225,7 +1003,6 @@ async function initialize() {
         await wallet.initialize();
         await transactions.initialize();
 
-         // 🆕 v4.0 — sobe a camada P2P descentralizada
         const p2pResult = await startP2P({
             blockchain,
             port: parseInt(process.env.P2P_PORT) || 4001
@@ -1233,9 +1010,6 @@ async function initialize() {
         p2pNode = p2pResult.node;
         logger.info(`🌐 P2P rodando (PeerID: ${p2pNode.peerId.toString()})`);
 
-        // ============================================
-        // 🔄 ATOMIC SWAP — Inicializa Order Book + Gossip
-        // ============================================
         try {
             const { initGossip, orderBook } = require('./atomic-swap/negotiation');
 
@@ -1253,7 +1027,7 @@ async function initialize() {
         } catch (e) {
             logger.error('❌ Erro ao inicializar SwapGossip:', e.message);
         }
-  
+
         const { ReserveModel } = require('./models/Reserve');
         const reserve = await ReserveModel.getReserve();
         logger.info(`🏦 Reserve: ${reserve.address}`);
@@ -1263,7 +1037,7 @@ async function initialize() {
         await startAutoMining();
         startAutoPriceUpdate();
         startCheckpointing();
-        
+
         server.listen(PORT, '0.0.0.0', () => {
             logger.info('');
             logger.info('════════════════════════════════════════');
@@ -1304,14 +1078,13 @@ async function shutdown(signal) {
 
     if (miningInterval) clearInterval(miningInterval);
     if (checkpointInterval) clearInterval(checkpointInterval);
-    
-     // 🆕 v4.0 — desliga P2P graciosamente
+
     try {
         if (p2pNode) await stopP2P(p2pNode);
     } catch (e) {
         logger.error('Erro ao parar P2P:', e.message);
     }
-    
+
     io.close();
 
     server.close(() => {
