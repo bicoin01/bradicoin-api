@@ -1,8 +1,8 @@
 // models/Wallet.js
 // ============================================
-// Schema da Carteira - Bradicoin (v2.1)
+// Schema da Carteira - Bradicoin (v2.2)
 // ============================================
-// 🆕 v2.1 — revertDebit / revertCredit (reorg-safe)
+// 🆕 v2.2 — campo encryptedPrivateKey (uso custodial pessoal)
 // ============================================
 
 const mongoose = require('mongoose');
@@ -13,9 +13,10 @@ const walletSchema = new mongoose.Schema(
         userId: {
             type: mongoose.Schema.Types.ObjectId,
             ref: 'User',
-            required: true,
-            unique: true,
-            index: true
+            required: false,       // ⚠️ era required:true. Agora opcional (Reserve não tem user)
+            unique: false,         // ⚠️ era unique:true. Reserve não tem user único
+            index: true,
+            sparse: true           // permite múltiplos nulls
         },
 
         address: {
@@ -25,7 +26,7 @@ const walletSchema = new mongoose.Schema(
             index: true,
             validate: {
                 validator: function (v) {
-                    return /^Br[a-fA-F0-9]{38}$/.test(v);
+                    return /^Br[a-fA-F0-9]{38}$/i.test(v);
                 },
                 message: 'Endereço deve ter o formato Br + 38 caracteres hexadecimais'
             }
@@ -40,6 +41,13 @@ const walletSchema = new mongoose.Schema(
                 },
                 message: 'Public key deve ter 66 caracteres hexadecimais (secp256k1 comprimida)'
             }
+        },
+
+        // 🆕 Chave privada criptografada (só para carteira do Reserve)
+        encryptedPrivateKey: {
+            type: String,
+            required: false,
+            select: false     // nunca retorna em queries padrão
         },
 
         balance: {
@@ -101,6 +109,7 @@ const walletSchema = new mongoose.Schema(
             transform(doc, ret) {
                 delete ret.__v;
                 delete ret.publicKey;
+                delete ret.encryptedPrivateKey;
 
                 if (ret.balance) ret.balance = ret.balance.toString();
                 if (ret.totalSent) ret.totalSent = ret.totalSent.toString();
@@ -115,6 +124,7 @@ const walletSchema = new mongoose.Schema(
             transform(doc, ret) {
                 delete ret.__v;
                 delete ret.publicKey;
+                delete ret.encryptedPrivateKey;
 
                 if (ret.balance) ret.balance = ret.balance.toString();
                 if (ret.totalSent) ret.totalSent = ret.totalSent.toString();
@@ -168,10 +178,8 @@ walletSchema.methods.getBalanceNumber = function () {
 // ============================================
 
 // 🔐 DEBITAR
-// ⚠️ NÃO use para reverter: use revertDebit
 walletSchema.statics.debit = async function (address, amountStr, session = null) {
     const amountDecimal = Decimal128.fromString(amountStr.toString());
-
     const options = { new: true };
     if (session) options.session = session;
 
@@ -200,10 +208,8 @@ walletSchema.statics.debit = async function (address, amountStr, session = null)
 };
 
 // 🔐 CREDITAR
-// ⚠️ NÃO use para reverter: use revertCredit
 walletSchema.statics.credit = async function (address, amountStr, session = null) {
     const amountDecimal = Decimal128.fromString(amountStr.toString());
-
     const options = { new: true };
     if (session) options.session = session;
 
@@ -227,10 +233,8 @@ walletSchema.statics.credit = async function (address, amountStr, session = null
 };
 
 // 🔁 REVERTER DÉBITO (reorg-safe)
-// Devolve saldo ao from e decrementa o nonce
 walletSchema.statics.revertDebit = async function (address, amountStr, session = null) {
     const amountDecimal = Decimal128.fromString(amountStr.toString());
-
     const options = { new: true };
     if (session) options.session = session;
 
@@ -255,10 +259,8 @@ walletSchema.statics.revertDebit = async function (address, amountStr, session =
 };
 
 // 🔁 REVERTER CRÉDITO (reorg-safe)
-// Retira saldo do to (o nonce dele NÃO foi mexido no credit, então não mexe aqui)
 walletSchema.statics.revertCredit = async function (address, amountStr, session = null) {
     const amountDecimal = Decimal128.fromString(amountStr.toString());
-
     const options = { new: true };
     if (session) options.session = session;
 
@@ -281,16 +283,11 @@ walletSchema.statics.revertCredit = async function (address, amountStr, session 
     return wallet;
 };
 
-// 🔐 INCREMENTAR NONCE (validação com expectedNonce)
+// 🔐 INCREMENTAR NONCE
 walletSchema.statics.incrementNonce = async function (address, expectedNonce) {
     const wallet = await this.findOneAndUpdate(
-        {
-            address,
-            nonce: expectedNonce
-        },
-        {
-            $inc: { nonce: 1 }
-        },
+        { address, nonce: expectedNonce },
+        { $inc: { nonce: 1 } },
         { new: true }
     );
 
@@ -304,7 +301,6 @@ walletSchema.statics.incrementNonce = async function (address, expectedNonce) {
 // ============================================
 // ÍNDICES
 // ============================================
-walletSchema.index({ userId: 1 }, { unique: true });
 walletSchema.index({ address: 1 }, { unique: true });
 walletSchema.index({ status: 1 });
 walletSchema.index({ createdAt: -1 });
