@@ -1,10 +1,9 @@
 // transactions.js
-// ============================================
-// Bradicoin Blockchain - Transactions (v3.1)
+// Bradicoin Blockchain - Transactions (v3.2)
 // ============================================
 // 🔐 NÃO-CUSTODIAL
 // 🆕 v3.1 — normalização de endereço + hash unificado
-// ============================================
+// 🆕 v3.2 — MAX_AMOUNT aumentado para 100 trilhões (uso pessoal)
 
 const mongoose = require('mongoose');
 const { Decimal128 } = mongoose.Schema.Types;
