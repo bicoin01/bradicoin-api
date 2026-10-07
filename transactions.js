@@ -19,7 +19,7 @@ const blockchain = require('./blockchain');
 // ============================================
 // CONSTANTES
 // ============================================
-const MAX_AMOUNT = 1_000_000_000;
+const MAX_AMOUNT = 100_000_000_000_000;
 const MAX_FEE = 1000;
 const MAX_FUTURE_TIMESTAMP_MS = 5 * 60 * 1000;
 const MAX_PAST_TIMESTAMP_MS = 10 * 60 * 1000;
