@@ -1,6 +1,8 @@
 // routes/auth.js
 // ============================================
-// Rotas de autenticação - Bradicoin (v2.0)
+// Rotas de autenticação - Bradicoin (v2.1)
+// ============================================
+// 🆕 v2.1 — LIMITE RÍGIDO DE 2 CONTAS (uso pessoal)
 // ============================================
 
 const express = require('express');
@@ -17,14 +19,19 @@ const { authenticate } = require('../middleware/auth');
 const { asyncHandler } = require('../middleware/error');
 
 // ============================================
-// RATE LIMITERS (específicos por rota)
+// CONSTANTES
+// ============================================
+const MAX_ACCOUNTS = 2;   // 🚨 limite rígido
+
+// ============================================
+// RATE LIMITERS
 // ============================================
 
 // Login: 5 tentativas a cada 15 min (por IP)
 const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 5,
-    skipSuccessfulRequests: true, // só conta falhas
+    skipSuccessfulRequests: true,
     message: {
         success: false,
         error: 'Muitas tentativas de login. Tente novamente em 15 minutos.'
@@ -33,13 +40,13 @@ const loginLimiter = rateLimit({
     legacyHeaders: false
 });
 
-// Register: 3 contas por hora (por IP)
+// Register: 🆕 agora limitado a 2/hora (era 3)
 const registerLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,
-    max: 3,
+    max: MAX_ACCOUNTS,
     message: {
         success: false,
-        error: 'Muitas contas criadas. Tente novamente em 1 hora.'
+        error: `Limite de ${MAX_ACCOUNTS} contas atingido nesta hora.`
     },
     standardHeaders: true,
     legacyHeaders: false
@@ -62,7 +69,6 @@ const forgotLimiter = rateLimit({
 // ============================================
 
 function generateToken(user) {
-    // Inclui tokenVersion para permitir revogação
     return jwt.sign(
         {
             id: user._id,
@@ -94,10 +100,30 @@ function validatePassword(password) {
     return { ok: true };
 }
 
-// Resposta padrão de erro
 function errorRes(res, status, message) {
     return res.status(status).json({ success: false, error: message });
 }
+
+// ============================================
+// GET /api/v1/auth/can-register
+// ============================================
+// 🆕 Retorna se ainda dá pra criar conta (pra UI mostrar/esconder botão)
+//
+router.get(
+    '/can-register',
+    asyncHandler(async (req, res) => {
+        const count = await User.countDocuments({ status: { $ne: 'deleted' } });
+        res.json({
+            success: true,
+            data: {
+                canRegister: count < MAX_ACCOUNTS,
+                currentCount: count,
+                maxAccounts: MAX_ACCOUNTS,
+                remaining: Math.max(0, MAX_ACCOUNTS - count)
+            }
+        });
+    })
+);
 
 // ============================================
 // POST /api/v1/auth/register
@@ -127,7 +153,20 @@ router.post(
             return errorRes(res, 400, pwdCheck.msg);
         }
 
-        // 3. Verifica se já existe
+        // ============================================
+        // 🚨 3. LIMITE RÍGIDO DE 2 CONTAS
+        // ============================================
+        const currentCount = await User.countDocuments({ status: { $ne: 'deleted' } });
+
+        if (currentCount >= MAX_ACCOUNTS) {
+            return errorRes(
+                res,
+                403,
+                `Limite de ${MAX_ACCOUNTS} contas atingido. Este sistema é de uso pessoal.`
+            );
+        }
+
+        // 4. Verifica se já existe
         const existing = await User.findOne({
             $or: [
                 { email: email.toLowerCase() },
@@ -140,7 +179,7 @@ router.post(
             return errorRes(res, 409, `${field} já está em uso`);
         }
 
-        // 4. Cria usuário
+        // 5. Cria usuário
         const user = await User.create({
             email: email.toLowerCase(),
             password,
@@ -155,17 +194,19 @@ router.post(
             }
         });
 
-        // 5. Gera token
+        // 6. Gera token
         const token = generateToken(user);
 
-        // 6. Retorna
+        // 7. Retorna
         res.status(201).json({
             success: true,
-            message: 'Conta criada com sucesso',
+            message: `Conta criada com sucesso (${currentCount + 1}/${MAX_ACCOUNTS})`,
             data: {
                 user: user.toPublic(),
                 token,
-                expiresIn: process.env.JWT_EXPIRES_IN || '7d'
+                expiresIn: process.env.JWT_EXPIRES_IN || '7d',
+                accountCount: currentCount + 1,
+                maxAccounts: MAX_ACCOUNTS
             }
         });
     })
@@ -184,34 +225,29 @@ router.post(
             return errorRes(res, 400, 'Email e senha são obrigatórios');
         }
 
-        // 1. Busca usuário (com password e campos de segurança)
         const user = await User.findOne({ email: email.toLowerCase() })
             .select('+password +failedLoginAttempts +lockedUntil +tokenVersion +twoFactorSecret');
 
-        // ⚠️ Sempre retornar mesma mensagem (não vaza se email existe)
         if (!user) {
             return errorRes(res, 401, 'Email ou senha incorretos');
         }
 
-        // 2. Verifica se está bloqueado por brute-force
         if (user.isLocked()) {
             const minutesLeft = Math.ceil((user.lockedUntil - Date.now()) / 60000);
             return errorRes(res, 429, `Conta bloqueada. Tente novamente em ${minutesLeft} minutos.`);
         }
 
-        // 3. Verifica status
         if (user.status !== 'active') {
             return errorRes(res, 403, 'Conta suspensa ou inativa');
         }
 
-        // 4. Verifica senha
         const isMatch = await user.comparePassword(password);
         if (!isMatch) {
             await user.registerFailedLogin();
             return errorRes(res, 401, 'Email ou senha incorretos');
         }
 
-        // 5. Verifica 2FA (se habilitado)
+        // 2FA
         if (user.twoFactorEnabled && user.twoFactorSecret) {
             if (!twoFACode) {
                 return res.status(200).json({
@@ -225,7 +261,7 @@ router.post(
                 secret: user.twoFactorSecret,
                 encoding: 'base32',
                 token: twoFACode,
-                window: 1 // tolera 1 período antes/depois
+                window: 1
             });
 
             if (!verified) {
@@ -234,10 +270,8 @@ router.post(
             }
         }
 
-        // 6. Sucesso — reseta tentativas
         await user.resetFailedLogins();
 
-        // 7. Gera token
         const token = generateToken(user);
 
         res.json({
@@ -275,7 +309,6 @@ router.post(
     '/logout',
     authenticate,
     asyncHandler(async (req, res) => {
-        // Invalida TODOS os tokens do usuário
         await req.user.revokeAllTokens();
 
         res.json({
@@ -309,26 +342,19 @@ router.put(
             return errorRes(res, 404, 'Usuário não encontrado');
         }
 
-        // Verifica senha atual
         const isMatch = await user.comparePassword(currentPassword);
         if (!isMatch) {
             return errorRes(res, 401, 'Senha atual incorreta');
         }
 
-        // Não permite mesma senha
         if (currentPassword === newPassword) {
             return errorRes(res, 400, 'Nova senha deve ser diferente da atual');
         }
 
-        // Atualiza senha (hook pre-save hasheia + atualiza lastPasswordChange)
         user.password = newPassword;
-
-        // Revoga TODOS os tokens (incluindo o atual)
         user.tokenVersion = (user.tokenVersion || 0) + 1;
-
         await user.save();
 
-        // Gera NOVO token (para o usuário não deslogar)
         const newToken = generateToken(user);
 
         res.json({
@@ -343,7 +369,6 @@ router.put(
 
 // ============================================
 // POST /api/v1/auth/forgot-password
-// ⚠️ FAKE por enquanto (não envia email real)
 // ============================================
 router.post(
     '/forgot-password',
@@ -357,7 +382,6 @@ router.post(
 
         const user = await User.findOne({ email: email.toLowerCase() });
 
-        // ⚠️ Sempre retorna sucesso (não vaza se email existe)
         const response = {
             success: true,
             message: 'Se o email estiver cadastrado, você receberá instruções para redefinir a senha.'
@@ -367,18 +391,13 @@ router.post(
             return res.json(response);
         }
 
-        // Gera token de reset (válido por 1h)
         const resetToken = crypto.randomBytes(32).toString('hex');
         const resetTokenHash = crypto.createHash('sha256').update(resetToken).digest('hex');
 
         user.resetPasswordToken = resetTokenHash;
-        user.resetPasswordExpires = new Date(Date.now() + 60 * 60 * 1000); // 1h
+        user.resetPasswordExpires = new Date(Date.now() + 60 * 60 * 1000);
         await user.save();
 
-        // TODO: enviar email com link:
-        // https://bradicoin.com/reset-password?token=${resetToken}
-        //
-        // Por enquanto, loga no console (em dev):
         if (process.env.NODE_ENV !== 'production') {
             console.log(`🔑 Reset token para ${email}: ${resetToken}`);
             response.devResetToken = resetToken;
@@ -405,10 +424,8 @@ router.post(
             return errorRes(res, 400, pwdCheck.msg);
         }
 
-        // Hash do token recebido
         const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
 
-        // Busca usuário com token válido e não expirado
         const user = await User.findOne({
             resetPasswordToken: tokenHash,
             resetPasswordExpires: { $gt: new Date() }
@@ -418,16 +435,10 @@ router.post(
             return errorRes(res, 400, 'Token inválido ou expirado');
         }
 
-        // Atualiza senha
         user.password = newPassword;
-
-        // Limpa tokens de reset
         user.resetPasswordToken = null;
         user.resetPasswordExpires = null;
-
-        // Revoga todos os tokens
         user.tokenVersion = (user.tokenVersion || 0) + 1;
-
         await user.save();
 
         res.json({
@@ -439,7 +450,6 @@ router.post(
 
 // ============================================
 // POST /api/v1/auth/verify-email
-// ⚠️ Simplificado (marca email como verificado)
 // ============================================
 router.post(
     '/verify-email',
@@ -462,7 +472,7 @@ router.post(
 );
 
 // ============================================
-// 2FA — SETUP (gera secret + QR code)
+// 2FA — SETUP
 // ============================================
 router.post(
     '/2fa/setup',
@@ -478,18 +488,15 @@ router.post(
             return errorRes(res, 400, '2FA já está ativado');
         }
 
-        // Gera secret
         const secret = speakeasy.generateSecret({
             name: `BradiCoin (${user.email})`,
             issuer: 'BradiCoin',
             length: 32
         });
 
-        // Salva temporariamente (não ativa ainda)
         user.twoFactorSecret = secret.base32;
         await user.save();
 
-        // Gera QR code como data URL
         const qrCodeDataUrl = await QRCode.toDataURL(secret.otpauth_url);
 
         res.json({
@@ -504,7 +511,7 @@ router.post(
 );
 
 // ============================================
-// 2FA — VERIFY (ativa o 2FA após confirmar código)
+// 2FA — VERIFY
 // ============================================
 router.post(
     '/2fa/verify',
@@ -548,7 +555,7 @@ router.post(
 );
 
 // ============================================
-// 2FA — DISABLE (desativa o 2FA)
+// 2FA — DISABLE
 // ============================================
 router.post(
     '/2fa/disable',
@@ -594,13 +601,11 @@ router.post(
 
 // ============================================
 // POST /api/v1/auth/refresh
-// Renova token (mantém sessão ativa)
 // ============================================
 router.post(
     '/refresh',
     authenticate,
     asyncHandler(async (req, res) => {
-        // Gera novo token com tokenVersion atual
         const token = generateToken(req.user);
 
         res.json({
