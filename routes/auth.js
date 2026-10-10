@@ -1,8 +1,9 @@
 // routes/auth.js
 // ============================================
-// Rotas de autenticação - Bradicoin (v2.1)
+// Rotas de autenticação - Bradicoin (v2.2)
 // ============================================
 // 🆕 v2.1 — LIMITE RÍGIDO DE 2 CONTAS (uso pessoal)
+// 🆕 v2.2 — SEPARAÇÃO: /register (app, livre) e /register-page (página, limite 2)
 // ============================================
 
 const express = require('express');
@@ -21,7 +22,7 @@ const { asyncHandler } = require('../middleware/error');
 // ============================================
 // CONSTANTES
 // ============================================
-const MAX_ACCOUNTS = 2;   // 🚨 limite rígido
+const PAGE_MAX_ACCOUNTS = 2;   // 🆕 limite SÓ para contas da página do Fundo de Reserva
 
 // ============================================
 // RATE LIMITERS
@@ -40,13 +41,25 @@ const loginLimiter = rateLimit({
     legacyHeaders: false
 });
 
-// Register: 🆕 agora limitado a 2/hora (era 3)
+// Register: 🆕 ajustado para escala global (app)
 const registerLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,
-    max: MAX_ACCOUNTS,
+    max: 20,
     message: {
         success: false,
-        error: `Limite de ${MAX_ACCOUNTS} contas atingido nesta hora.`
+        error: 'Muitas tentativas de cadastro. Tente novamente em 1 hora.'
+    },
+    standardHeaders: true,
+    legacyHeaders: false
+});
+
+// Register-page: 🆕 limite mais rígido (só a página do fundo)
+const registerPageLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: PAGE_MAX_ACCOUNTS,
+    message: {
+        success: false,
+        error: `Limite de ${PAGE_MAX_ACCOUNTS} contas atingido nesta hora.`
     },
     standardHeaders: true,
     legacyHeaders: false
@@ -105,21 +118,25 @@ function errorRes(res, status, message) {
 }
 
 // ============================================
-// GET /api/v1/auth/can-register
+// GET /api/v1/auth/can-register-page
 // ============================================
-// 🆕 Retorna se ainda dá pra criar conta (pra UI mostrar/esconder botão)
+// 🆕 Retorna se ainda dá pra criar conta PELA PÁGINA do Fundo de Reserva
+// (NÃO conta as contas criadas pelo app)
 //
 router.get(
-    '/can-register',
+    '/can-register-page',
     asyncHandler(async (req, res) => {
-        const count = await User.countDocuments({ status: { $ne: 'deleted' } });
+        const count = await User.countDocuments({
+            status: { $ne: 'deleted' },
+            'metadata.source': 'reserve-page'
+        });
         res.json({
             success: true,
             data: {
-                canRegister: count < MAX_ACCOUNTS,
+                canRegister: count < PAGE_MAX_ACCOUNTS,
                 currentCount: count,
-                maxAccounts: MAX_ACCOUNTS,
-                remaining: Math.max(0, MAX_ACCOUNTS - count)
+                maxAccounts: PAGE_MAX_ACCOUNTS,
+                remaining: Math.max(0, PAGE_MAX_ACCOUNTS - count)
             }
         });
     })
@@ -128,6 +145,9 @@ router.get(
 // ============================================
 // POST /api/v1/auth/register
 // ============================================
+// ✅ APP GLOBAL — SEM LIMITE DE CONTAS
+// (só rate limit por IP, configurável)
+//
 router.post(
     '/register',
     registerLimiter,
@@ -153,20 +173,7 @@ router.post(
             return errorRes(res, 400, pwdCheck.msg);
         }
 
-        // ============================================
-        // 🚨 3. LIMITE RÍGIDO DE 2 CONTAS
-        // ============================================
-        const currentCount = await User.countDocuments({ status: { $ne: 'deleted' } });
-
-        if (currentCount >= MAX_ACCOUNTS) {
-            return errorRes(
-                res,
-                403,
-                `Limite de ${MAX_ACCOUNTS} contas atingido. Este sistema é de uso pessoal.`
-            );
-        }
-
-        // 4. Verifica se já existe
+        // 3. Verifica se já existe (email OU username)
         const existing = await User.findOne({
             $or: [
                 { email: email.toLowerCase() },
@@ -179,7 +186,7 @@ router.post(
             return errorRes(res, 409, `${field} já está em uso`);
         }
 
-        // 5. Cria usuário
+        // 4. Cria usuário (app global — sem limite)
         const user = await User.create({
             email: email.toLowerCase(),
             password,
@@ -189,6 +196,100 @@ router.post(
             tokenVersion: 0,
             emailVerified: false,
             metadata: {
+                source: 'app',   // 🆕 marcador
+                userAgent: (req.headers['user-agent'] || '').substring(0, 500),
+                ip: req.ip
+            }
+        });
+
+        // 5. Gera token
+        const token = generateToken(user);
+
+        // 6. Retorna
+        res.status(201).json({
+            success: true,
+            message: 'Conta criada com sucesso',
+            data: {
+                user: user.toPublic(),
+                token,
+                expiresIn: process.env.JWT_EXPIRES_IN || '7d'
+            }
+        });
+    })
+);
+
+// ============================================
+// POST /api/v1/auth/register-page
+// ============================================
+// 🎯 USADA APENAS PELA PÁGINA DO FUNDO DE RESERVA
+// 🚨 Limite rígido de 2 contas com source = 'reserve-page'
+//
+router.post(
+    '/register-page',
+    registerPageLimiter,
+    asyncHandler(async (req, res) => {
+        const { email, password, username } = req.body;
+
+        // 1. Campos obrigatórios
+        if (!email || !password || !username) {
+            return errorRes(res, 400, 'Email, senha e username são obrigatórios');
+        }
+
+        // 2. Validações
+        if (!validateEmail(email)) {
+            return errorRes(res, 400, 'Email inválido');
+        }
+
+        if (!validateUsername(username)) {
+            return errorRes(res, 400, 'Username deve ter 3-30 caracteres (letras, números, _)');
+        }
+
+        const pwdCheck = validatePassword(password);
+        if (!pwdCheck.ok) {
+            return errorRes(res, 400, pwdCheck.msg);
+        }
+
+        // ============================================
+        // 🚨 3. LIMITE RÍGIDO DE 2 CONTAS (só da página)
+        // ============================================
+        const pageCount = await User.countDocuments({
+            status: { $ne: 'deleted' },
+            'metadata.source': 'reserve-page'
+        });
+
+        if (pageCount >= PAGE_MAX_ACCOUNTS) {
+            return errorRes(
+                res,
+                403,
+                `Limite de ${PAGE_MAX_ACCOUNTS} contas atingido. Este sistema é de uso pessoal.`
+            );
+        }
+
+        // 4. Verifica se já existe (email OU username)
+        // ⚠️ Checa GLOBALMENTE (não só contas da página)
+        const existing = await User.findOne({
+            $or: [
+                { email: email.toLowerCase() },
+                { username: username.toLowerCase() }
+            ]
+        });
+
+        if (existing) {
+            const field = existing.email === email.toLowerCase() ? 'Email' : 'Username';
+            return errorRes(res, 409, `${field} já está em uso`);
+        }
+
+        // 5. Cria usuário marcado como "da página"
+        const user = await User.create({
+            email: email.toLowerCase(),
+            password,
+            username: username.toLowerCase(),
+            status: 'active',
+            role: 'user',
+            tokenVersion: 0,
+            emailVerified: false,
+            metadata: {
+                source: 'reserve-page',   // 🆕 MARCADOR IMPORTANTE
                 userAgent: (req.headers['user-agent'] || '').substring(0, 500),
                 ip: req.ip
             }
@@ -200,13 +301,13 @@ router.post(
         // 7. Retorna
         res.status(201).json({
             success: true,
-            message: `Conta criada com sucesso (${currentCount + 1}/${MAX_ACCOUNTS})`,
+            message: `Conta criada com sucesso (${pageCount + 1}/${PAGE_MAX_ACCOUNTS})`,
             data: {
                 user: user.toPublic(),
                 token,
                 expiresIn: process.env.JWT_EXPIRES_IN || '7d',
-                accountCount: currentCount + 1,
-                maxAccounts: MAX_ACCOUNTS
+                accountCount: pageCount + 1,
+                maxAccounts: PAGE_MAX_ACCOUNTS
             }
         });
     })
