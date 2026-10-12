@@ -692,6 +692,290 @@ app.use('/api/v1/airdrop', airdropRouter);
 app.use('/api/v1/governance', governanceRoutes);
 app.use('/api/atomic-swap', swapLimiter, atomicSwapRoutes);
 
+// ============================================
+// 📊 NETWORK STATS — Painel agregado (dados REAIS)
+// Cola antes de: logger.info('✅ Rotas v1 registradas');
+// ============================================
+
+const staking = require('./staking');
+const explorer = require('./explorer');
+
+// Cache interno de 15s (evita martelar Mongo quando 10 abas abrem junto)
+const _nsCache = { data: null, ts: 0 };
+const NS_CACHE_TTL = 15000;
+
+app.get('/api/network/stats', asyncHandler(async (req, res) => {
+    // Cache
+    if (_nsCache.data && (Date.now() - _nsCache.ts) < NS_CACHE_TTL) {
+        return res.json({ success: true, cached: true, timestamp: _nsCache.ts, data: _nsCache.data });
+    }
+
+    const now = Date.now();
+    const oneDayAgo = new Date(now - 86400000);
+    const MAX_SUPPLY = parseFloat(process.env.MAX_SUPPLY || '0');
+
+    // ===== Chamadas em paralelo =====
+    const [
+        chainInfo,
+        totalTx,
+        tx24h,
+        activeWallets,
+        newWalletsToday,
+        feesAgg,
+        volumeAgg,
+        stakingStats,
+        priceState,
+        latestBlocks,
+        reserveDoc
+    ] = await Promise.all([
+        blockchain.getChainInfo().catch(() => ({})),
+        TransactionModel.countDocuments({}).catch(() => 0),
+        TransactionModel.countDocuments({ timestamp: { $gte: oneDayAgo } }).catch(() => 0),
+        WalletModel.countDocuments({ status: 'active' }).catch(() => 0),
+        WalletModel.countDocuments({ createdAt: { $gte: oneDayAgo } }).catch(() => 0),
+
+        // Soma de fees das últimas 24h
+        TransactionModel.aggregate([
+            { $match: { timestamp: { $gte: oneDayAgo } } },
+            { $group: { _id: null, total: { $sum: { $toDouble: '$fee' } }, count: { $sum: 1 } } }
+        ]).catch(() => []),
+
+        // Volume 24h (soma de amount de TX não-sistema)
+        TransactionModel.aggregate([
+            { $match: { timestamp: { $gte: oneDayAgo }, from: { $ne: null } } },
+            { $group: { _id: null, total: { $sum: { $toDouble: '$amount' } } } }
+        ]).catch(() => []),
+
+        staking.getStakingStats().catch(() => ({ totalStaked: 0, totalRewards: 0, activeStakers: 0, apy: 18 })),
+
+        Promise.resolve().then(() => {
+            try { return priceEngine.getPriceState(); }
+            catch (_) { return null; }
+        }),
+
+        // Últimos 100 blocos (para descentralização e avg block time)
+        BlockModel.find().sort({ index: -1 }).limit(100).lean().catch(() => []),
+
+        // Reserve (para locked)
+        Promise.resolve().then(async () => {
+            try {
+                const { ReserveModel } = require('./models/Reserve');
+                return await ReserveModel.getReserve();
+            } catch (_) { return null; }
+        })
+    ]);
+
+    // ===== Cálculos derivados (REAIS) =====
+
+    // Avg block time dos últimos 100 blocos
+    let avgBlockTime = 30;
+    if (latestBlocks.length >= 2) {
+        const ts = latestBlocks
+            .map(b => new Date(b.timestamp).getTime())
+            .filter(Number.isFinite)
+            .sort((a, b) => b - a);
+        const deltas = [];
+        for (let i = 1; i < ts.length; i++) deltas.push(ts[i - 1] - ts[i]);
+        if (deltas.length) avgBlockTime = deltas.reduce((a, b) => a + b, 0) / deltas.length / 1000;
+    }
+
+    const blocksPerMin = avgBlockTime > 0 ? 60 / avgBlockTime : 0;
+    const tps = tx24h / 86400;
+    const avgConfirmation = avgBlockTime;
+
+    // ===== Supply REAL =====
+    let minedSupply = 0;
+    try { minedSupply = explorer.calculateTotalSupply() || 0; } catch (_) {}
+
+    const total = minedSupply;
+    const locked = reserveDoc ? parseFloat(reserveDoc.balance.toString()) : 0;
+    const staked = Number(stakingStats.totalStaked || 0);
+    const burned = 0; // sem mechanism de burn ainda
+    const circulating = Math.max(0, total - locked - burned);
+
+    // ===== Market Cap REAL =====
+    const currentPrice = priceState?.currentPrice || 0;
+    const basePrice = priceState?.basePrice || 0;
+    const maxPrice = priceState?.maxPrice || currentPrice * 1.5;
+
+    const realMarketCap = circulating * currentPrice;
+    const dilutedMC = MAX_SUPPLY * currentPrice;
+    const targetMC = MAX_SUPPLY * maxPrice;
+
+    // ===== Descentralização (HHI) =====
+    let decentralization = 0;
+    let networkHealth = 0;
+    try {
+        const miners = new Map();
+        for (const b of latestBlocks) {
+            if (b.minerAddress) miners.set(b.minerAddress, (miners.get(b.minerAddress) || 0) + 1);
+        }
+        const totalBlocks = latestBlocks.length || 1;
+        let hhi = 0;
+        for (const count of miners.values()) {
+            const share = count / totalBlocks;
+            hhi += share * share;
+        }
+        decentralization = Math.round((1 - hhi) * 1000) / 10;
+
+        const pendingPenalty = Math.min(40, (chainInfo.pendingTransactions || 0) / 25);
+        const orphanPenalty = Math.min(20, (chainInfo.orphanPoolSize || 0) * 2);
+        const decPenalty = (100 - decentralization) / 5;
+        networkHealth = Math.max(0, Math.round((100 - pendingPenalty - orphanPenalty - decPenalty) * 10) / 10);
+    } catch (_) {}
+
+    const feesToday = feesAgg[0]?.total || 0;
+    const tx24hCount = feesAgg[0]?.count || tx24h;
+    const avgFee = tx24hCount > 0 ? feesToday / tx24hCount : 0;
+    const volume24h = volumeAgg[0]?.total || 0;
+
+    // ===== Validação da chain =====
+    let isValid = true;
+    try { isValid = chainInfo.isValid !== false; } catch (_) {}
+
+    const responseData = {
+        // Rede
+        blockHeight: chainInfo.totalBlocks || 0,
+        blocksPerMin: Number(blocksPerMin.toFixed(1)),
+        avgBlockTime: Number(avgBlockTime.toFixed(1)),
+        nodesOnline: 1,             // TODO: pegar do P2P quando expuser contagem
+        validators: stakingStats.activeStakers || 0,
+        networkHealth,
+        decentralization,
+        difficulty: chainInfo.difficulty || 0,
+        isValid,
+
+        // Transações
+        tps: Number(tps.toFixed(2)),
+        avgConfirmation: Number(avgConfirmation.toFixed(1)),
+        avgFee: Number(avgFee.toFixed(4)),
+        volume24h,
+        feesToday,
+        pending: chainInfo.pendingTransactions || 0,
+        totalTX: totalTx,
+        tx24h,
+
+        // Wallets
+        activeWallets,
+        newToday: newWalletsToday,
+        inStaking: stakingStats.activeStakers || 0,
+        topHolders: 0,               // vem do /api/explorer/rich-list
+
+        // Supply (REAL)
+        total,
+        circulating,
+        maxSupply: MAX_SUPPLY,
+        locked,
+        staked,
+        burned,
+        deflation: 0,
+
+        // Preço (REAL)
+        basePrice,
+        currentPrice,
+        priceSupport: basePrice,
+        maxPrice,
+        realMarketCap,
+        dilutedMC,
+        targetMC,
+        variation24h: priceState?.variation24h || 0,
+
+        // Estabilidade (sem mecanismo ainda)
+        buybackActive: false,
+        stabilityFund: 0,
+        boughtToday: 0,
+        burnedToday: 0,
+
+        // Meta
+        latestBlock: chainInfo.latestBlock || null,
+        cachedAt: now
+    };
+
+    _nsCache.data = responseData;
+    _nsCache.ts = now;
+
+    res.json({ success: true, cached: false, timestamp: now, data: responseData });
+}));
+
+// ============================================
+// 📊 SUPPLY DETALHADO (endpoint alternativo)
+// ============================================
+app.get('/api/network/supply', asyncHandler(async (req, res) => {
+    const MAX_SUPPLY = parseFloat(process.env.MAX_SUPPLY || '0');
+
+    let mined = 0;
+    try { mined = explorer.calculateTotalSupply() || 0; } catch (_) {}
+
+    let reserve = 0;
+    try {
+        const { ReserveModel } = require('./models/Reserve');
+        const r = await ReserveModel.getReserve();
+        reserve = parseFloat(r.balance.toString());
+    } catch (_) {}
+
+    let stakedTotal = 0;
+    try {
+        const s = await staking.getStakingStats();
+        stakedTotal = s.totalStaked || 0;
+    } catch (_) {}
+
+    res.json({
+        success: true,
+        data: {
+            maxSupply: MAX_SUPPLY,
+            total: mined,
+            circulating: Math.max(0, mined - reserve),
+            locked: reserve,
+            staked: stakedTotal,
+            burned: 0,
+            remaining: Math.max(0, MAX_SUPPLY - mined)
+        }
+    });
+}));
+
+// ============================================
+// 📊 RICH LIST — Top Holders (expõe explorer.getRichList)
+// ============================================
+app.get('/api/explorer/rich-list', asyncHandler(async (req, res) => {
+    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+    const result = await explorer.getRichList(limit);
+    res.json({ success: true, data: result });
+}));
+
+// ============================================
+// 📊 TOKEN LIST (para o painel de Tokens)
+// ============================================
+app.get('/api/v1/token/list', asyncHandler(async (req, res) => {
+    try {
+        const TokenModel = require('./models/Token');
+        const tokens = await TokenModel.find({ status: 'active' })
+            .sort({ createdAt: -1 })
+            .limit(100)
+            .lean();
+        res.json({ success: true, data: tokens, total: tokens.length });
+    } catch (_) {
+        res.json({ success: true, data: [], total: 0 });
+    }
+}));
+
+// ============================================
+// 📊 NFT LIST
+// ============================================
+app.get('/api/v1/nft/list', asyncHandler(async (req, res) => {
+    try {
+        const NFTModel = require('./models/NFT');
+        const nfts = await NFTModel.find({ status: 'active' })
+            .sort({ createdAt: -1 })
+            .limit(100)
+            .lean();
+        res.json({ success: true, data: nfts, total: nfts.length });
+    } catch (_) {
+        res.json({ success: true, data: [], total: 0 });
+    }
+}));
+
+logger.info('✅ Rotas: /api/network/*, /api/explorer/rich-list, /api/v1/token/list, /api/v1/nft/list');
+
 logger.info('✅ Rotas v1 registradas');
 try {
     logger.info(`🔄 Atomic Swap: ${atomicSwap.listChains().length} chains registradas`);
