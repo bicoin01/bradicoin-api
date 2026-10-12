@@ -679,6 +679,38 @@ app.post(
 logger.info('✅ Rotas: /api/market/price*');
 
 // ============================================
+// 📊 TOKEN LIST — público (vem ANTES de tokenRoutes)
+// ============================================
+app.get('/api/v1/token/list', asyncHandler(async (req, res) => {
+    try {
+        const TokenModel = require('./models/Token');
+        const tokens = await TokenModel.find({ status: 'active' })
+            .sort({ createdAt: -1 })
+            .limit(100)
+            .lean();
+        res.json({ success: true, data: tokens, total: tokens.length });
+    } catch (_) {
+        res.json({ success: true, data: [], total: 0 });
+    }
+}));
+
+// ============================================
+// 📊 NFT LIST — público (vem ANTES de nftRoutes)
+// ============================================
+app.get('/api/v1/nft/list', asyncHandler(async (req, res) => {
+    try {
+        const NFTModel = require('./models/NFT');
+        const nfts = await NFTModel.find({ status: 'active' })
+            .sort({ createdAt: -1 })
+            .limit(100)
+            .lean();
+        res.json({ success: true, data: nfts, total: nfts.length });
+    } catch (_) {
+        res.json({ success: true, data: [], total: 0 });
+    }
+}));
+
+// ============================================
 // ROTAS DA API — v1
 // ============================================
 app.use('/api/v1/auth', authRoutes);
@@ -941,47 +973,6 @@ app.get('/api/explorer/rich-list', asyncHandler(async (req, res) => {
     const result = await explorer.getRichList(limit);
     res.json({ success: true, data: result });
 }));
-
-// ============================================
-// 📊 TOKEN LIST (para o painel de Tokens)
-// ============================================
-app.get('/api/v1/token/list', asyncHandler(async (req, res) => {
-    try {
-        const TokenModel = require('./models/Token');
-        const tokens = await TokenModel.find({ status: 'active' })
-            .sort({ createdAt: -1 })
-            .limit(100)
-            .lean();
-        res.json({ success: true, data: tokens, total: tokens.length });
-    } catch (_) {
-        res.json({ success: true, data: [], total: 0 });
-    }
-}));
-
-// ============================================
-// 📊 NFT LIST
-// ============================================
-app.get('/api/v1/nft/list', asyncHandler(async (req, res) => {
-    try {
-        const NFTModel = require('./models/NFT');
-        const nfts = await NFTModel.find({ status: 'active' })
-            .sort({ createdAt: -1 })
-            .limit(100)
-            .lean();
-        res.json({ success: true, data: nfts, total: nfts.length });
-    } catch (_) {
-        res.json({ success: true, data: [], total: 0 });
-    }
-}));
-
-logger.info('✅ Rotas: /api/network/*, /api/explorer/rich-list, /api/v1/token/list, /api/v1/nft/list');
-
-logger.info('✅ Rotas v1 registradas');
-try {
-    logger.info(`🔄 Atomic Swap: ${atomicSwap.listChains().length} chains registradas`);
-} catch (e) {
-    logger.warn(`⚠️  Atomic Swap: não foi possível listar chains (${e.message})`);
-}
 
 // ============================================
 // ROTAS DE ADMIN
