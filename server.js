@@ -725,6 +725,19 @@ app.use('/api/v1/governance', governanceRoutes);
 app.use('/api/atomic-swap', swapLimiter, atomicSwapRoutes);
 
 // ============================================
+// 🔗 ALIAS — rotas sem /v1 (compatibilidade com frontend público)
+// ============================================
+// O frontend do explorer chama /api/wallet/... e /api/transaction/...
+// sem o prefixo /v1. Estas linhas criam aliases para essas rotas.
+
+app.use('/api/wallet', walletRoutes);
+app.use('/api/transaction', txLimiter, transactionRoutes);
+app.use('/api/token', tokenRoutes);
+app.use('/api/nft', nftRoutes);
+
+logger.info('✅ Aliases /api/wallet, /api/transaction, /api/token, /api/nft registrados');
+
+// ============================================
 // 📊 NETWORK STATS — Painel agregado (dados REAIS)
 // Cola antes de: logger.info('✅ Rotas v1 registradas');
 // ============================================
