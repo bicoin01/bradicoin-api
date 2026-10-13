@@ -1,9 +1,14 @@
 // routes/wallet.js
 // ============================================
-// Rotas de carteira - BradiChain (v2.0)
+// Rotas de carteira - BradiChain (v2.1)
 // ============================================
 // 🔐 NÃO-CUSTODIAL: o cliente gera a chave e envia
 // apenas publicKey + address. O servidor NUNCA vê a privateKey.
+//
+// 📝 v2.1 — Correções:
+//   [1] /balance/:address agora retorna 404 se wallet não existe
+//   [2] /history/:address agora retorna 404 se wallet não existe
+//   [3] Normalização de endereço (case-insensitive) em todas as rotas
 // ============================================
 
 const express = require('express');
@@ -76,17 +81,34 @@ router.post(
 // ============================================
 // GET /api/v1/wallet/balance/:address
 // ============================================
+// 📝 v2.1 — Retorna 404 quando a wallet não existe
+// ============================================
 router.get(
     '/balance/:address',
     queryLimiter,
     asyncHandler(async (req, res) => {
         const { address } = req.params;
 
+        // Valida formato
         if (!wallet.isValidAddress(address)) {
-            throw new AppError('Endereço inválido', 400);
+            throw new AppError('Endereço inválido (deve começar com "Br" e ter 40 caracteres)', 400);
         }
 
-        const result = await wallet.getBalance(address);
+        // Normaliza (case-insensitive)
+        const normalized = wallet.normalizeAddress
+            ? wallet.normalizeAddress(address)
+            : address;
+
+        const result = await wallet.getBalance(normalized);
+
+        // ✅ NOVO: se a wallet não existe, retorna 404
+        if (result.exists === false) {
+            return res.status(404).json({
+                success: false,
+                error: 'Wallet not found',
+                address: result.address
+            });
+        }
 
         res.json({
             success: true,
@@ -98,6 +120,8 @@ router.get(
 // ============================================
 // GET /api/v1/wallet/history/:address
 // ============================================
+// 📝 v2.1 — Retorna 404 quando a wallet não existe
+// ============================================
 router.get(
     '/history/:address',
     queryLimiter,
@@ -105,18 +129,34 @@ router.get(
         const { address } = req.params;
         const { limit = 50 } = req.query;
 
+        // Valida formato
         if (!wallet.isValidAddress(address)) {
-            throw new AppError('Endereço inválido', 400);
+            throw new AppError('Endereço inválido (deve começar com "Br" e ter 40 caracteres)', 400);
+        }
+
+        // Normaliza (case-insensitive)
+        const normalized = wallet.normalizeAddress
+            ? wallet.normalizeAddress(address)
+            : address;
+
+        // ✅ NOVO: verifica se a wallet existe antes de buscar histórico
+        const balance = await wallet.getBalance(normalized);
+        if (balance.exists === false) {
+            return res.status(404).json({
+                success: false,
+                error: 'Wallet not found',
+                address: balance.address
+            });
         }
 
         const limitNum = Math.min(Math.max(1, parseInt(limit) || 50), 100);
 
-        const result = await wallet.getHistory(address, limitNum);
+        const result = await wallet.getHistory(normalized, limitNum);
 
         res.json({
             success: true,
             data: {
-                address,
+                address: normalized,
                 transactions: result,
                 count: result.length
             }
@@ -128,7 +168,8 @@ router.get(
 // GET /api/v1/wallet/nonce/:address
 // ============================================
 // ⚠️ CRÍTICO: o cliente precisa disso para assinar a próxima TX
-//
+// (já retornava 404 corretamente — mantido)
+// ============================================
 router.get(
     '/nonce/:address',
     queryLimiter,
@@ -136,21 +177,30 @@ router.get(
         const { address } = req.params;
 
         if (!wallet.isValidAddress(address)) {
-            throw new AppError('Endereço inválido', 400);
+            throw new AppError('Endereço inválido (deve começar com "Br" e ter 40 caracteres)', 400);
         }
 
-        const walletDoc = await WalletModel.findOne({ address })
+        // Normaliza (case-insensitive)
+        const normalized = wallet.normalizeAddress
+            ? wallet.normalizeAddress(address)
+            : address;
+
+        const walletDoc = await WalletModel.findOne({ address: normalized })
             .select('nonce status')
             .lean();
 
         if (!walletDoc) {
-            throw new AppError('Carteira não encontrada', 404);
+            return res.status(404).json({
+                success: false,
+                error: 'Wallet not found',
+                address: normalized
+            });
         }
 
         res.json({
             success: true,
             data: {
-                address,
+                address: normalized,
                 nonce: walletDoc.nonce,
                 status: walletDoc.status
             }
@@ -168,19 +218,28 @@ router.get(
         const { address } = req.params;
 
         if (!wallet.isValidAddress(address)) {
-            throw new AppError('Endereço inválido', 400);
+            throw new AppError('Endereço inválido (deve começar com "Br" e ter 40 caracteres)', 400);
         }
 
-        const publicKey = await wallet.getPublicKey(address);
+        // Normaliza (case-insensitive)
+        const normalized = wallet.normalizeAddress
+            ? wallet.normalizeAddress(address)
+            : address;
+
+        const publicKey = await wallet.getPublicKey(normalized);
 
         if (!publicKey) {
-            throw new AppError('Carteira não encontrada', 404);
+            return res.status(404).json({
+                success: false,
+                error: 'Wallet not found',
+                address: normalized
+            });
         }
 
         res.json({
             success: true,
             data: {
-                address,
+                address: normalized,
                 publicKey
             }
         });
