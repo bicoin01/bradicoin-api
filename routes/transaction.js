@@ -1,10 +1,15 @@
 // routes/transaction.js
 // ============================================
-// Rotas de transação - BradiChain (v2.0)
+// Rotas de transação - BradiChain (v2.1)
 // ============================================
 // 🔐 NÃO-CUSTODIAL: o cliente assina a TX e envia
 // apenas { fromAddress, toAddress, amount, nonce, signature, publicKey }.
 // O servidor verifica a assinatura antes de aceitar.
+//
+// 📝 v2.1 — Correções:
+//   [1] /:hash agora retorna 404 quando TX não existe
+//   [2] Aceita hash com prefixo "0x" (compatibilidade)
+//   [3] Aceita hash de 16+ hex (frontend pode enviar curto)
 // ============================================
 
 const express = require('express');
@@ -119,19 +124,46 @@ router.get(
 // ============================================
 // GET /api/v1/transaction/:hash
 // ============================================
+// 📝 v2.1 — Correções aplicadas:
+//   ✅ Aceita prefixo "0x" (opcional)
+//   ✅ Aceita hash de 16+ caracteres hex (compatível com frontend)
+//   ✅ Retorna 404 quando a TX não existe (antes retornava 200 com null)
+// ============================================
 router.get(
     '/:hash',
     queryLimiter,
     asyncHandler(async (req, res) => {
-        const { hash } = req.params;
+        const { hash: rawHash } = req.params;
 
-        // Valida formato (SHA-256 = 64 hex)
-        if (!/^[a-fA-F0-9]{64}$/.test(hash)) {
-            throw new AppError('Hash inválido', 400);
+        // ─── Normalização ───
+        // Remove prefixo "0x" se existir
+        const hash = rawHash.startsWith('0x') || rawHash.startsWith('0X')
+            ? rawHash.slice(2)
+            : rawHash;
+
+        // ─── Validação ───
+        // Aceita 16+ caracteres hex (frontend pode enviar curto)
+        // Mas o ideal é 64 (SHA-256 completo)
+        if (!/^[a-fA-F0-9]{16,64}$/.test(hash)) {
+            throw new AppError(
+                'Hash inválido (deve ter entre 16 e 64 caracteres hexadecimais)',
+                400
+            );
         }
 
+        // ─── Busca ───
         const tx = await transactions.getTransactionByHash(hash);
 
+        // ─── ✅ NOVO: retorna 404 se não encontrou ───
+        if (!tx) {
+            return res.status(404).json({
+                success: false,
+                error: 'Transaction not found',
+                hash
+            });
+        }
+
+        // ─── Sucesso ───
         res.json({
             success: true,
             data: tx
