@@ -721,6 +721,8 @@ app.use('/api/v1/reserve-staking', reserveStakingRoutes);
 app.use('/api/v1/token', tokenRoutes);
 app.use('/api/v1/nft', nftRoutes);
 app.use('/api/v1/airdrop', airdropRouter);
+const { router: adminAirdropRouter } = require('./routes/adminAirdrop');
+app.use('/api/v1/admin/airdrop', adminAirdropRouter);
 app.use('/api/v1/governance', governanceRoutes);
 app.use('/api/atomic-swap', swapLimiter, atomicSwapRoutes);
 
