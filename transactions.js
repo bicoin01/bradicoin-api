@@ -109,7 +109,7 @@ function validateTransactionPayload(payload) {
     if (ts > now + MAX_FUTURE_TIMESTAMP_MS) throw new Error('Timestamp muito no futuro');
     if (ts < now - MAX_PAST_TIMESTAMP_MS) throw new Error('Timestamp muito antigo');
 
-    const validTypes = ['transfer', 'stake', 'unstake', 'reward', 'mint', 'burn', 'airdrop', 'wallet_creation', 'tip', 'nft_mint', 'nft_transfer'];
+    const validTypes = ['transfer', 'stake', 'unstake', 'reward', 'mint', 'burn', 'airdrop', 'wallet_creation', 'tip', 'nft_mint', 'nft_transfer', 'buy'];
     if (type && !validTypes.includes(type)) {
         throw new Error('Tipo de transação inválido');
     }
