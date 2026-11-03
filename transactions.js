@@ -452,6 +452,152 @@ async function creditAirdrop({ toAddress, amount, campaign, userId }) {
 }
 
 // ============================================
+// 🛒 COMPRA DE BRADICOIN (buy) — SEM SESSÃO ATÔMICA
+// ============================================
+// Usado pelo creditWorker quando o pagamento é confirmado.
+// Debita do Reserve + credita no usuário + registra tx tipo 'buy'.
+//
+// ⚠️ SEM session atômica. Usa 3 proteções:
+//    1. Idempotência (se já creditado, não duplica)
+//    2. Ordem segura (credita usuário antes de debitar Reserve)
+//    3. Status 'crediting' como lock (evita 2 workers processando)
+//
+// Retorna { txHash, newBalance, orderId, alreadyCredited }
+//
+async function creditPurchase({ orderId, toAddress, amount }) {
+    if (!orderId) throw new Error('orderId é obrigatório');
+    if (!toAddress) throw new Error('toAddress é obrigatório');
+    
+    const amountNum = parseFloat(amount);
+    if (!Number.isFinite(amountNum) || amountNum <= 0) {
+        throw new Error('amount inválido (deve ser > 0)');
+    }
+
+    const toAddr = wallet.normalizeAddress(toAddress);
+    if (!wallet.isValidAddress(toAddr)) {
+        throw new Error('Endereço de destino inválido');
+    }
+
+    const fromAddress = wallet.normalizeAddress(process.env.RESERVE_ADDRESS);
+    if (!fromAddress) {
+        throw new Error('RESERVE_ADDRESS não configurado no .env');
+    }
+
+    const BuyOrder = require('./models/BuyOrder');
+
+    // 🛡️ LOCK: só continua se estiver 'paid'
+    const order = await BuyOrder.findOneAndUpdate(
+        { orderId, status: 'paid' },
+        { $set: { status: 'crediting' } },
+        { new: true }
+    );
+
+    if (!order) {
+        const existing = await BuyOrder.findOne({ orderId });
+        if (!existing) throw new Error(`Pedido ${orderId} não encontrado`);
+        if (existing.status === 'credited' && existing.creditTxHash) {
+            console.log(`⚠️ Pedido ${orderId} já creditado (${existing.creditTxHash})`);
+            return {
+                txHash: existing.creditTxHash,
+                orderId: existing.orderId,
+                amount: parseFloat(existing.amountBr.toString()),
+                alreadyCredited: true
+            };
+        }
+        if (existing.status === 'crediting') {
+            throw new Error(`Pedido ${orderId} já está sendo processado`);
+        }
+        throw new Error(`Pedido ${orderId} em estado inválido: ${existing.status}`);
+    }
+
+    try {
+        // ===== 1. CREDITA NO USUÁRIO PRIMEIRO (ordem segura) =====
+        const userWallet = await WalletModel.credit(toAddr, amountNum.toString());
+
+        // ===== 2. DEBITA DO RESERVE =====
+        let reserveWallet;
+        try {
+            reserveWallet = await WalletModel.debit(fromAddress, amountNum.toString());
+        } catch (debitErr) {
+            console.error(`❌ Falha ao debitar Reserve: ${debitErr.message}`);
+            await BuyOrder.findOneAndUpdate(
+                { orderId },
+                { $set: { status: 'failed', failureReason: `Reserve debit failed: ${debitErr.message}` } }
+            );
+            throw debitErr;
+        }
+
+        // ===== 3. CRIA TRANSACTIONMODEL (type: 'buy') =====
+        const timestamp = new Date().toISOString();
+        const txPayload = {
+            fromAddress,
+            toAddress: toAddr,
+            amount: amountNum,
+            fee: 0,
+            nonce: 0,
+            timestamp,
+            type: 'buy'
+        };
+
+        const internalSignature = `INTERNAL_BUY_${orderId}_${Date.now()}`;
+        const hash = calculateTxHash(txPayload, internalSignature);
+
+        const existingTx = await TransactionModel.findOne({ hash });
+        if (!existingTx) {
+            await TransactionModel.create({
+                hash,
+                from: fromAddress,
+                to: toAddr,
+                amount: Decimal128.fromString(amountNum.toString()),
+                fee: Decimal128.fromString('0'),
+                nonce: 0,
+                signature: internalSignature,
+                publicKey: 'INTERNAL',
+                type: 'buy',
+                status: 'confirmed',
+                timestamp: new Date(timestamp),
+                metadata: {
+                    orderId: order.orderId,
+                    currency: order.currency,
+                    amountUsd: order.amountUsd,
+                    priceAtOrder: order.priceAtOrder,
+                    internal: true,
+                    source: 'buy_worker'
+                }
+            });
+        }
+
+        // ===== 4. MARCA PEDIDO COMO 'CREDITED' =====
+        await BuyOrder.findOneAndUpdate(
+            { orderId, status: 'crediting' },
+            { $set: { status: 'credited', creditTxHash: hash, creditedAt: new Date() } }
+        );
+
+        console.log(`✅ Compra creditada: ${amountNum} BRD → ${toAddr} (tx: ${hash.substring(0, 12)}...)`);
+
+        return {
+            txHash: hash,
+            orderId: order.orderId,
+            amount: amountNum,
+            newBalance: userWallet.balance.toString(),
+            reserveBalance: reserveWallet.balance.toString()
+        };
+
+    } catch (err) {
+        console.error(`❌ Erro ao creditar compra ${orderId}:`, err.message);
+        try {
+            await BuyOrder.findOneAndUpdate(
+                { orderId, status: 'crediting' },
+                { $set: { status: 'failed', failureReason: err.message } }
+            );
+        } catch (updateErr) {
+            console.error(`❌ Erro ao marcar pedido como failed:`, updateErr.message);
+        }
+        throw err;
+    }
+}
+
+// ============================================
 // EXPORTS
 // ============================================
 module.exports = {
@@ -465,5 +611,6 @@ module.exports = {
     getTransactionStats,
     confirmTransaction,
     failTransaction,
-    creditAirdrop
+    creditAirdrop,
+    creditPurchase
 };
