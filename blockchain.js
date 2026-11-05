@@ -139,7 +139,7 @@ class Block {
                 nonce: tx.nonce,
                 type: tx.type,
                 signature: tx.signature,
-                publicKey: tx.publicKey
+                publicKey: tx.publicKey,
                 tokenData: tx.tokenData || null,
                 metadata: tx.metadata || {}    
             })),
