@@ -61,6 +61,7 @@ if (!/^Br[a-fA-F0-9]{38}$/.test(CONFIG.feeCollectorAddress)) {
 // ============================================
 function normalizeTx(tx) {
     if (!tx) return null;
+    const metadata = tx.metadata || {};
     return {
         hash: tx.hash,
         fromAddress: tx.fromAddress !== undefined ? tx.fromAddress : (tx.from !== undefined ? tx.from : null),
@@ -75,7 +76,8 @@ function normalizeTx(tx) {
         status: tx.status,
         blockIndex: tx.blockIndex,
         blockHash: tx.blockHash,
-        metadata: tx.metadata
+        tokenData: tx.tokenData || metadata.tokenData || null,
+        metadata
     };
 }
 
@@ -138,6 +140,8 @@ class Block {
                 type: tx.type,
                 signature: tx.signature,
                 publicKey: tx.publicKey
+                tokenData: tx.tokenData || null,
+                metadata: tx.metadata || {}    
             })),
             previousHash: this.previousHash,
             hash: this.hash,
@@ -275,18 +279,19 @@ class Blockchain extends EventEmitter {
     // HASH CANÔNICO DA TX
     // ============================================
     calculateTxHash(tx) {
-        const payload = JSON.stringify({
-            from: tx.fromAddress || tx.from || null,
-            to: tx.toAddress || tx.to || null,
-            amount: safeToString(tx.amount),
-            fee: safeToString(tx.fee, '0'),
-            nonce: tx.nonce || 0,
-            type: tx.type || 'transfer',
-            timestamp: safeToString(tx.timestamp),
-            signature: tx.signature || 'system'
-        });
-        return bytesToHex(sha256(utf8ToBytes(payload)));
-    }
+    const payload = JSON.stringify({
+        from: tx.fromAddress || tx.from || null,
+        to: tx.toAddress || tx.to || null,
+        amount: safeToString(tx.amount),
+        fee: safeToString(tx.fee, '0'),
+        nonce: tx.nonce || 0,
+        type: tx.type || 'transfer',
+        timestamp: safeToString(tx.timestamp),
+        signature: tx.signature || 'system',
+        tokenData: tx.tokenData || (tx.metadata && tx.metadata.tokenData) || undefined
+    });
+    return bytesToHex(sha256(utf8ToBytes(payload)));
+}
 
     // ============================================
     // ADICIONAR TRANSAÇÃO À MEMPOOL
@@ -304,11 +309,33 @@ class Blockchain extends EventEmitter {
             transaction.timestamp = new Date().toISOString();
         }
 
+        const TOKEN_TX_TYPES = ['token_create', 'token_transfer'];
+        const isTokenTx = TOKEN_TX_TYPES.includes(transaction.type);
+
         const amount = parseFloat(transaction.amount);
-        if (!Number.isFinite(amount) || amount <= 0) {
+        if (!Number.isFinite(amount) || (amount <= 0 && !isTokenTx)) {
             throw new Error('Valor inválido');
         }
 
+        if (transaction.type === 'token_create') {
+            const td = transaction.tokenData;
+            if (!td || !td.name || !td.symbol || !td.supply) {
+                throw new Error('tokenData incompleto (name/symbol/supply)');
+        }
+        if (parseFloat(td.supply) <= 0) {
+            throw new Error('Supply do token inválido');
+        }
+    }
+    
+if (transaction.type === 'token_transfer') {
+    const td = transaction.tokenData;
+    if (!td || !td.tokenId || !td.amount) {
+        throw new Error('tokenData incompleto (tokenId/amount)');
+    }
+    if (parseFloat(td.amount) <= 0) {
+        throw new Error('Quantidade de token inválida');
+    }
+}
         const fee = parseFloat(transaction.fee || '0');
         if (!Number.isFinite(fee) || fee < 0) {
             throw new Error('Taxa inválida');
@@ -369,9 +396,12 @@ class Blockchain extends EventEmitter {
             publicKey: transaction.publicKey || 'system',
             status: 'pending',
             timestamp: new Date(transaction.timestamp),
-            metadata: transaction.metadata || {}
-        };
-
+            metadata: {
+               ...(transaction.metadata || {}),
+               ...(transaction.tokenData ? { tokenData: transaction.tokenData } : {})
+            }
+    };
+    
         const savedTx = await TransactionModel.create(txData);
         const normalized = normalizeTx(savedTx.toObject());
         this.pendingTransactions.push(normalized);
@@ -380,21 +410,27 @@ class Blockchain extends EventEmitter {
 
         return { hash: savedTx.hash, status: 'pending', message: 'Transação adicionada à fila' };
     }
-
+    
     // ============================================
     // ASSINATURA
     // ============================================
     buildSignableMessage(tx) {
-        return [
-            tx.fromAddress,
-            tx.toAddress,
-            tx.amount.toString(),
-            (tx.fee || '0').toString(),
-            (tx.nonce || 0).toString(),
-            safeToString(tx.timestamp),
-            tx.type || 'transfer'
-        ].join('|');
+    const base = [
+        tx.fromAddress,
+        tx.toAddress,
+        tx.amount.toString(),
+        (tx.fee || '0').toString(),
+        (tx.nonce || 0).toString(),
+        safeToString(tx.timestamp),
+        tx.type || 'transfer'
+    ].join('|');
+
+    const tokenData = tx.tokenData || (tx.metadata && tx.metadata.tokenData);
+    if (tokenData) {
+        return base + `|token:${JSON.stringify(tokenData)}`;
     }
+    return base;
+}
 
     // ============================================
     // RETARGET (busca do Mongo)
@@ -507,75 +543,95 @@ class Blockchain extends EventEmitter {
     // APLICAR TRANSAÇÕES
     // ============================================
     async applyTransactions(transactions) {
-        for (const rawTx of transactions) {
-            try {
-                const tx = normalizeTx(rawTx);
-                const amountStr = safeToString(tx.amount);
-                const feeStr = safeToString(tx.fee, '0');
-                const fromAddr = tx.fromAddress;
-                const toAddr = tx.toAddress;
-                const isSystemTx = !fromAddr;
+    for (const rawTx of transactions) {
+        try {
+            const tx = normalizeTx(rawTx);
+            const amountStr = safeToString(tx.amount);
+            const feeStr = safeToString(tx.fee, '0');
+            const fromAddr = tx.fromAddress;
+            const toAddr = tx.toAddress;
+            const isSystemTx = !fromAddr;
 
-                if (isSystemTx) {
-                    await WalletModel.credit(toAddr, amountStr);
-                    console.log(`💰 Sistema creditou ${amountStr} em ${toAddr.substring(0, 12)}...`);
-                } else {
-                    const totalDebit = (parseFloat(amountStr) + parseFloat(feeStr)).toFixed(8);
-                    await WalletModel.debit(fromAddr, totalDebit);
-                    await WalletModel.credit(toAddr, amountStr);
+            // 1) efeito específico do tipo de token
+            if (tx.type === 'token_create') {
+                await this._applyTokenCreate(tx);
+            } else if (tx.type === 'token_transfer') {
+                await this._applyTokenTransfer(tx);
+            }
 
-                    if (parseFloat(feeStr) > 0) {
-                        try {
-                            await WalletModel.credit(CONFIG.feeCollectorAddress, feeStr);
-                        } catch (e) {
-                            console.error('Erro ao creditar fee:', e.message);
-                        }
+            // 2) efeito monetário (BRD)
+            if (isSystemTx) {
+                await WalletModel.credit(toAddr, amountStr);
+                console.log(`💰 Sistema creditou ${amountStr} em ${toAddr.substring(0, 12)}...`);
+            } else {
+                const totalDebit = (parseFloat(amountStr) + parseFloat(feeStr)).toFixed(8);
+                await WalletModel.debit(fromAddr, totalDebit);
+
+                if (toAddr && toAddr !== fromAddr && parseFloat(amountStr) > 0) {
+                    await WalletModel.credit(toAddr, amountStr);
+                }
+
+                if (parseFloat(feeStr) > 0) {
+                    try {
+                        await WalletModel.credit(CONFIG.feeCollectorAddress, feeStr);
+                    } catch (e) {
+                        console.error('Erro ao creditar fee:', e.message);
                     }
                 }
-            } catch (error) {
-                console.error(`❌ Erro ao aplicar TX ${rawTx.hash}:`, error.message);
-                await TransactionModel.updateOne(
-                    { hash: rawTx.hash },
-                    { $set: { status: 'failed', 'metadata.reason': error.message } }
-                );
             }
+        } catch (error) {
+            console.error(`❌ Erro ao aplicar TX ${rawTx.hash}:`, error.message);
+            await TransactionModel.updateOne(
+                { hash: rawTx.hash },
+                { $set: { status: 'failed', 'metadata.reason': error.message } }
+            );
         }
     }
+}
 
     // ============================================
     // REVERTER TRANSAÇÕES
     // 🆕 [1] usa revertDebit/revertCredit (simétricos ao apply)
     // ============================================
     async _revertTransactions(transactions) {
-        for (const rawTx of [...transactions].reverse()) {
-            try {
-                const tx = normalizeTx(rawTx);
-                const amountStr = safeToString(tx.amount);
-                const feeStr = safeToString(tx.fee, '0');
-                const fromAddr = tx.fromAddress;
-                const toAddr = tx.toAddress;
-                const isSystemTx = !fromAddr;
+    for (const rawTx of [...transactions].reverse()) {
+        try {
+            const tx = normalizeTx(rawTx);
+            const amountStr = safeToString(tx.amount);
+            const feeStr = safeToString(tx.fee, '0');
+            const fromAddr = tx.fromAddress;
+            const toAddr = tx.toAddress;
+            const isSystemTx = !fromAddr;
 
-                if (isSystemTx) {
-                    await WalletModel.revertCredit(toAddr, amountStr);
-                } else {
-                    const totalDebit = (parseFloat(amountStr) + parseFloat(feeStr)).toFixed(8);
-                    await WalletModel.revertCredit(toAddr, amountStr);
-                    await WalletModel.revertDebit(fromAddr, totalDebit);
+            if (tx.type === 'token_create') {
+                await this._revertTokenCreate(tx);
+            } else if (tx.type === 'token_transfer') {
+                await this._revertTokenTransfer(tx);
+            }
 
-                    if (parseFloat(feeStr) > 0) {
-                        try {
-                            await WalletModel.revertCredit(CONFIG.feeCollectorAddress, feeStr);
-                        } catch (e) {
-                            console.error('Erro ao reverter fee:', e.message);
-                        }
+            if (isSystemTx) {
+                await WalletModel.revertCredit(toAddr, amountStr);
+            } else {
+                const totalDebit = (parseFloat(amountStr) + parseFloat(feeStr)).toFixed(8);
+
+                if (toAddr && toAddr !== fromAddr && parseFloat(amountStr) > 0) {
+                    await WalletModel.revertCredit(toAddr, amountStr);
+                }
+                await WalletModel.revertDebit(fromAddr, totalDebit);
+
+                if (parseFloat(feeStr) > 0) {
+                    try {
+                        await WalletModel.revertCredit(CONFIG.feeCollectorAddress, feeStr);
+                    } catch (e) {
+                        console.error('Erro ao reverter fee:', e.message);
                     }
                 }
-            } catch (error) {
-                console.error(`❌ Erro ao reverter TX ${rawTx.hash}:`, error.message);
             }
+        } catch (error) {
+            console.error(`❌ Erro ao reverter TX ${rawTx.hash}:`, error.message);
         }
     }
+}
 
     // ============================================
     // ACEITAR BLOCO VINDO DE PEER
@@ -884,6 +940,122 @@ class Blockchain extends EventEmitter {
         }
         return true;
     }
+
+    // ============================================
+// 🪙 TOKENS — aplicação de estado
+// ============================================
+async _applyTokenCreate(tx) {
+    const TokenModel = require('./models/Token');
+    const { Decimal128 } = mongoose.Schema.Types;
+    const crypto = require('crypto');
+
+    const existing = await TokenModel.findOne({ txHash: tx.hash });
+    if (existing) {
+        if (existing.status !== 'active') {
+            existing.status = 'active';
+            await existing.save();
+        }
+        return existing;
+    }
+
+    const symbolUpper = (tx.tokenData.symbol || '').toUpperCase();
+    const symbolTaken = await TokenModel.findOne({ symbol: symbolUpper });
+    if (symbolTaken) {
+        throw new Error(`Símbolo ${symbolUpper} já existe`);
+    }
+
+    const tokenId = 'BRAD_' + crypto.randomBytes(16).toString('hex');
+    const supply = Decimal128.fromString(tx.tokenData.supply.toString());
+
+    const token = await TokenModel.create({
+        tokenId,
+        name: tx.tokenData.name,
+        symbol: symbolUpper,
+        totalSupply: supply,
+        decimals: parseInt(tx.tokenData.decimals) || 0,
+        creator: tx.fromAddress,
+        txHash: tx.hash,
+        logo: tx.tokenData.logo || null,
+        status: 'active',
+        balances: [{ address: tx.fromAddress, amount: supply }]
+    });
+
+    if (global.io) global.io.emit('token:created', token.toPublic());
+    console.log(`🪙 Token criado: ${token.symbol} (${token.tokenId}) por ${tx.fromAddress}`);
+    return token;
+}
+
+async _applyTokenTransfer(tx) {
+    const TokenModel = require('./models/Token');
+
+    const token = await TokenModel.findOne({ tokenId: tx.tokenData.tokenId });
+    if (!token) throw new Error(`Token ${tx.tokenData.tokenId} não encontrado`);
+    if (token.status !== 'active') throw new Error(`Token ${token.symbol} congelado`);
+
+    const amountNum = parseFloat(tx.tokenData.amount);
+    const fromBal = token.getBalance(tx.fromAddress);
+    if (fromBal < amountNum) {
+        throw new Error(`Saldo de ${token.symbol} insuficiente: ${fromBal} < ${amountNum}`);
+    }
+
+    token.setBalance(tx.fromAddress, fromBal - amountNum);
+    token.setBalance(tx.toAddress, token.getBalance(tx.toAddress) + amountNum);
+    await token.save();
+
+    if (global.io) {
+        global.io.emit('token:transferred', {
+            tokenId: token.tokenId,
+            symbol: token.symbol,
+            from: tx.fromAddress,
+            to: tx.toAddress,
+            amount: amountNum,
+            txHash: tx.hash
+        });
+    }
+    console.log(`🪙 Token transferido: ${amountNum} ${token.symbol}`);
+    return token;
+}
+
+async _revertTokenCreate(tx) {
+    const TokenModel = require('./models/Token');
+    const deleted = await TokenModel.deleteOne({ txHash: tx.hash });
+    if (deleted.deletedCount > 0) {
+        console.log(`↩️  Token revertido: txHash=${tx.hash.substring(0, 12)}...`);
+        if (global.io) global.io.emit('token:reverted', { txHash: tx.hash });
+    }
+}
+
+async _revertTokenTransfer(tx) {
+    const TokenModel = require('./models/Token');
+    const token = await TokenModel.findOne({ tokenId: tx.tokenData.tokenId });
+    if (!token) {
+        console.warn(`⚠️  Revertendo transferência de token inexistente: ${tx.tokenData.tokenId}`);
+        return;
+    }
+
+    const amountNum = parseFloat(tx.tokenData.amount);
+    const toBal = token.getBalance(tx.toAddress);
+    if (toBal < amountNum) {
+        console.error(`🚨 Revert: saldo insuficiente em ${tx.toAddress} para ${amountNum} ${token.symbol}`);
+        return;
+    }
+
+    token.setBalance(tx.toAddress, toBal - amountNum);
+    token.setBalance(tx.fromAddress, token.getBalance(tx.fromAddress) + amountNum);
+    await token.save();
+
+    if (global.io) {
+        global.io.emit('token:reverted', {
+            tokenId: token.tokenId,
+            symbol: token.symbol,
+            from: tx.fromAddress,
+            to: tx.toAddress,
+            amount: amountNum,
+            txHash: tx.hash
+        });
+    }
+    console.log(`↩️  Transferência de token revertida: ${amountNum} ${token.symbol}`);
+}
 
     // ============================================
     // LIMPEZA
