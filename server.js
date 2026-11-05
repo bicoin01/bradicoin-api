@@ -1293,12 +1293,23 @@ async function initialize() {
         await wallet.initialize();
         await transactions.initialize();
 
-        const p2pResult = await startP2P({
-            blockchain,
-            port: parseInt(process.env.P2P_PORT) || 4001
-        });
-        p2pNode = p2pResult.node;
-        logger.info(`🌐 P2P rodando (PeerID: ${p2pNode.peerId.toString()})`);
+
+        if (process.env.P2P_ENABLED !== 'false') {
+            try {
+                const p2pResult = await startP2P({
+                    blockchain,
+                    port: parseInt(process.env.P2P_PORT) || 4001
+                });
+                p2pNode = p2pResult.node;
+                logger.info(`🌐 P2P rodando (PeerID: ${p2pNode.peerId.toString()})`);
+            } catch (p2pErr) {
+                logger.error('⚠️ P2P falhou ao iniciar (continuando sem P2P):', p2pErr.message);
+                p2pNode = null;
+            }
+        } else {
+            logger.warn('⚠️ P2P desativado (P2P_ENABLED=false)');
+            p2pNode = null;
+        }
 
         try {
             const { initGossip, orderBook } = require('./atomic-swap/negotiation');
