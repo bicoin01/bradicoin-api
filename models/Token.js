@@ -1,37 +1,53 @@
 // models/Token.js
 const mongoose = require('mongoose');
+const { Decimal128 } = mongoose.Schema.Types;
 
-const TokenSchema = new mongoose.Schema(
-    {
-        ownerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
-        ownerAddress: { type: String, required: true, lowercase: true, index: true },
-        name: { type: String, required: true, trim: true, maxlength: 64 },
-        symbol: { type: String, required: true, uppercase: true, trim: true, maxlength: 10 },
-        supply: { type: Number, required: true, min: 1 },
-        price: { type: Number, default: 1.5 },
-        logo: { type: String, default: null },
-        description: { type: String, default: '', maxlength: 500 },
-        listed: { type: Boolean, default: true, index: true },
-        mintFee: { type: Number, default: 0.016 },
-        txHash: { type: String, default: null }
-    },
-    { timestamps: true }
-);
+const TokenSchema = new mongoose.Schema({
+    tokenId:     { type: String, required: true, unique: true, index: true },
+    name:        { type: String, required: true, maxlength: 64 },
+    symbol:      { type: String, required: true, uppercase: true, maxlength: 16, index: true },
+    totalSupply: { type: Decimal128, required: true },
+    decimals:    { type: Number, default: 0, min: 0, max: 18 },
+    creator:     { type: String, required: true, index: true },
+    txHash:      { type: String, required: true, unique: true },
+    logo:        { type: String, default: null },
+    status:      { type: String, enum: ['active', 'frozen'], default: 'active' },
 
-TokenSchema.index({ symbol: 1 }, { unique: true });
+    balances: [{
+        address: { type: String, required: true },
+        amount:  { type: Decimal128, required: true, default: 0 }
+    }],
 
-TokenSchema.methods.toPublic = function () {
+    createdAt:   { type: Date, default: Date.now }
+}, { timestamps: true });
+
+TokenSchema.index({ 'balances.address': 1 });
+TokenSchema.index({ status: 1, createdAt: -1 });
+
+TokenSchema.methods.getBalance = function(address) {
+    const entry = this.balances.find(b => b.address === address);
+    return entry ? parseFloat(entry.amount.toString()) : 0;
+};
+
+TokenSchema.methods.setBalance = function(address, newAmount) {
+    const idx = this.balances.findIndex(b => b.address === address);
+    const value = Decimal128.fromString(newAmount.toString());
+    if (idx >= 0) this.balances[idx].amount = value;
+    else this.balances.push({ address, amount: value });
+};
+
+TokenSchema.methods.toPublic = function() {
     return {
-        id: this._id,
+        tokenId: this.tokenId,
         name: this.name,
         symbol: this.symbol,
-        supply: this.supply,
-        price: this.price,
-        logo: this.logo,
-        description: this.description,
-        ownerAddress: this.ownerAddress,
-        listed: this.listed,
+        totalSupply: this.totalSupply.toString(),
+        decimals: this.decimals,
+        creator: this.creator,
         txHash: this.txHash,
+        logo: this.logo,
+        status: this.status,
+        holders: this.balances.filter(b => parseFloat(b.amount.toString()) > 0).length,
         createdAt: this.createdAt
     };
 };
