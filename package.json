@@ -22,7 +22,7 @@
     "swap:sdk": "node scripts/test-sdk.js"
   },
   "dependencies": {
-    "@noble/hashes": "2.0.1",
+    "@noble/hashes": "1.8.0",
     "@noble/secp256k1": "2.0.0",
     "axios": "^1.7.7",
     "bcryptjs": "^2.4.3",
@@ -50,7 +50,7 @@
     "winston": "^3.14.2"
   },
   "overrides": {
-    "@noble/hashes": "2.0.1"
+    "@noble/hashes": "1.8.0",
   },
   "devDependencies": {
     "jest": "^29.7.0",
