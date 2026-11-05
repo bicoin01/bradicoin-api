@@ -60,7 +60,6 @@ if (process.env.JWT_SECRET.length < 32) {
 // ============================================
 // IMPORTAÇÕES LOCAIS
 // ============================================
-const { startP2P, stopP2P } = require('./p2p');
 const blockchain = require('./blockchain');
 const wallet = require('./wallet');
 const transactions = require('./transactions');
@@ -1293,9 +1292,10 @@ async function initialize() {
         await wallet.initialize();
         await transactions.initialize();
 
-
+        // 🌐 P2P — opcional (desativado com P2P_ENABLED=false)
         if (process.env.P2P_ENABLED !== 'false') {
             try {
+                const { startP2P } = require('./p2p');
                 const p2pResult = await startP2P({
                     blockchain,
                     port: parseInt(process.env.P2P_PORT) || 4001
@@ -1311,22 +1311,27 @@ async function initialize() {
             p2pNode = null;
         }
 
-        try {
-            const { initGossip, orderBook } = require('./atomic-swap/negotiation');
+        // 📡 SwapGossip (só se P2P estiver ativo)
+        if (p2pNode) {
+            try {
+                const { initGossip, orderBook } = require('./atomic-swap/negotiation');
 
-            await orderBook.loadFromMongo();
-            orderBook.startCleanup();
+                await orderBook.loadFromMongo();
+                orderBook.startCleanup();
 
-            initGossip({
-                node: p2pNode,
-                peerId: p2pNode.peerId.toString(),
-                privateKey: process.env.SWAP_PRIVATE_KEY || null,
-                publicKey: process.env.SWAP_PUBLIC_KEY || null
-            });
+                initGossip({
+                    node: p2pNode,
+                    peerId: p2pNode.peerId.toString(),
+                    privateKey: process.env.SWAP_PRIVATE_KEY || null,
+                    publicKey: process.env.SWAP_PUBLIC_KEY || null
+                });
 
-            logger.info('📡 SwapGossip P2P inicializado');
-        } catch (e) {
-            logger.error('❌ Erro ao inicializar SwapGossip:', e.message);
+                logger.info('📡 SwapGossip P2P inicializado');
+            } catch (e) {
+                logger.error('❌ Erro ao inicializar SwapGossip:', e.message);
+            }
+        } else {
+            logger.warn('⚠️ SwapGossip ignorado (sem P2P)');
         }
 
         const { ReserveModel } = require('./models/Reserve');
@@ -1356,7 +1361,6 @@ async function initialize() {
         process.exit(1);
     }
 }
-
 // ============================================
 // ERROS NÃO TRATADOS
 // ============================================
@@ -1381,7 +1385,10 @@ async function shutdown(signal) {
     if (checkpointInterval) clearInterval(checkpointInterval);
 
     try {
-        if (p2pNode) await stopP2P(p2pNode);
+        if (p2pNode) {
+            const { stopP2P } = require('./p2p');
+            await stopP2P(p2pNode);
+        }
     } catch (e) {
         logger.error('Erro ao parar P2P:', e.message);
     }
