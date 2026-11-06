@@ -19,7 +19,7 @@
 
 const mongoose = require('mongoose');
 const { EventEmitter } = require('events');
-const { Decimal128 } = mongoose.Schema.Types;
+const Decimal128 = mongoose.Types.Decimal128;
 
 const { sha256 } = require('@noble/hashes/sha2');
 const { bytesToHex, utf8ToBytes } = require('@noble/hashes/utils');
