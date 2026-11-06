@@ -7,7 +7,7 @@ const crypto = require('crypto');
 const blockchain = require('./blockchain');
 const wallet = require('./wallet');
 const staking = require('./staking');
-const { WalletModel } = require('./wallet');
+const WalletModel = require('./models/Wallet');
 
 // ============================================
 // INICIALIZAR
