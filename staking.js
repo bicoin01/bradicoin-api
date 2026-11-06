@@ -32,8 +32,6 @@ const StakeModel = mongoose.model('Stake', StakeSchema);
 // ============================================
 async function initialize() {
     if (mongoose.connection.readyState === 0) {
-        await mongoose.connect(process.env.MONGODB_URI);
-    }
     await StakeModel.init();
     console.log('✅ Staking inicializado');
 }
