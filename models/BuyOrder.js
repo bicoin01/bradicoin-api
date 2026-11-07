@@ -74,17 +74,71 @@ const buyOrderSchema = new mongoose.Schema(
             index: true
         },
 
-        // Endereço de depósito (BTC/ETH/etc)
-        // ⚠️ Na Fase 1 é fake. Na Fase 2 vem do config.
+        // Gerado por pedido via HD wallet (services/buy/depositAddress.js)
         depositAddress: {
             type: String,
             required: true
         },
 
+        // ============================================
+        // 🆕 FASE 1 — campos pra monitores v2
+        // ============================================
+
+        // Índice HD usado pra derivar o depositAddress
+        // (1000–9999, definido em BUY_HD_INDEX_START/END)
+        depositIndex: {
+            type: Number,
+            default: null,
+            index: true,
+            sparse: true
+        },
+
+        // Rede de pagamento (pra distinguir USDT-BEP20 de USDT-ERC20)
+        //   BTC     → 'bitcoin'
+        //   ETH     → 'ethereum'
+        //   BNB     → 'bsc'
+        //   SOL     → 'solana'
+        //   USDT    → 'bsc' | 'ethereum' | 'tron' | 'solana'
+        paymentNetwork: {
+            type: String,
+            enum: ['bitcoin', 'ethereum', 'solana', 'bsc', 'tron', null],
+            default: null,
+            index: true
+        },
+
+        // Valor exato esperado (em string pra suportar sats/wei/lamports)
+        //   BTC   → sats (ex: "15000")
+        //   ETH   → wei  (ex: "10000000000000000")
+        //   BNB   → wei
+        //   USDT  → unidades base (6 decimais ETH, 18 BSC)
+        //   SOL   → lamports (ex: "100000000")
+        expectedPaymentAmount: {
+            type: String,
+            default: null
+        },
+
+        // Valor efetivamente recebido (na mesma unidade de expectedPaymentAmount)
+        paymentAmount: {
+            type: String,
+            default: null
+        },
+
+        // Bloco da tx na blockchain de pagamento
+        paymentBlock: {
+            type: Number,
+            default: null
+        },
+
+        // Quando o pagamento foi detectado pela primeira vez
+        detectedAt: {
+            type: Date,
+            default: null
+        },
+        
         // Status do pedido
         status: {
             type: String,
-            enum: ['pending', 'paid', 'credited', 'expired', 'failed'],
+            enum: ['pending', 'detected', 'paid', 'crediting', 'credited', 'expired', 'failed'],
             default: 'pending',
             index: true
         },
@@ -167,6 +221,15 @@ buyOrderSchema.index({ userId: 1, createdAt: -1 });
 buyOrderSchema.index({ status: 1, currency: 1 });
 buyOrderSchema.index({ status: 1, expiresAt: 1 });
 
+// 🆕 Dedupe de pagamento (evita creditar 2x a mesma tx)
+buyOrderSchema.index(
+    { paymentTxHash: 1 },
+    { unique: true, sparse: true }
+);
+
+// 🆕 Busca rápida por rede + status (usado pelos monitores)
+buyOrderSchema.index({ currency: 1, paymentNetwork: 1, status: 1 });
+
 // ============================================
 // MÉTODOS DE INSTÂNCIA
 // ============================================
@@ -188,16 +251,21 @@ buyOrderSchema.methods.toPublic = function () {
     return {
         orderId: this.orderId,
         currency: this.currency,
+        paymentNetwork: this.paymentNetwork,                  // 🆕
         amountBr: this.amountBr.toString(),
         amountUsd: this.amountUsd,
         priceAtOrder: this.priceAtOrder,
         toWallet: this.toWallet,
         depositAddress: this.depositAddress,
+        expectedPaymentAmount: this.expectedPaymentAmount,
+        paymentAmount: this.paymentAmount,
+        paymentBlock: this.paymentBlock,
         status: this.status,
         paymentTxHash: this.paymentTxHash,
         paymentConfirmations: this.paymentConfirmations,
         creditTxHash: this.creditTxHash,
         createdAt: this.createdAt,
+        detectedAt: this.detectedAt,
         paidAt: this.paidAt,
         creditedAt: this.creditedAt,
         expiresAt: this.expiresAt
