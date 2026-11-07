@@ -27,14 +27,16 @@ const PRICE_BRD_USD = 10;
 const PRICE_PAYMENT_USD = {
     BNB: 600,
     ETH: 3000,
-    USDT: 1
+    USDT: 1,
+    SOL: 150,
 };
 
 // Redes permitidas por moeda (Fase 1: só EVM/BSC)
 const ALLOWED_NETWORKS = {
     BNB:  ['bsc'],
     ETH:  ['ethereum'],
-    USDT: ['bsc', 'ethereum']
+    USDT: ['bsc', 'ethereum'],
+    SOL:  ['solana'],
 };
 
 // Decimais por moeda pra converter valor esperado
@@ -42,8 +44,19 @@ const PAYMENT_DECIMALS = {
     BNB: 18,
     ETH: 18,
     USDT_BSC: 18,       // BEP-20 USDT usa 18 decimals
-    USDT_ETH: 6         // ERC-20 USDT usa 6 decimals ⚠️ diferente!
+    USDT_ETH: 6,         // ERC-20 USDT usa 6 decimals ⚠️ diferente!
+    SOL: 9,
 };
+
+function networkLabel(currency, network) {
+    if (currency === 'USDT') {
+        return network === 'bsc' ? 'BSC (BEP-20)' : 'Ethereum (ERC-20)';
+    }
+    if (currency === 'BNB') return 'BSC (BEP-20)';
+    if (currency === 'ETH') return 'Ethereum';
+    if (currency === 'SOL') return 'Solana';
+    return network;
+}
 
 // ============================================
 // HELPERS
@@ -70,7 +83,17 @@ function calcExpectedPaymentAmount(currency, network, amountUsd) {
 
     // amountUsd = quantos dólares o usuário vai pagar
     const amountPayment = amountUsd / priceUsd;
-
+    
+    // ===== SOL: lamports (9 decimais) =====
+    if (currency === 'SOL') {
+        const lamports = BigInt(Math.round(amountPayment * 1e9));
+        return {
+            amountPayment: amountPayment.toString(),
+            baseUnits: lamports.toString(),
+            decimals: 9
+        };
+    }
+    
     let decimals;
     if (currency === 'USDT') {
         decimals = network === 'bsc' ? PAYMENT_DECIMALS.USDT_BSC : PAYMENT_DECIMALS.USDT_ETH;
@@ -121,7 +144,7 @@ async function createOrder(req, res) {
 
         // Rede válida?
         if (!ALLOWED_NETWORKS[c]) {
-            return badRequest(res, `currency '${c}' não suportada na Fase 1 (use BNB, ETH ou USDT)`);
+            return badRequest(res, `currency '${c}' não suportada (use BNB, ETH, USDT ou SOL)`);
         }
         if (!n || !ALLOWED_NETWORKS[c].includes(n)) {
             return badRequest(
@@ -243,7 +266,7 @@ async function createOrder(req, res) {
                     sendExactly: `${expected.amountPayment} ${c}${c === 'USDT' ? ` (${n.toUpperCase()})` : ''}`,
                     toAddress: order.depositAddress,
                     network: n,
-                    warning: `Envie APENAS ${c} ${n === 'bsc' ? 'na rede BSC (BEP-20)' : 'na rede Ethereum (ERC-20)'}. Outra rede = perda total.`
+                    warning: `Envie APENAS ${c}${c === 'USDT' ? ` (${n.toUpperCase()})` : ''} na rede ${networkLabel(c, n)}. Outra rede = perda total.`
                 }
             }
         });
