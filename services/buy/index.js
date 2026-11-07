@@ -99,7 +99,7 @@ async function startBuyWorkers({ io } = {}) {
     evmMonitor.start();
     usdtMonitor.start();
     solMonitor.start();
-    binanceMonitor.stop();
+    binanceMonitor.start();
     
     // Inicia creditWorker
     if (!creditInterval) {
