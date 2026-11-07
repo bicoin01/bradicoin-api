@@ -1,14 +1,5 @@
 // services/buy/monitors/binanceMonitor.js
-// ============================================
-// Monitor de pagamentos Binance Chain (BNB + BEP-20)
-// ============================================
-// Monitora:
-//   1. BNB nativo (envio direto pro endereço de depósito)
-//   2. USDT BEP-20 (contrato 0x55d3...)
-//
-// Se BUY_BNB_ADDRESS não estiver no .env, desativa.
-// Se BUY_USDT_BNB_ADDRESS não estiver no .env, desativa só o USDT-BEP20.
-//
+// v2 — rastreia TX (não saldo), com confirmações reais e dedupe por txHash
 // ============================================
 
 const { ethers } = require('ethers');
@@ -16,247 +7,305 @@ const BuyOrder = require('../../../models/BuyOrder');
 const { logger } = require('../../../middleware/error');
 
 // ===== CONFIG =====
-const BNB_ADDRESS = process.env.BUY_BNB_ADDRESS || null;
-const BNB_RPC = process.env.BUY_BNB_RPC || 'https://bsc-dataseed.binance.org';
-const BNB_CONFIRMATIONS = parseInt(process.env.BUY_BNB_CONFIRMATIONS || '15');
+const BNB_ADDRESS        = process.env.BUY_BNB_ADDRESS || null;
+const BNB_RPC            = process.env.BUY_BNB_RPC || 'https://bsc-dataseed.binance.org';
+const BNB_RPC_FALLBACK   = process.env.BUY_BNB_RPC_FALLBACK || 'https://bsc-dataseed1.defibit.io';
+const BNB_CONFIRMATIONS  = parseInt(process.env.BUY_BNB_CONFIRMATIONS || '15');
 
-const USDT_BNB_ADDRESS = process.env.BUY_USDT_BNB_ADDRESS || null;
-const USDT_BNB_CONTRACT = process.env.BUY_USDT_CONTRACT_BNB || '0x55d398326f99059fF775485246999027B3197955';
-const USDT_CONFIRMATIONS = parseInt(process.env.BUY_USDT_BNB_CONFIRMATIONS || '15');
+const USDT_BNB_ADDRESS      = process.env.BUY_USDT_BNB_ADDRESS || null;
+const USDT_BNB_CONTRACT     = process.env.BUY_USDT_CONTRACT_BNB || '0x55d398326f99059fF775485246999027B3197955';
+const USDT_CONFIRMATIONS    = parseInt(process.env.BUY_USDT_BNB_CONFIRMATIONS || '15');
 
-const POLL_INTERVAL_MS = 30 * 1000; // 30 segundos
+const POLL_INTERVAL_MS   = 30 * 1000;
+const MAX_BLOCKS_PER_POLL = 200; // evita varrer 1000 blocos de uma vez
+const LOOKBACK_BLOCKS    = 100;  // no boot, começa N blocos atrás
 
-// ===== ABI MÍNIMA ERC-20 =====
 const ERC20_ABI = [
-    'event Transfer(address indexed from, address indexed to, uint256 value)',
-    'function balanceOf(address) view returns (uint256)',
-    'function decimals() view returns (uint8)'
+  'event Transfer(address indexed from, address indexed to, uint256 value)',
+  'function decimals() view returns (uint8)'
 ];
 
 // ===== ESTADO =====
 let provider = null;
 let usdtContract = null;
-let usdtDecimals = null;
+let usdtDecimals = 18n;
 let intervalHandle = null;
 let isRunning = false;
 
+// Último bloco processado por rede (BNB Chain é uma só, então 1 chave)
+let lastProcessedBlock = null;
+
 // ============================================
-// INICIALIZA PROVIDER
+// PROVIDER
 // ============================================
 function getProvider() {
-    if (!provider) {
-        provider = new ethers.JsonRpcProvider(BNB_RPC, {
-            chainId: 56,
-            name: 'bsc'
-        }, {
-            staticNetwork: true
-        });
-    }
-    return provider;
+  if (!provider) {
+    provider = new ethers.JsonRpcProvider(
+      BNB_RPC,
+      { chainId: 56, name: 'bsc' },
+      { staticNetwork: true }
+    );
+    // fallback simples: se o provider atual falhar, troca
+    provider.on?.('error', () => {
+      logger.warn('[binanceMonitor] RPC primário falhou, usando fallback');
+      provider = new ethers.JsonRpcProvider(
+        BNB_RPC_FALLBACK,
+        { chainId: 56, name: 'bsc' },
+        { staticNetwork: true }
+      );
+    });
+  }
+  return provider;
 }
 
 async function getUsdtContract() {
-    if (!usdtContract) {
-        usdtContract = new ethers.Contract(USDT_BNB_CONTRACT, ERC20_ABI, getProvider());
-        try {
-            usdtDecimals = await usdtContract.decimals();
-        } catch (_) {
-            usdtDecimals = 18n; // BEP-20 USDT da Binance usa 18 decimals
-        }
-    }
-    return usdtContract;
+  if (!usdtContract) {
+    usdtContract = new ethers.Contract(USDT_BNB_CONTRACT, ERC20_ABI, getProvider());
+    try { usdtDecimals = await usdtContract.decimals(); }
+    catch { usdtDecimals = 18n; }
+  }
+  return usdtContract;
 }
 
 // ============================================
-// VERIFICA SALDO BNB NATIVO
+// HELPERS
 // ============================================
-async function checkBnbNativeOrders() {
-    if (!BNB_ADDRESS) return;
+async function getLastBlock() {
+  const p = getProvider();
+  const current = await p.getBlockNumber();
+  if (lastProcessedBlock === null) {
+    lastProcessedBlock = Math.max(0, current - LOOKBACK_BLOCKS);
+    logger.info(`[binanceMonitor] boot — começando do bloco ${lastProcessedBlock} (atual ${current})`);
+  }
+  return current;
+}
 
+function normalizeAddress(a) {
+  try { return ethers.getAddress(a); } catch { return null; }
+}
+
+// ============================================
+// BNB NATIVO — rastreia tx.to == depositAddress
+// ============================================
+async function scanBnbNative(fromBlock, toBlock) {
+  if (!BNB_ADDRESS) return;
+
+  const p = getProvider();
+
+  // Busca pedidos pendentes (ou detectados aguardando confirmação)
+  const orders = await BuyOrder.find({
+    paymentCurrency: 'BNB',
+    status: { $in: ['pending', 'detected'] }
+  }).limit(50);
+
+  if (orders.length === 0) return;
+
+  const byAddress = new Map();
+  for (const o of orders) {
+    const addr = normalizeAddress(o.depositAddress);
+    if (!addr) continue;
+    if (!byAddress.has(addr)) byAddress.set(addr, []);
+    byAddress.get(addr).push(o);
+  }
+
+  for (let bn = fromBlock; bn <= toBlock; bn++) {
+    let block;
+    try { block = await p.getBlock(bn, true); } catch { continue; }
+    if (!block || !block.transactions) continue;
+
+    for (const tx of block.transactions) {
+      // tx.to é o destinatário (contrato ou EOA)
+      if (!tx.to) continue;
+      const to = normalizeAddress(tx.to);
+      if (!to || !byAddress.has(to)) continue;
+
+      // BNB nativo = tx.value > 0 e tx.to == endereço
+      if (!tx.value || tx.value === 0n) continue;
+
+      const matchedOrders = byAddress.get(to);
+      for (const order of matchedOrders) {
+        const valueBnb = parseFloat(ethers.formatEther(tx.value));
+        await registerPayment(order, {
+          txHash: tx.hash,
+          amount: valueBnb,
+          currency: 'BNB',
+          blockNumber: bn,
+          requiredConfirmations: BNB_CONFIRMATIONS
+        });
+      }
+    }
+  }
+}
+
+// ============================================
+// USDT BEP-20 — rastreia evento Transfer
+// ============================================
+async function scanUsdtBep20(fromBlock, toBlock) {
+  if (!USDT_BNB_ADDRESS) return;
+
+  const contract = await getUsdtContract();
+  const decimals = usdtDecimals ?? 18n;
+
+  const orders = await BuyOrder.find({
+    paymentCurrency: 'USDT_BEP20',
+    status: { $in: ['pending', 'detected'] }
+  }).limit(50);
+
+  if (orders.length === 0) return;
+
+  // Endereço de depósito → pedidos
+  const byAddress = new Map();
+  for (const o of orders) {
+    const addr = normalizeAddress(o.depositAddress);
+    if (!addr) continue;
+    if (!byAddress.has(addr)) byAddress.set(addr, []);
+    byAddress.get(addr).push(o);
+  }
+
+  // Lista de endereços únicos (filtro `to` do evento)
+  const targets = Array.from(byAddress.keys());
+  if (targets.length === 0) return;
+
+  // Chunk de blocos pra evitar `queryFilter` pesado
+  for (let bn = fromBlock; bn <= toBlock; bn += MAX_BLOCKS_PER_POLL) {
+    const end = Math.min(bn + MAX_BLOCKS_PER_POLL - 1, toBlock);
+
+    let events;
     try {
-        const orders = await BuyOrder.find({
-            currency: 'BNB',
-            status: 'pending',
-            expiresAt: { $gt: new Date() }
-        }).limit(50);
-
-        if (orders.length === 0) return;
-
-        logger.info(`🔍 BNB: checando ${orders.length} pedido(s) pending`);
-
-        const p = getProvider();
-
-        for (const order of orders) {
-            try {
-                // Confere se o endereço de depósito é válido
-                if (!ethers.isAddress(order.depositAddress)) {
-                    logger.warn(`⚠️ Endereço BNB inválido: ${order.depositAddress}`);
-                    continue;
-                }
-
-                const balanceWei = await p.getBalance(order.depositAddress);
-
-                if (balanceWei === 0n) continue;
-
-                const balanceBnb = parseFloat(ethers.formatEther(balanceWei));
-
-                // ⚠️ Verificação mínima: BNB chegou. Para produção,
-                //    você compararia com um valor mínimo esperado.
-                logger.info(`💰 BNB recebido em ${order.depositAddress}: ${balanceBnb} BNB`);
-
-                // Marca como pago
-                const updated = await BuyOrder.findOneAndUpdate(
-                    { orderId: order.orderId, status: 'pending' },
-                    {
-                        $set: {
-                            status: 'paid',
-                            paidAt: new Date(),
-                            paymentTxHash: `bnb_balance_${balanceWei.toString()}`,
-                            paymentConfirmations: BNB_CONFIRMATIONS
-                        }
-                    },
-                    { new: true }
-                );
-
-                if (updated) {
-                    logger.info(`✅ BNB pago: ${order.orderId} (${balanceBnb} BNB)`);
-                }
-            } catch (err) {
-                logger.warn(`⚠️ Erro BNB ${order.orderId}: ${err.message}`);
-            }
-        }
+      events = await contract.queryFilter(
+        contract.filters.Transfer(null, targets),
+        bn,
+        end
+      );
     } catch (err) {
-        logger.error(`❌ binanceMonitor BNB nativo erro: ${err.message}`);
+      logger.warn(`[binanceMonitor] queryFilter USDT ${bn}-${end}: ${err.message}`);
+      continue;
     }
+
+    for (const ev of events) {
+      const to = normalizeAddress(ev.args.to);
+      const matchedOrders = byAddress.get(to);
+      if (!matchedOrders) continue;
+
+      const amount = parseFloat(ethers.formatUnits(ev.args.value, decimals));
+      for (const order of matchedOrders) {
+        await registerPayment(order, {
+          txHash: ev.transactionHash,
+          amount,
+          currency: 'USDT_BEP20',
+          blockNumber: ev.blockNumber,
+          requiredConfirmations: USDT_CONFIRMATIONS
+        });
+      }
+    }
+  }
 }
 
 // ============================================
-// VERIFICA SALDO USDT BEP-20
+// REGISTRA PAGAMENTO (dedupe + confirmações)
 // ============================================
-async function checkUsdtBep20Orders() {
-    if (!USDT_BNB_ADDRESS) return;
+async function registerPayment(order, info) {
+  try {
+    const currentBlock = await getProvider().getBlockNumber();
+    const confirmations = Math.max(0, currentBlock - info.blockNumber);
+    const isPaid = confirmations >= info.requiredConfirmations;
 
-    try {
-        // Busca pedidos que o usuário escolheu pagar com USDT (na BNB)
-        const orders = await BuyOrder.find({
-            currency: 'USDT',
-            status: 'pending',
-            expiresAt: { $gt: new Date() }
-        }).limit(50);
+    // Dedupe: só atualiza se ainda não tem esse txHash registrado
+    const filter = { orderId: order.orderId, paymentTxHash: { $ne: info.txHash } };
+    const update = {
+      $set: {
+        paymentTxHash: info.txHash,
+        paymentAmount: info.amount,
+        paymentCurrency: info.currency,
+        paymentBlock: info.blockNumber,
+        paymentConfirmations: confirmations,
+        detectedAt: order.detectedAt || new Date(),
+        status: isPaid ? 'paid' : 'detected'
+      }
+    };
+    if (isPaid) update.$set.paidAt = new Date();
 
-        if (orders.length === 0) return;
+    const updated = await BuyOrder.findOneAndUpdate(filter, update, { new: true });
 
-        // Filtra só os que têm depositAddress BEP-20 configurado
-        const validOrders = orders.filter(o => 
-            ethers.isAddress(o.depositAddress)
-        );
-
-        if (validOrders.length === 0) return;
-
-        logger.info(`🔍 USDT-BEP20: checando ${validOrders.length} pedido(s)`);
-
-        const contract = await getUsdtContract();
-        const decimals = usdtDecimals ?? 18n;
-
-        for (const order of validOrders) {
-            try {
-                const balance = await contract.balanceOf(order.depositAddress);
-
-                if (balance === 0n) continue;
-
-                const balanceUsdt = parseFloat(
-                    ethers.formatUnits(balance, decimals)
-                );
-
-                logger.info(`💰 USDT-BEP20 recebido em ${order.depositAddress}: ${balanceUsdt} USDT`);
-
-                const updated = await BuyOrder.findOneAndUpdate(
-                    { orderId: order.orderId, status: 'pending' },
-                    {
-                        $set: {
-                            status: 'paid',
-                            paidAt: new Date(),
-                            paymentTxHash: `usdt_bep20_${balance.toString()}`,
-                            paymentConfirmations: USDT_CONFIRMATIONS
-                        }
-                    },
-                    { new: true }
-                );
-
-                if (updated) {
-                    logger.info(`✅ USDT-BEP20 pago: ${order.orderId} (${balanceUsdt} USDT)`);
-                }
-            } catch (err) {
-                logger.warn(`⚠️ Erro USDT-BEP20 ${order.orderId}: ${err.message}`);
-            }
-        }
-    } catch (err) {
-        logger.error(`❌ binanceMonitor USDT-BEP20 erro: ${err.message}`);
+    if (updated) {
+      if (isPaid) {
+        logger.info(`✅ ${info.currency} PAGO: ${order.orderId} — ${info.amount} (tx ${info.txHash.slice(0, 10)}… ${confirmations} conf)`);
+      } else {
+        logger.info(`⏳ ${info.currency} detectado: ${order.orderId} — ${info.amount} (${confirmations}/${info.requiredConfirmations} conf)`);
+      }
     }
+    // se updated == null, era duplicata ou já pago — ignora silenciosamente
+  } catch (err) {
+    logger.warn(`[binanceMonitor] registerPayment ${order.orderId}: ${err.message}`);
+  }
 }
 
 // ============================================
-// LOOP PRINCIPAL
+// LOOP
 // ============================================
 async function poll() {
-    if (isRunning) return;
-    isRunning = true;
+  if (isRunning) return;
+  isRunning = true;
 
-    try {
-        // Roda os dois em sequência pra não sobrecarregar o RPC
-        await checkBnbNativeOrders();
-        await checkUsdtBep20Orders();
-    } catch (err) {
-        logger.error(`❌ binanceMonitor poll erro: ${err.message}`);
-    } finally {
-        isRunning = false;
+  try {
+    const currentBlock = await getLastBlock();
+
+    if (lastProcessedBlock === null || currentBlock <= lastProcessedBlock) return;
+
+    // Limita quantos blocos varremos por poll
+    const fromBlock = lastProcessedBlock + 1;
+    const toBlock = Math.min(currentBlock, fromBlock + MAX_BLOCKS_PER_POLL - 1);
+
+    // Só loga se houver algo pendente
+    const pendingCount = await BuyOrder.countDocuments({
+      paymentCurrency: { $in: ['BNB', 'USDT_BEP20'] },
+      status: { $in: ['pending', 'detected'] }
+    });
+    if (pendingCount === 0) {
+      lastProcessedBlock = toBlock;
+      return;
     }
+
+    logger.debug?.(`[binanceMonitor] poll bloco ${fromBlock}→${toBlock} (${pendingCount} pendentes)`);
+
+    if (BNB_ADDRESS)      await scanBnbNative(fromBlock, toBlock);
+    if (USDT_BNB_ADDRESS) await scanUsdtBep20(fromBlock, toBlock);
+
+    lastProcessedBlock = toBlock;
+  } catch (err) {
+    logger.error(`[binanceMonitor] poll erro: ${err.message}`);
+  } finally {
+    isRunning = false;
+  }
 }
 
 // ============================================
-// START/STOP
+// START / STOP
 // ============================================
 function start() {
-    const hasBnb = !!BNB_ADDRESS;
-    const hasUsdt = !!USDT_BNB_ADDRESS;
+  const hasBnb = !!BNB_ADDRESS;
+  const hasUsdt = !!USDT_BNB_ADDRESS;
 
-    if (!hasBnb && !hasUsdt) {
-        logger.info('⚠️ binanceMonitor DESATIVADO (BUY_BNB_ADDRESS e BUY_USDT_BNB_ADDRESS não configurados)');
-        return;
-    }
+  if (!hasBnb && !hasUsdt) {
+    logger.info('⚠️ binanceMonitor DESATIVADO (BUY_BNB_ADDRESS e BUY_USDT_BNB_ADDRESS não configurados)');
+    return;
+  }
+  if (intervalHandle) return;
 
-    if (intervalHandle) return;
+  logger.info(`✅ binanceMonitor ATIVO (RPC: ${BNB_RPC.substring(0, 30)}…)`);
+  logger.info(`   ├─ BNB nativo:  ${hasBnb ? BNB_ADDRESS.substring(0, 10) + '…' : '⚠️ DESATIVADO'} (${BNB_CONFIRMATIONS} conf)`);
+  logger.info(`   └─ USDT BEP-20: ${hasUsdt ? USDT_BNB_ADDRESS.substring(0, 10) + '…' : '⚠️ DESATIVADO'} (${USDT_CONFIRMATIONS} conf)`);
 
-    logger.info(`✅ binanceMonitor ATIVO (RPC: ${BNB_RPC.substring(0, 30)}...)`);
-    if (hasBnb) {
-        logger.info(`   ├─ BNB nativo: ${BNB_ADDRESS.substring(0, 10)}... (${BNB_CONFIRMATIONS} conf)`);
-    } else {
-        logger.info('   ├─ BNB nativo: ⚠️ DESATIVADO');
-    }
-    if (hasUsdt) {
-        logger.info(`   └─ USDT BEP-20: ${USDT_BNB_ADDRESS.substring(0, 10)}... (${USDT_CONFIRMATIONS} conf)`);
-    } else {
-        logger.info('   └─ USDT BEP-20: ⚠️ DESATIVADO');
-    }
-
-    intervalHandle = setInterval(poll, POLL_INTERVAL_MS);
+  intervalHandle = setInterval(poll, POLL_INTERVAL_MS);
+  poll(); // roda já no boot
 }
 
 function stop() {
-    if (intervalHandle) {
-        clearInterval(intervalHandle);
-        intervalHandle = null;
-        logger.info('🛑 binanceMonitor parado');
-    }
+  if (intervalHandle) {
+    clearInterval(intervalHandle);
+    intervalHandle = null;
+    logger.info('🛑 binanceMonitor parado');
+  }
 }
 
-// ============================================
-// EXPORT
-// ============================================
-module.exports = {
-    start,
-    stop,
-    poll,
-    checkBnbNativeOrders,
-    checkUsdtBep20Orders
-};
+module.exports = { start, stop, poll };
