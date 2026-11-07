@@ -1,12 +1,6 @@
 // services/buy/monitors/btcMonitor.js
-// ============================================
-// Monitor de pagamentos Bitcoin
-// ============================================
-// Consulta a API pública do Blockstream (Esplora) a cada 30s
-// pra ver se algum pedido 'pending' recebeu pagamento no endereço.
-//
-// Se BUY_BTC_ADDRESS não estiver no .env, o monitor fica desativado.
-//
+// v2 — rastreia tx real, dedupe por txHash, confirmações reais,
+//      valida valor, ignora tx de saída (change/vin), cacheia tip height
 // ============================================
 
 const axios = require('axios');
@@ -14,156 +8,210 @@ const BuyOrder = require('../../../models/BuyOrder');
 const { logger } = require('../../../middleware/error');
 
 // ===== CONFIG =====
-const BTC_ADDRESS = process.env.BUY_BTC_ADDRESS || null;
-const BTC_API = process.env.BUY_BTC_API || 'https://blockstream.info/api';
-const BTC_CONFIRMATIONS = parseInt(process.env.BUY_BTC_CONFIRMATIONS || '2');
-const POLL_INTERVAL_MS = 30 * 1000; // 30 segundos
+const BTC_ADDRESS         = process.env.BUY_BTC_ADDRESS || null;
+const BTC_API             = process.env.BUY_BTC_API || 'https://blockstream.info/api';
+const BTC_API_FALLBACK    = process.env.BUY_BTC_API_FALLBACK || 'https://mempool.space/api';
+const BTC_CONFIRMATIONS   = parseInt(process.env.BUY_BTC_CONFIRMATIONS || '2');
+const BTC_AMOUNT_TOLERANCE = parseFloat(process.env.BUY_BTC_AMOUNT_TOLERANCE || '0.02'); // 2%
+const POLL_INTERVAL_MS    = 30 * 1000;
+const PER_ORDER_TIMEOUT   = 15000;
 
+// ===== ESTADO =====
 let intervalHandle = null;
 let isRunning = false;
+let currentApiBase = BTC_API;
+let tipHeightCache = { height: null, at: 0 };
 
 // ============================================
-// CONSULTA A API DO BLOCKSTREAM
+// HTTP HELPER (com fallback + timeout)
+// ============================================
+async function apiGet(path, timeout = 10000) {
+  const tryBase = async (base) => {
+    const res = await axios.get(`${base}${path}`, { timeout });
+    return res.data;
+  };
+  try {
+    return await tryBase(currentApiBase);
+  } catch (err) {
+    // Se for 429 / 5xx / timeout, troca pro fallback e tenta de novo
+    if (err.response?.status === 429 || err.code === 'ECONNABORTED' || err.response?.status >= 500) {
+      const other = currentApiBase === BTC_API ? BTC_API_FALLBACK : BTC_API;
+      logger.warn(`[btcMonitor] ${currentApiBase} falhou (${err.response?.status || err.code}), tentando ${other}`);
+      currentApiBase = other;
+      return await tryBase(other);
+    }
+    throw err;
+  }
+}
+
+// ============================================
+// TIP HEIGHT (cache 15s — evita 50 chamadas por poll)
+// ============================================
+async function getTipHeight() {
+  const now = Date.now();
+  if (tipHeightCache.height && (now - tipHeightCache.at) < 15000) {
+    return tipHeightCache.height;
+  }
+  const data = await apiGet('/blocks/tip/height', 5000);
+  const h = parseInt(data);
+  tipHeightCache = { height: h, at: now };
+  return h;
+}
+
+// ============================================
+// TXS DO ENDEREÇO
 // ============================================
 async function getAddressTxs(address) {
-    const url = `${BTC_API}/address/${address}/txs`;
-    const res = await axios.get(url, { timeout: 10000 });
-    return res.data || [];
+  return (await apiGet(`/address/${address}/txs`, 10000)) || [];
 }
 
-async function getTxConfirmations(txid) {
-    try {
-        const url = `${BTC_API}/tx/${txid}/status`;
-        const res = await axios.get(url, { timeout: 10000 });
-        return {
-            confirmed: res.data.confirmed || false,
-            block_height: res.data.block_height || null
-        };
-    } catch (err) {
-        return { confirmed: false, block_height: null };
+// ============================================
+// VERIFICA UM PEDIDO
+// ============================================
+async function checkOrder(order, tipHeight) {
+  const addr = order.depositAddress;
+  if (!addr) return;
+
+  const txs = await getAddressTxs(addr);
+  if (!txs || txs.length === 0) return;
+
+  for (const tx of txs) {
+    const txid = tx.txid;
+
+    // Ignora tx onde nosso endereço está no input (é SAÍDA, não pagamento)
+    const isOutgoing = (tx.vin || []).some(v =>
+      v.prevout?.scriptpubkey_address === addr
+    );
+    if (isOutgoing) continue;
+
+    // Pega só os vouts que pagam o nosso endereço
+    const vouts = (tx.vout || []).filter(v =>
+      v.scriptpubkey_address === addr
+    );
+    if (vouts.length === 0) continue;
+
+    const amountSats = vouts.reduce((s, v) => s + (v.value || 0), 0);
+    if (amountSats <= 0) continue;
+
+    // Confirmações
+    let confirmations = 0;
+    let blockHeight = null;
+    if (tx.status?.confirmed) {
+      blockHeight = tx.status.block_height;
+      confirmations = Math.max(1, tipHeight - blockHeight + 1);
     }
-}
 
-// ============================================
-// VERIFICA UM PEDIDO ESPECÍFICO
-// ============================================
-async function checkOrder(order) {
-    try {
-        // Pega transações do endereço de depósito
-        const txs = await getAddressTxs(order.depositAddress);
-        if (!txs || txs.length === 0) return;
+    // Valor esperado (se o pedido tem)
+    const expectedSats = order.expectedAmountSats || order.amountSats || null;
+    let valueOk = true;
+    if (expectedSats && expectedSats > 0) {
+      const diff = Math.abs(amountSats - expectedSats) / expectedSats;
+      valueOk = diff <= BTC_AMOUNT_TOLERANCE;
+    }
 
-        // Procura tx que enviou pro nosso endereço
-        // (a API do Blockstream retorna txs onde o endereço aparece,
-        //  então filtramos pelas que têm 'vout' pro nosso endereço)
-        for (const tx of txs) {
-            const txid = tx.txid;
+    const isPaid = confirmations >= BTC_CONFIRMATIONS && valueOk;
 
-            // Verifica se a saída vai pro nosso endereço
-            const vout = (tx.vout || []).find(v => 
-                v.scriptpubkey_address === order.depositAddress
-            );
-            if (!vout) continue;
-
-            const amountSats = vout.value || 0;
-            if (amountSats <= 0) continue;
-
-            // Verifica confirmações
-            const { confirmed, block_height } = await getTxConfirmations(txid);
-            if (!confirmed) continue;
-
-            // Conta confirmações: pega altura atual e subtrai
-            // (simplificação: se confirmou 1 bloco, já conta como confirmado)
-            // Para contar confirmações reais, precisaríamos do tip height.
-            // Aqui usamos uma abordagem simples: se confirmou, conta como 1.
-            // Para produção, consultar /blocks/tip/height e calcular.
-            let confirmations = 1;
-            try {
-                const tipRes = await axios.get(`${BTC_API}/blocks/tip/height`, { timeout: 5000 });
-                const tipHeight = parseInt(tipRes.data);
-                confirmations = tipHeight - block_height + 1;
-            } catch (_) {}
-
-            // Já tem confirmações suficientes?
-            if (confirmations >= BTC_CONFIRMATIONS) {
-                // Marca como 'paid'
-                const updated = await BuyOrder.findOneAndUpdate(
-                    { orderId: order.orderId, status: 'pending' },
-                    {
-                        $set: {
-                            status: 'paid',
-                            paidAt: new Date(),
-                            paymentTxHash: txid,
-                            paymentConfirmations: confirmations
-                        }
-                    },
-                    { new: true }
-                );
-
-                if (updated) {
-                    logger.info(`💰 BTC pago: ${order.orderId} (${amountSats} sats, ${confirmations} conf, tx: ${txid.substring(0, 12)}...)`);
-                }
-                return;
-            }
+    // Dedupe: não reprocessa o mesmo txid
+    const updated = await BuyOrder.findOneAndUpdate(
+      {
+        orderId: order.orderId,
+        status: { $in: ['pending', 'detected'] },
+        paymentTxHash: { $ne: txid }
+      },
+      {
+        $set: {
+          paymentTxHash: txid,
+          paymentAmount: amountSats / 1e8, // em BTC
+          paymentAmountSats: amountSats,
+          paymentBlock: blockHeight,
+          paymentConfirmations: confirmations,
+          detectedAt: order.detectedAt || new Date(),
+          status: isPaid ? 'paid' : 'detected',
+          ...(isPaid ? { paidAt: new Date() } : {})
         }
-    } catch (err) {
-        logger.warn(`⚠️ Erro ao checar pedido BTC ${order.orderId}: ${err.message}`);
+      },
+      { new: true }
+    );
+
+    if (updated) {
+      if (isPaid) {
+        logger.info(`💰 BTC PAGO: ${order.orderId} — ${amountSats} sats (${confirmations} conf, tx ${txid.slice(0, 12)}…)`);
+      } else {
+        logger.info(`⏳ BTC detectado: ${order.orderId} — ${amountSats} sats (${confirmations}/${BTC_CONFIRMATIONS} conf)`);
+      }
+      return; // 1 tx por pedido já basta
     }
+    // se updated == null, era duplicata ou já pago — segue pra próxima tx
+  }
 }
 
 // ============================================
-// LOOP PRINCIPAL
+// LOOP
 // ============================================
 async function poll() {
-    if (isRunning) return;
-    isRunning = true;
+  if (isRunning) return;
+  isRunning = true;
 
-    try {
-        // Pega todos pedidos pending em BTC
-        const orders = await BuyOrder.find({
-            currency: 'BTC',
-            status: 'pending',
-            expiresAt: { $gt: new Date() }
-        }).limit(50);
+  try {
+    const orders = await BuyOrder.find({
+      paymentCurrency: 'BTC',                 // ⚠️ troque pra 'currency' se for o caso
+      status: { $in: ['pending', 'detected'] },
+      expiresAt: { $gt: new Date() }
+    }).limit(50);
 
-        if (orders.length === 0) {
-            isRunning = false;
-            return;
-        }
-
-        logger.info(`🔍 BTC: checando ${orders.length} pedido(s) pending`);
-
-        for (const order of orders) {
-            await checkOrder(order);
-        }
-    } catch (err) {
-        logger.error(`❌ btcMonitor erro: ${err.message}`);
-    } finally {
-        isRunning = false;
+    if (orders.length === 0) {
+      isRunning = false;
+      return;
     }
+
+    const tipHeight = await getTipHeight();
+
+    // Processa com concorrência limitada (2 por vez) pra não estourar a API
+    const queue = [...orders];
+    const CONCURRENCY = 2;
+    await Promise.all(
+      Array.from({ length: CONCURRENCY }, async () => {
+        while (queue.length) {
+          const order = queue.shift();
+          try {
+            await Promise.race([
+              checkOrder(order, tipHeight),
+              new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), PER_ORDER_TIMEOUT))
+            ]);
+          } catch (err) {
+            logger.warn(`[btcMonitor] pedido ${order.orderId}: ${err.message}`);
+          }
+        }
+      })
+    );
+  } catch (err) {
+    logger.error(`❌ btcMonitor erro: ${err.message}`);
+  } finally {
+    isRunning = false;
+  }
 }
 
 // ============================================
-// START/STOP
+// START / STOP
 // ============================================
 function start() {
-    if (!BTC_ADDRESS) {
-        logger.info('⚠️ btcMonitor DESATIVADO (BUY_BTC_ADDRESS não configurado)');
-        return;
-    }
+  if (!BTC_ADDRESS) {
+    logger.info('⚠️ btcMonitor DESATIVADO (BUY_BTC_ADDRESS não configurado)');
+    return;
+  }
+  if (intervalHandle) return;
 
-    if (intervalHandle) return;
-
-    logger.info(`✅ btcMonitor ATIVO (endereço: ${BTC_ADDRESS.substring(0, 12)}..., ${BTC_CONFIRMATIONS} confirmações, a cada ${POLL_INTERVAL_MS/1000}s)`);
-    intervalHandle = setInterval(poll, POLL_INTERVAL_MS);
+  logger.info(`✅ btcMonitor ATIVO (endereço: ${BTC_ADDRESS.substring(0, 12)}…, ${BTC_CONFIRMATIONS} conf, ${POLL_INTERVAL_MS / 1000}s)`);
+  intervalHandle = setInterval(poll, POLL_INTERVAL_MS);
+  poll(); // roda já no boot
 }
 
 function stop() {
-    if (intervalHandle) {
-        clearInterval(intervalHandle);
-        intervalHandle = null;
-        logger.info('🛑 btcMonitor parado');
-    }
+  if (intervalHandle) {
+    clearInterval(intervalHandle);
+    intervalHandle = null;
+    logger.info('🛑 btcMonitor parado');
+  }
 }
 
 module.exports = { start, stop, poll };
