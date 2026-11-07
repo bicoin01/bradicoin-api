@@ -1,6 +1,8 @@
 // services/buy/monitors/btcMonitor.js
-// v2 — rastreia tx real, dedupe por txHash, confirmações reais,
-//      valida valor, ignora tx de saída (change/vin), cacheia tip height
+// ============================================
+// Monitor de pagamentos Bitcoin
+// v3 — rastreia TX real, dedupe por txHash, confirmações reais,
+//       valida valor, alinhado ao schema do BuyOrder
 // ============================================
 
 const axios = require('axios');
@@ -8,13 +10,12 @@ const BuyOrder = require('../../../models/BuyOrder');
 const { logger } = require('../../../middleware/error');
 
 // ===== CONFIG =====
-const BTC_ADDRESS         = process.env.BUY_BTC_ADDRESS || null;
-const BTC_API             = process.env.BUY_BTC_API || 'https://blockstream.info/api';
-const BTC_API_FALLBACK    = process.env.BUY_BTC_API_FALLBACK || 'https://mempool.space/api';
-const BTC_CONFIRMATIONS   = parseInt(process.env.BUY_BTC_CONFIRMATIONS || '2');
-const BTC_AMOUNT_TOLERANCE = parseFloat(process.env.BUY_BTC_AMOUNT_TOLERANCE || '0.02'); // 2%
-const POLL_INTERVAL_MS    = 30 * 1000;
-const PER_ORDER_TIMEOUT   = 15000;
+const BTC_API              = process.env.BUY_BTC_API || 'https://blockstream.info/api';
+const BTC_API_FALLBACK     = process.env.BUY_BTC_API_FALLBACK || 'https://mempool.space/api';
+const BTC_CONFIRMATIONS    = parseInt(process.env.BUY_BTC_CONFIRMATIONS || '2');
+const BTC_AMOUNT_TOLERANCE = parseFloat(process.env.BUY_BTC_AMOUNT_TOLERANCE || '0.02');
+const POLL_INTERVAL_MS     = 30 * 1000;
+const PER_ORDER_TIMEOUT    = 15000;
 
 // ===== ESTADO =====
 let intervalHandle = null;
@@ -33,8 +34,7 @@ async function apiGet(path, timeout = 10000) {
   try {
     return await tryBase(currentApiBase);
   } catch (err) {
-    // Se for 429 / 5xx / timeout, troca pro fallback e tenta de novo
-    if (err.response?.status === 429 || err.code === 'ECONNABORTED' || err.response?.status >= 500) {
+    if (err.response?.status === 429 || err.code === 'ECONNABORTED' || (err.response?.status || 0) >= 500) {
       const other = currentApiBase === BTC_API ? BTC_API_FALLBACK : BTC_API;
       logger.warn(`[btcMonitor] ${currentApiBase} falhou (${err.response?.status || err.code}), tentando ${other}`);
       currentApiBase = other;
@@ -45,7 +45,7 @@ async function apiGet(path, timeout = 10000) {
 }
 
 // ============================================
-// TIP HEIGHT (cache 15s — evita 50 chamadas por poll)
+// TIP HEIGHT (cache 15s)
 // ============================================
 async function getTipHeight() {
   const now = Date.now();
@@ -66,6 +66,19 @@ async function getAddressTxs(address) {
 }
 
 // ============================================
+// VALIDA VALOR
+// ============================================
+function valueMatches(expectedSats, receivedSats, tolerance) {
+  if (!expectedSats) return true;
+  const expected = BigInt(expectedSats);
+  const received = BigInt(receivedSats);
+  if (expected === 0n) return received > 0n;
+  const diff = received > expected ? received - expected : expected - received;
+  const maxDiff = (expected * BigInt(Math.round(tolerance * 10000))) / 10000n;
+  return diff <= maxDiff;
+}
+
+// ============================================
 // VERIFICA UM PEDIDO
 // ============================================
 async function checkOrder(order, tipHeight) {
@@ -78,13 +91,12 @@ async function checkOrder(order, tipHeight) {
   for (const tx of txs) {
     const txid = tx.txid;
 
-    // Ignora tx onde nosso endereço está no input (é SAÍDA, não pagamento)
+    // Ignora tx de saída (change)
     const isOutgoing = (tx.vin || []).some(v =>
       v.prevout?.scriptpubkey_address === addr
     );
     if (isOutgoing) continue;
 
-    // Pega só os vouts que pagam o nosso endereço
     const vouts = (tx.vout || []).filter(v =>
       v.scriptpubkey_address === addr
     );
@@ -101,17 +113,18 @@ async function checkOrder(order, tipHeight) {
       confirmations = Math.max(1, tipHeight - blockHeight + 1);
     }
 
-    // Valor esperado (se o pedido tem)
-    const expectedSats = order.expectedAmountSats || order.amountSats || null;
-    let valueOk = true;
-    if (expectedSats && expectedSats > 0) {
-      const diff = Math.abs(amountSats - expectedSats) / expectedSats;
-      valueOk = diff <= BTC_AMOUNT_TOLERANCE;
+    // Valida valor
+    if (!valueMatches(order.expectedPaymentAmount, amountSats, BTC_AMOUNT_TOLERANCE)) {
+      logger.warn(
+        `[btcMonitor] ${order.orderId}: valor diferente ` +
+        `(esperado ${order.expectedPaymentAmount} sats, recebido ${amountSats}) — ignorando`
+      );
+      continue;
     }
 
-    const isPaid = confirmations >= BTC_CONFIRMATIONS && valueOk;
+    const isPaid = confirmations >= BTC_CONFIRMATIONS;
 
-    // Dedupe: não reprocessa o mesmo txid
+    // Dedupe por txHash
     const updated = await BuyOrder.findOneAndUpdate(
       {
         orderId: order.orderId,
@@ -121,8 +134,7 @@ async function checkOrder(order, tipHeight) {
       {
         $set: {
           paymentTxHash: txid,
-          paymentAmount: amountSats / 1e8, // em BTC
-          paymentAmountSats: amountSats,
+          paymentAmount: amountSats.toString(),
           paymentBlock: blockHeight,
           paymentConfirmations: confirmations,
           detectedAt: order.detectedAt || new Date(),
@@ -134,14 +146,14 @@ async function checkOrder(order, tipHeight) {
     );
 
     if (updated) {
+      const btc = (amountSats / 1e8).toFixed(8);
       if (isPaid) {
-        logger.info(`💰 BTC PAGO: ${order.orderId} — ${amountSats} sats (${confirmations} conf, tx ${txid.slice(0, 12)}…)`);
+        logger.info(`✅ BTC PAGO: ${order.orderId} — ${btc} BTC (${confirmations} conf, tx ${txid.slice(0, 12)}…)`);
       } else {
-        logger.info(`⏳ BTC detectado: ${order.orderId} — ${amountSats} sats (${confirmations}/${BTC_CONFIRMATIONS} conf)`);
+        logger.info(`⏳ BTC detectado: ${order.orderId} — ${btc} BTC (${confirmations}/${BTC_CONFIRMATIONS} conf)`);
       }
       return; // 1 tx por pedido já basta
     }
-    // se updated == null, era duplicata ou já pago — segue pra próxima tx
   }
 }
 
@@ -154,7 +166,8 @@ async function poll() {
 
   try {
     const orders = await BuyOrder.find({
-      paymentCurrency: 'BTC',                 // ⚠️ troque pra 'currency' se for o caso
+      currency: 'BTC',
+      paymentNetwork: 'bitcoin',
       status: { $in: ['pending', 'detected'] },
       expiresAt: { $gt: new Date() }
     }).limit(50);
@@ -166,7 +179,6 @@ async function poll() {
 
     const tipHeight = await getTipHeight();
 
-    // Processa com concorrência limitada (2 por vez) pra não estourar a API
     const queue = [...orders];
     const CONCURRENCY = 2;
     await Promise.all(
@@ -185,7 +197,7 @@ async function poll() {
       })
     );
   } catch (err) {
-    logger.error(`❌ btcMonitor erro: ${err.message}`);
+    logger.error(`[btcMonitor] poll erro: ${err.message}`);
   } finally {
     isRunning = false;
   }
@@ -195,15 +207,15 @@ async function poll() {
 // START / STOP
 // ============================================
 function start() {
-  if (!BTC_ADDRESS) {
-    logger.info('⚠️ btcMonitor DESATIVADO (BUY_BTC_ADDRESS não configurado)');
+  if (process.env.BUY_BTC_ENABLED === 'false') {
+    logger.info('⚠️ btcMonitor DESATIVADO (BUY_BTC_ENABLED=false)');
     return;
   }
   if (intervalHandle) return;
 
-  logger.info(`✅ btcMonitor ATIVO (endereço: ${BTC_ADDRESS.substring(0, 12)}…, ${BTC_CONFIRMATIONS} conf, ${POLL_INTERVAL_MS / 1000}s)`);
+  logger.info(`✅ btcMonitor ATIVO (${BTC_CONFIRMATIONS} conf, ${POLL_INTERVAL_MS / 1000}s)`);
   intervalHandle = setInterval(poll, POLL_INTERVAL_MS);
-  poll(); // roda já no boot
+  poll();
 }
 
 function stop() {
