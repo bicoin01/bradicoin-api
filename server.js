@@ -36,7 +36,8 @@ const REQUIRED_ENV = [
     'JWT_SECRET',
     'RESERVE_ADDRESS',
     'FEE_COLLECTOR_ADDRESS',
-    'MAX_SUPPLY'
+    'MAX_SUPPLY',
+    'BUY_MASTER_SEED',
 ];
 
 const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
@@ -724,6 +725,23 @@ const { router: adminAirdropRouter } = require('./routes/adminAirdrop');
 app.use('/api/v1/admin/airdrop', adminAirdropRouter);
 app.use('/api/v1/governance', governanceRoutes);
 app.use('/api/atomic-swap', swapLimiter, atomicSwapRoutes);
+
+const buyRoutes = require('./routes/buy');
+app.use('/api/v1/buy', buyRoutes);
+
+// ============================================
+// 🛒 Validação do BUY_MASTER_SEED ANTES de montar rotas
+// ============================================
+try {
+    const deposit = require('./services/buy/depositAddress');
+    if (!deposit.selfTest()) {
+        console.error('❌ BUY_MASTER_SEED inválida — abortando boot');
+        process.exit(1);
+    }
+} catch (err) {
+    console.warn(`⚠️ depositAddress não carregou: ${err.message}`);
+    console.warn('   (rotas /buy vão falhar — verifique BUY_MASTER_SEED no .env)');
+}
 
 // ============================================
 // 🔗 ALIAS — rotas sem /v1 (compatibilidade com frontend público)
