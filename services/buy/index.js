@@ -16,6 +16,7 @@ const btcMonitor = require('./monitors/btcMonitor');
 const evmMonitor = require('./monitors/evmMonitor');
 const usdtMonitor = require('./monitors/usdtMonitor');
 const solMonitor = require('./monitors/solMonitor');
+const binanceMonitor = require('./monitors/binanceMonitor');
 
 let creditInterval = null;
 let expirationInterval = null;
@@ -98,7 +99,8 @@ async function startBuyWorkers({ io } = {}) {
     evmMonitor.start();
     usdtMonitor.start();
     solMonitor.start();
-
+    binanceMonitor.stop();
+    
     // Inicia creditWorker
     if (!creditInterval) {
         creditInterval = setInterval(creditWorker, CREDIT_INTERVAL_MS);
@@ -123,7 +125,8 @@ function stopBuyWorkers() {
     evmMonitor.stop();
     usdtMonitor.stop();
     solMonitor.stop();
-
+    binanceMonitor.stop();
+    
     if (creditInterval) { clearInterval(creditInterval); creditInterval = null; }
     if (expirationInterval) { clearInterval(expirationInterval); expirationInterval = null; }
 
