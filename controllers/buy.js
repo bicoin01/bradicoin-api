@@ -29,6 +29,7 @@ const PRICE_PAYMENT_USD = {
     ETH: 3000,
     USDT: 1,
     SOL: 150,
+    BTC: 6000,
 };
 
 // Redes permitidas por moeda (Fase 1: só EVM/BSC)
@@ -37,6 +38,7 @@ const ALLOWED_NETWORKS = {
     ETH:  ['ethereum'],
     USDT: ['bsc', 'ethereum'],
     SOL:  ['solana'],
+    BTC:  ['bitcoin'],
 };
 
 // Decimais por moeda pra converter valor esperado
@@ -55,6 +57,7 @@ function networkLabel(currency, network) {
     if (currency === 'BNB') return 'BSC (BEP-20)';
     if (currency === 'ETH') return 'Ethereum';
     if (currency === 'SOL') return 'Solana';
+    if (currency === 'BTC') return 'Bitcoin';
     return network;
 }
 
@@ -91,6 +94,16 @@ function calcExpectedPaymentAmount(currency, network, amountUsd) {
             amountPayment: amountPayment.toString(),
             baseUnits: lamports.toString(),
             decimals: 9
+        };
+    }
+
+        // ===== BTC: satoshis (8 decimais) =====
+    if (currency === 'BTC') {
+        const sats = BigInt(Math.round(amountPayment * 1e8));
+        return {
+            amountPayment: amountPayment.toString(),
+            baseUnits: sats.toString(),
+            decimals: 8
         };
     }
     
