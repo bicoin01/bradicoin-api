@@ -5,6 +5,7 @@
 // ============================================
 
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const router = express.Router();
 
 const buyController = require('../controllers/buy');
@@ -27,16 +28,100 @@ try {
 }
 
 // ============================================
+// RATE LIMITERS
+// ============================================
+
+// POST /create — 10 pedidos/hora por usuário
+// Evita esgotar o range HD (9000 endereços)
+const createOrderLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,      // 1 hora
+    max: 10,                        // 10 pedidos/hora
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => {
+        // Por user_id (não por IP — usuários atrás de NAT compartilham IP)
+        const uid = req.user?.id || req.user?._id;
+        return uid ? `user:${uid}` : `ip:${req.ip}`;
+    },
+    message: {
+        success: false,
+        error: 'Muitos pedidos em pouco tempo. Aguarde 1 hora ou contate o suporte.'
+    }
+});
+
+// POST /create — 100 pedidos/minuto global (proteção contra flood)
+const createOrderGlobalLimiter = rateLimit({
+    windowMs: 60 * 1000,            // 1 minuto
+    max: 100,                       // 100 pedidos/minuto global
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: () => 'global',
+    message: {
+        success: false,
+        error: 'Sistema ocupado. Tente novamente em alguns segundos.'
+    }
+});
+
+// GET /:orderId — 60 req/min por user (polling do front é 5s = 12/min)
+const getOrderLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => {
+        const uid = req.user?.id || req.user?._id;
+        return uid ? `user:${uid}` : `ip:${req.ip}`;
+    },
+    message: {
+        success: false,
+        error: 'Muitas consultas. Reduza a frequência de polling.'
+    }
+});
+
+// GET /me — 30 req/min por user
+const myOrdersLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => {
+        const uid = req.user?.id || req.user?._id;
+        return uid ? `user:${uid}` : `ip:${req.ip}`;
+    },
+    message: {
+        success: false,
+        error: 'Muitas consultas. Aguarde alguns segundos.'
+    }
+});
+
+// ============================================
 // ROTAS
 // ============================================
 
-// POST /api/v1/buy/create  → cria pedido
-router.post('/create', requireAuth, buyController.createOrder);
+// POST /api/v1/buy/create
+// Ordem importa: global primeiro (mais barato), depois por user
+router.post(
+    '/create',
+    createOrderGlobalLimiter,   // 100/min global
+    createOrderLimiter,         // 10/hora por user
+    requireAuth,
+    buyController.createOrder
+);
 
-// GET /api/v1/buy/me       → lista pedidos do usuário logado
-router.get('/me', requireAuth, buyController.myOrders);
+// GET /api/v1/buy/me
+router.get(
+    '/me',
+    myOrdersLimiter,
+    requireAuth,
+    buyController.myOrders
+);
 
-// GET /api/v1/buy/:orderId → status do pedido
-router.get('/:orderId', requireAuth, buyController.getOrder);
+// GET /api/v1/buy/:orderId
+router.get(
+    '/:orderId',
+    getOrderLimiter,
+    requireAuth,
+    buyController.getOrder
+);
 
 module.exports = router;
