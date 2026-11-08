@@ -18,6 +18,8 @@ const usdtMonitor = require('./monitors/usdtMonitor');
 const solanaMonitor = require('./monitors/solanaMonitor');
 const binanceMonitor = require('./monitors/binanceMonitor');
 
+const creditingWatchdog = require('./creditingWatchdog');
+
 let creditInterval = null;
 let expirationInterval = null;
 let ioRef = null;
@@ -113,6 +115,8 @@ async function startBuyWorkers({ io } = {}) {
         logger.info(`✅ expirationWorker ATIVO (a cada ${EXPIRATION_INTERVAL_MS/1000}s)`);
     }
 
+    creditingWatchdog.start({ io });
+    
     logger.info('════════════════════════════════════════');
     logger.info('');
 }
@@ -126,6 +130,8 @@ function stopBuyWorkers() {
     usdtMonitor.stop();
     solanaMonitor.stop();
     binanceMonitor.stop();
+
+    creditingWatchdog.stop();
     
     if (creditInterval) { clearInterval(creditInterval); creditInterval = null; }
     if (expirationInterval) { clearInterval(expirationInterval); expirationInterval = null; }
