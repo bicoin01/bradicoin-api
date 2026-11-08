@@ -22,7 +22,7 @@ try {
 } catch (e) {
     console.warn('[routes/buy] middleware/auth não encontrado — usando stub (NÃO USE EM PRODUÇÃO)');
     requireAuth = (req, res, next) => {
-        req.user = { id: 'stub-user-id' }; // ⚠️ stub pra testar
+        req.user = { id: 'stub-user-id' };
         next();
     };
 }
@@ -97,30 +97,30 @@ const myOrdersLimiter = rateLimit({
 // ============================================
 // ROTAS
 // ============================================
+// ⚠️ ORDEM IMPORTA: requireAuth ANTES do limiter que usa req.user
 
 // POST /api/v1/buy/create
-// Ordem importa: global primeiro (mais barato), depois por user
 router.post(
     '/create',
-    createOrderGlobalLimiter,   // 100/min global
-    createOrderLimiter,         // 10/hora por user
-    requireAuth,
+    createOrderGlobalLimiter,   // 1º: global (sem req.user, barato)
+    requireAuth,                // 2º: valida token + seta req.user
+    createOrderLimiter,         // 3º: 10/hora por user (agora tem req.user.id)
     buyController.createOrder
 );
 
 // GET /api/v1/buy/me
 router.get(
     '/me',
-    myOrdersLimiter,
-    requireAuth,
+    requireAuth,                // 1º: seta req.user
+    myOrdersLimiter,            // 2º: 30/min por user
     buyController.myOrders
 );
 
 // GET /api/v1/buy/:orderId
 router.get(
     '/:orderId',
-    getOrderLimiter,
-    requireAuth,
+    requireAuth,                // 1º: seta req.user
+    getOrderLimiter,            // 2º: 60/min por user
     buyController.getOrder
 );
 
