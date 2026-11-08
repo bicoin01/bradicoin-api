@@ -120,6 +120,67 @@ function deriveSolAddress(index) {
 }
 
 // ============================================
+// BITCOIN — Derivação de endereço (BIP84 native SegWit)
+// ============================================
+// Path padrão: m/84'/0'/{index}'/0/0
+// Endereço: bc1q... (P2WPKH native SegWit, taxa baixa)
+// ============================================
+
+let btcLibs = null;
+
+function getBtcLibs() {
+    if (btcLibs) return btcLibs;
+
+    let bitcoin, bip32, bip39, ecc;
+    try {
+        bitcoin = require('bitcoinjs-lib');
+        const { BIP32Factory } = require('bip32');
+        bip39 = require('bip39');
+        ecc = require('tiny-secp256k1');
+        bip32 = BIP32Factory(ecc);
+        bitcoin.initEccLib(ecc);
+    } catch (err) {
+        throw new Error(
+            'Dependências Bitcoin não instaladas. Rode: ' +
+            'npm install bitcoinjs-lib bip32 bip84 tiny-secp256k1. ' +
+            `(${err.message})`
+        );
+    }
+
+    if (!MASTER_SEED) throw new Error('BUY_MASTER_SEED não configurada');
+    if (!bip39.validateMnemonic(MASTER_SEED)) {
+        throw new Error('BUY_MASTER_SEED inválida (bip39)');
+    }
+
+    const seed = bip39.mnemonicToSeedSync(MASTER_SEED);
+    const network = bitcoin.networks.bitcoin; // mainnet
+    const root = bip32.fromSeed(seed, network);
+
+    btcLibs = { bitcoin, bip32, root, network };
+    logger.info('[depositAddress] Master node Bitcoin (BIP84) inicializado');
+    return btcLibs;
+}
+
+function deriveBtcAddress(index) {
+    if (index < HD_INDEX_START || index > HD_INDEX_END) {
+        throw new Error(`Índice HD fora do range: ${index}`);
+    }
+
+    const { bitcoin, root, network } = getBtcLibs();
+
+    // BIP84: m/84'/0'/{index}'/0/0
+    const path = `m/84'/0'/${index}'/0/0`;
+    const child = root.derivePath(path);
+
+    const { address } = bitcoin.payments.p2wpkh({
+        pubkey: Buffer.from(child.publicKey),
+        network
+    });
+
+    return address; // bc1q...
+}
+
+// ============================================
 // API PÚBLICA
 // ============================================
 
@@ -139,6 +200,11 @@ function generateDepositAddress(currency, network, depositIndex) {
     const c = String(currency || '').toUpperCase();
     const n = String(network || '').toLowerCase();
 
+        // ===== Bitcoin =====
+    if (c === 'BTC') {
+        return deriveBtcAddress(depositIndex);
+    }
+    
     // ===== Solana =====
     if (c === 'SOL') {
         if (n && n !== 'solana') {
@@ -228,6 +294,18 @@ function selfTest() {
     return true;
 }
 
+    // BTC (só testa se BUY_BTC_ENABLED !== 'false')
+    if (process.env.BUY_BTC_ENABLED !== 'false') {
+        try {
+            const btcAddr = deriveBtcAddress(HD_INDEX_START);
+            logger.info(
+                `[depositAddress] BTC OK — índice ${HD_INDEX_START} → ${btcAddr}`
+            );
+        } catch (err) {
+            logger.warn(`[depositAddress] BTC selfTest falhou: ${err.message}`);
+        }
+    }
+
 // ============================================
 // EXPORT
 // ============================================
@@ -236,5 +314,6 @@ module.exports = {
     nextDepositIndex,
     selfTest,
     deriveEvmAddress,
-    deriveSolAddress
+    deriveSolAddress,
+    deriveBtcAddress,
 };
