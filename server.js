@@ -1362,6 +1362,19 @@ async function initialize() {
         startAutoPriceUpdate();
         startCheckpointing();
 
+        // ============================================
+        // 💰 BUY — creditWorker (credita BRD após pagamento)
+        // ============================================
+        try {
+            const creditWorker = require('./services/buy/creditWorker');
+            const creditingWatchdog = require('./services/buy/creditingWatchdog');
+            creditWorker.start({ io });
+            creditingWatchdog.start({ io });
+        } catch (err) {
+            logger.error('⚠️ Falha ao iniciar creditWorker/watchdog:', err.message);
+            logger.error('   Verifique models/Treasury.js e services/buy/credit*.js');
+        }
+
         server.listen(PORT, '0.0.0.0', () => {
             logger.info('');
             logger.info('════════════════════════════════════════');
