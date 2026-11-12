@@ -32,14 +32,12 @@ try {
 // ============================================
 
 // POST /create — 10 pedidos/hora por usuário
-// Evita esgotar o range HD (9000 endereços)
 const createOrderLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,      // 1 hora
     max: 10,                        // 10 pedidos/hora
     standardHeaders: true,
     legacyHeaders: false,
     keyGenerator: (req) => {
-        // Por user_id (não por IP — usuários atrás de NAT compartilham IP)
         const uid = req.user?.id || req.user?._id;
         return uid ? `user:${uid}` : `ip:${req.ip}`;
     },
@@ -94,33 +92,96 @@ const myOrdersLimiter = rateLimit({
     }
 });
 
+// GET /treasury — 30 req/min por user
+const treasuryLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => {
+        const uid = req.user?.id || req.user?._id;
+        return uid ? `user:${uid}` : `ip:${req.ip}`;
+    },
+    message: {
+        success: false,
+        error: 'Muitas consultas. Aguarde alguns segundos.'
+    }
+});
+
 // ============================================
 // ROTAS
 // ============================================
-// ⚠️ ORDEM IMPORTA: requireAuth ANTES do limiter que usa req.user
+// ⚠️ ORDEM IMPORTA:
+//   1) Rotas estáticas primeiro (/create, /me, /treasury)
+//   2) Rotas com parâmetro por último (/:orderId)
+//   Senão /:orderId captura "treasury" e "me"
 
 // POST /api/v1/buy/create
 router.post(
     '/create',
     createOrderGlobalLimiter,   // 1º: global (sem req.user, barato)
     requireAuth,                // 2º: valida token + seta req.user
-    createOrderLimiter,         // 3º: 10/hora por user (agora tem req.user.id)
+    createOrderLimiter,         // 3º: 10/hora por user
     buyController.createOrder
 );
 
 // GET /api/v1/buy/me
 router.get(
     '/me',
-    requireAuth,                // 1º: seta req.user
-    myOrdersLimiter,            // 2º: 30/min por user
+    requireAuth,
+    myOrdersLimiter,
     buyController.myOrders
 );
 
+// ============================================
+// GET /api/v1/buy/treasury — status da tesouraria
+// ============================================
+// ⚠️ DEVE vir ANTES de /:orderId
+router.get(
+    '/treasury',
+    requireAuth,
+    treasuryLimiter,
+    async (req, res) => {
+        try {
+            const Treasury = require('../models/Treasury');
+            const WalletModel = require('../models/Wallet');
+
+            const treasury = await Treasury.getMain();
+
+            const agg = await WalletModel.aggregate([
+                { $match: { status: 'active' } },
+                { $group: { _id: null, total: { $sum: { $toDouble: '$balance' } } } }
+            ]);
+
+            const balanceBrd = parseFloat(treasury.balance.toString());
+            const initialBrd = parseFloat(treasury.initialBalance.toString());
+
+            res.json({
+                success: true,
+                data: {
+                    balanceBrd: treasury.balance.toString(),
+                    balanceUsd: (balanceBrd * 10).toFixed(2),
+                    initialBrd: treasury.initialBalance.toString(),
+                    initialUsd: (initialBrd * 10).toFixed(2),
+                    totalSoldBrd: treasury.totalSold.toString(),
+                    totalCreditedBrd: treasury.totalCredited.toString(),
+                    lowBalanceAlertAt: treasury.lowBalanceAlertAt,
+                    networkTotalSupply: (agg[0]?.total || 0).toFixed(8),
+                    brdPriceUsd: 10
+                }
+            });
+        } catch (err) {
+            res.status(500).json({ success: false, error: err.message });
+        }
+    }
+);
+
 // GET /api/v1/buy/:orderId
+// ⚠️ ESTA DEVE SER A ÚLTIMA ROTA (captura tudo que sobrou)
 router.get(
     '/:orderId',
-    requireAuth,                // 1º: seta req.user
-    getOrderLimiter,            // 2º: 60/min por user
+    requireAuth,
+    getOrderLimiter,
     buyController.getOrder
 );
 
