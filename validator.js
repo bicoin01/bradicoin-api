@@ -3,35 +3,65 @@
 // Bradicoin Blockchain - Validators (PoS)
 // ============================================
 
+const crypto = require('crypto');
 const mongoose = require('mongoose');
-const blockchain = require('./blockchain');
 const staking = require('./staking');
 const wallet = require('./wallet');
 
-const MIN_VALIDATOR_STAKE = parseInt(process.env.MIN_VALIDATOR_STAKE) || 1000;
+const parsedMin = Number.parseInt(process.env.MIN_VALIDATOR_STAKE, 10);
+const MIN_VALIDATOR_STAKE = Number.isFinite(parsedMin) && parsedMin > 0 ? parsedMin : 1000;
+
+// ============================================
+// HELPERS
+// ============================================
+
+// Garante que o endereço é string (evita injeção NoSQL, ex.: { "$ne": null })
+function assertAddress(address) {
+    if (typeof address !== 'string' || address.length === 0 || address.length > 128) {
+        throw new Error('Endereço inválido');
+    }
+    return address;
+}
+
+// Garante número finito e positivo (typeof NaN/Infinity === 'number', por isso o isFinite)
+function assertPositiveAmount(value, label = 'Valor') {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+        throw new Error(`${label} deve ser um número positivo`);
+    }
+    return value;
+}
+
+// Número aleatório criptograficamente seguro em [0, 1)
+function secureRandom() {
+    return crypto.randomBytes(6).readUIntBE(0, 6) / 2 ** 48;
+}
 
 // ============================================
 // SCHEMA MONGOOSE — VALIDATOR
 // ============================================
 const ValidatorSchema = new mongoose.Schema({
-    address: { type: String, required: true, unique: true, index: true },
-    stake: { type: Number, required: true },
-    blocksProposed: { type: Number, default: 0 },
-    rewards: { type: Number, default: 0 },
+    address: { type: String, required: true, unique: true, index: true, trim: true },
+    stake: { type: Number, required: true, min: 0 },
+    blocksProposed: { type: Number, default: 0, min: 0 },
+    rewards: { type: Number, default: 0, min: 0 },
     joined: { type: Number, default: () => Date.now() },
     lastBlock: { type: Number, default: null },
-    active: { type: Boolean, default: true },
-    uptime: { type: Number, default: 100 },
-    performance: { type: Number, default: 0 }
+    active: { type: Boolean, default: true, index: true },
+    uptime: { type: Number, default: 100, min: 0, max: 100 },
+    performance: { type: Number, default: 0, min: 0 }
 });
 
-const ValidatorModel = mongoose.model('Validator', ValidatorSchema);
+// Evita OverwriteModelError se o módulo for carregado mais de uma vez
+const ValidatorModel = mongoose.models.Validator || mongoose.model('Validator', ValidatorSchema);
 
 // ============================================
 // INICIALIZAR
 // ============================================
 async function initialize() {
     if (mongoose.connection.readyState === 0) {
+        if (!process.env.MONGO_URI) {
+            throw new Error('MONGO_URI não configurada');
+        }
         await mongoose.connect(process.env.MONGO_URI);
     }
     await ValidatorModel.init();
@@ -42,130 +72,186 @@ async function initialize() {
 // REGISTRAR VALIDADOR
 // ============================================
 async function register(address, stakeAmount) {
-    if (!address || !stakeAmount) {
-        throw new Error('Dados incompletos');
-    }
+    assertAddress(address);
+    assertPositiveAmount(stakeAmount, 'Stake');
 
     if (!wallet.isValidAddress(address)) {
         throw new Error('Endereço inválido');
-    }
-
-    if (typeof stakeAmount !== 'number' || stakeAmount <= 0) {
-        throw new Error('Stake deve ser um número positivo');
     }
 
     if (stakeAmount < MIN_VALIDATOR_STAKE) {
         throw new Error(`Stake mínimo para validador: ${MIN_VALIDATOR_STAKE} BRD`);
     }
 
-    // Já é validador?
-    const existing = await ValidatorModel.findOne({ address });
-    if (existing) {
-        throw new Error('Endereço já é um validador');
+    // 1) Reserva o registro (inativo). O índice único impede registro duplicado
+    //    mesmo com duas requisições simultâneas.
+    let validator;
+    try {
+        validator = await ValidatorModel.create({
+            address,
+            stake: stakeAmount,
+            active: false
+        });
+    } catch (err) {
+        if (err && err.code === 11000) {
+            throw new Error('Endereço já é um validador');
+        }
+        throw err;
     }
 
-    // Faz o stake (trava o saldo no pool)
-    await staking.stake(address, stakeAmount);
+    // 2) Trava o saldo no pool. Se falhar, remove a reserva (nada fica pela metade).
+    try {
+        await staking.stake(address, stakeAmount);
+    } catch (err) {
+        await ValidatorModel.deleteOne({ _id: validator._id }).catch(() => {});
+        throw err;
+    }
 
-    // Registra como validador no Mongo
-    const validator = await ValidatorModel.create({
-        address,
-        stake: stakeAmount,
-        blocksProposed: 0,
-        rewards: 0,
-        joined: Date.now(),
-        lastBlock: null,
-        active: true,
-        uptime: 100,
-        performance: 0
-    });
+    // 3) Ativa o validador
+    try {
+        validator = await ValidatorModel.findByIdAndUpdate(
+            validator._id,
+            { $set: { active: true } },
+            { new: true }
+        );
+    } catch (err) {
+        console.error(`❌ CRÍTICO: stake feito mas validador não ativado (${address}). Verificar manualmente.`);
+        throw err;
+    }
 
     console.log(`🛡️  Validador registrado: ${address} (${stakeAmount} BRD)`);
-
     return validator.toObject();
 }
 
 // ============================================
 // LISTAR VALIDADORES ATIVOS
 // ============================================
-async function getValidators() {
-    const docs = await ValidatorModel.find({ active: true }).lean();
-    return docs;
+async function getValidators(limit = 500) {
+    const safeLimit = Math.min(Math.max(Number.parseInt(limit, 10) || 500, 1), 1000);
+    return ValidatorModel.find({ active: true })
+        .sort({ stake: -1 })
+        .limit(safeLimit)
+        .lean();
 }
 
 // ============================================
 // SELECIONAR VALIDADOR (PoS — ponderado por stake)
 // ============================================
 async function selectValidator() {
-    const active = await ValidatorModel.find({ active: true }).lean();
+    const active = await ValidatorModel.find({
+        active: true,
+        stake: { $gte: MIN_VALIDATOR_STAKE }
+    }).lean();
+
     if (active.length === 0) return null;
 
     const totalStake = active.reduce((sum, v) => sum + (v.stake || 0), 0);
-    if (totalStake === 0) return null;
+    if (!(totalStake > 0)) return null;
 
-    let random = Math.random() * totalStake;
+    let random = secureRandom() * totalStake;
     for (const validator of active) {
         random -= validator.stake;
-        if (random <= 0) return validator;
+        if (random < 0) return validator;
     }
 
-    return active[0];
+    return active[active.length - 1];
 }
 
 // ============================================
 // ATUALIZAR ESTATÍSTICAS APÓS PROPOR BLOCO
+// (atômico: sem race condition entre leitura e escrita)
 // ============================================
 async function updateValidatorStats(address, blockIndex) {
-    const doc = await ValidatorModel.findOne({ address });
-    if (!doc) return null;
+    assertAddress(address);
+    if (!Number.isInteger(blockIndex) || blockIndex < 0) {
+        throw new Error('Índice de bloco inválido');
+    }
 
-    doc.blocksProposed += 1;
-    doc.lastBlock = blockIndex;
+    const now = Date.now();
 
-    const timeSinceJoined = Math.max(Date.now() - doc.joined, 1);
-    doc.performance = (doc.blocksProposed / timeSinceJoined) * 1000;
+    // Pipeline de update (MongoDB 4.2+): incrementa e recalcula a performance de uma vez
+    const doc = await ValidatorModel.findOneAndUpdate(
+        { address },
+        [
+            {
+                $set: {
+                    blocksProposed: { $add: ['$blocksProposed', 1] },
+                    lastBlock: blockIndex,
+                    performance: {
+                        $multiply: [
+                            {
+                                $divide: [
+                                    { $add: ['$blocksProposed', 1] },
+                                    { $max: [{ $subtract: [now, '$joined'] }, 1] }
+                                ]
+                            },
+                            1000
+                        ]
+                    }
+                }
+            }
+        ],
+        { new: true }
+    ).lean();
 
-    await doc.save();
-    return doc.toObject();
+    return doc || null;
 }
 
 // ============================================
-// ADICIONAR REWARD AO VALIDADOR
+// ADICIONAR REWARD AO VALIDADOR (atômico)
 // ============================================
 async function addReward(address, amount) {
-    const doc = await ValidatorModel.findOne({ address });
-    if (!doc) return null;
+    assertAddress(address);
+    assertPositiveAmount(amount, 'Reward');
 
-    doc.rewards += amount;
-    await doc.save();
+    const doc = await ValidatorModel.findOneAndUpdate(
+        { address },
+        { $inc: { rewards: amount } },
+        { new: true }
+    ).lean();
 
-    return doc.toObject();
+    return doc || null;
 }
 
 // ============================================
 // DESATIVAR VALIDADOR (ex: slashing)
 // ============================================
 async function deactivate(address) {
-    const doc = await ValidatorModel.findOne({ address });
-    if (!doc) throw new Error('Validador não encontrado');
+    assertAddress(address);
 
-    doc.active = false;
-    await doc.save();
-    return doc.toObject();
+    const doc = await ValidatorModel.findOneAndUpdate(
+        { address },
+        { $set: { active: false } },
+        { new: true }
+    ).lean();
+
+    if (!doc) throw new Error('Validador não encontrado');
+    return doc;
 }
 
 // ============================================
-// ESTATÍSTICAS GLOBAIS
+// ESTATÍSTICAS GLOBAIS (agregação no banco, sem carregar tudo em memória)
 // ============================================
 async function getValidatorStats() {
-    const docs = await ValidatorModel.find().lean();
+    const [result] = await ValidatorModel.aggregate([
+        {
+            $group: {
+                _id: null,
+                total: { $sum: 1 },
+                active: { $sum: { $cond: ['$active', 1, 0] } },
+                totalStake: { $sum: '$stake' },
+                totalBlocks: { $sum: '$blocksProposed' },
+                totalRewards: { $sum: '$rewards' }
+            }
+        }
+    ]);
 
     return {
-        total: docs.length,
-        active: docs.filter((v) => v.active).length,
-        totalStake: docs.reduce((sum, v) => sum + (v.stake || 0), 0),
-        totalBlocks: docs.reduce((sum, v) => sum + (v.blocksProposed || 0), 0),
-        totalRewards: docs.reduce((sum, v) => sum + (v.rewards || 0), 0)
+        total: result?.total || 0,
+        active: result?.active || 0,
+        totalStake: result?.totalStake || 0,
+        totalBlocks: result?.totalBlocks || 0,
+        totalRewards: result?.totalRewards || 0
     };
 }
 
@@ -173,6 +259,7 @@ async function getValidatorStats() {
 // BUSCAR VALIDADOR POR ENDEREÇO
 // ============================================
 async function getByAddress(address) {
+    assertAddress(address);
     const doc = await ValidatorModel.findOne({ address }).lean();
     return doc || null;
 }
@@ -181,9 +268,9 @@ async function getByAddress(address) {
 // EXPORTA
 // ============================================
 module.exports = {
-    initialize,            // ✅ server.js precisa
+    initialize,
     register,
-    getValidators,         // ✅ server.js usa em rota + WebSocket
+    getValidators,
     selectValidator,
     updateValidatorStats,
     addReward,
