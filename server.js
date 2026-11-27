@@ -1,20 +1,24 @@
 // server.js
 // ============================================
-// BradiChain - Servidor Principal (v4.2)
+// BradiChain - Servidor Principal (v4.3)
 // ============================================
-// 📝 v4.2 (FASE 1 — correções pré-lançamento):
-//   [1] Removidas rotas duplicadas (/api/v1/token/list, /api/v1/nft/list)
-//   [2] /api/market/price/recalculate e /buy agora exigem admin
-//   [3] /api/validator/register agora exige admin
-//   [4] Logs sanitizados (não loga query string)
-//   [5] /api/explorer/transactions lê da chain real (Mongo)
-//   [6] /api/explorer/stats lê da chain real (sem números fake)
-//   [7] /api/validator/list retorna apenas validadores reais
-//   [8] Removido fallback de "validadores virtuais"
+// v4.3 — revisão de segurança e estabilidade:
+//   [1] /api/validator/* usa o módulo validator.js real (antes usava um model
+//       inexistente e devolvia sucesso falso com uptime/comissão inventados)
+//   [2] Todas as rotas /api/v1/admin/* exigem admin em um único ponto
+//   [3] Validação de entrada (números, endereços, limit/offset) em todas as rotas
+//   [4] Cache com deduplicação (sem "estouro" no Mongo quando o cache expira)
+//   [5] Limite de conexões WebSocket por IP e de tamanho de mensagem
+//   [6] Rate limit de login/registro e do /buy; GET não conta no txLimiter
+//   [7] Checkpoint sem duplicar; timers limpos no shutdown; shutdown idempotente
+//   [8] /health/defense só para admin; /health/detailed sem versão/ambiente em produção
+//   [9] BUY_MASTER_SEED validado ANTES de montar as rotas de /buy
+//   [10] validator.initialize() agora é chamado no boot
 // ============================================
 
 require('dotenv').config();
 
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -37,11 +41,10 @@ const REQUIRED_ENV = [
     'RESERVE_ADDRESS',
     'FEE_COLLECTOR_ADDRESS',
     'MAX_SUPPLY',
-    'BUY_MASTER_SEED',
+    'BUY_MASTER_SEED'
 ];
 
 const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
-
 if (missingEnv.length > 0) {
     console.error(`❌ Variáveis de ambiente obrigatórias faltando: ${missingEnv.join(', ')}`);
     console.error('📄 Copie .env.example para .env e preencha os valores.');
@@ -58,20 +61,37 @@ if (process.env.JWT_SECRET.length < 32) {
     process.exit(1);
 }
 
+const MAX_SUPPLY = Number.parseFloat(process.env.MAX_SUPPLY);
+if (!Number.isFinite(MAX_SUPPLY) || MAX_SUPPLY <= 0) {
+    console.error('❌ MAX_SUPPLY inválido (deve ser um número maior que zero).');
+    process.exit(1);
+}
+
 // ============================================
 // IMPORTAÇÕES LOCAIS
 // ============================================
 const blockchain = require('./blockchain');
 const wallet = require('./wallet');
 const transactions = require('./transactions');
+const validatorModule = require('./validator');
+const staking = require('./staking');
+const explorer = require('./explorer');
 const { logger } = require('./middleware/error');
 
-// 🛡️ v4.1 — Módulos de defesa de consenso
+for (const key of ['RESERVE_ADDRESS', 'FEE_COLLECTOR_ADDRESS']) {
+    if (!wallet.isValidAddress(process.env[key])) {
+        console.error(`❌ ${key} não é um endereço válido.`);
+        process.exit(1);
+    }
+}
+const RESERVE_ADDRESS = wallet.normalizeAddress(process.env.RESERVE_ADDRESS);
+
+// 🛡️ Módulos de defesa de consenso
 const ConsecutiveBlockGuard = require('./consensus/consecutiveBlockGuard');
-const DynamicDifficulty     = require('./consensus/dynamicDifficulty');
-const ReorgDetector         = require('./consensus/reorgDetector');
-const WeakSubjectivity      = require('./consensus/weakSubjectivity');
-const TimestampService      = require('./consensus/timestampService');
+const DynamicDifficulty = require('./consensus/dynamicDifficulty');
+const ReorgDetector = require('./consensus/reorgDetector');
+const WeakSubjectivity = require('./consensus/weakSubjectivity');
+const TimestampService = require('./consensus/timestampService');
 
 // Models
 const User = require('./models/User');
@@ -80,7 +100,7 @@ const TransactionModel = require('./models/Transaction');
 const BlockModel = require('./models/Block');
 
 // Middlewares
-const { authenticate, requireAdmin, optionalAuth } = require('./middleware/auth');
+const { authenticate, requireAdmin } = require('./middleware/auth');
 const { errorHandler, notFoundHandler, asyncHandler, AppError } = require('./middleware/error');
 
 // Routes
@@ -92,8 +112,8 @@ const reserveStakingRoutes = require('./routes/reserveStaking');
 const tokenRoutes = require('./routes/token');
 const nftRoutes = require('./routes/nft');
 const { router: airdropRouter } = require('./routes/airdrop');
+const { router: adminAirdropRouter } = require('./routes/adminAirdrop');
 const governanceRoutes = require('./routes/governance');
-
 const atomicSwapRoutes = require('./routes/atomicSwap');
 const atomicSwap = require('./atomic-swap');
 
@@ -104,29 +124,98 @@ const priceEngine = require('./priceEngine');
 // CONFIGURAÇÃO
 // ============================================
 const IS_PROD = process.env.NODE_ENV === 'production';
-const PORT = parseInt(process.env.PORT) || 3000;
+const PORT = Number.parseInt(process.env.PORT, 10) || 3000;
 const DOMAIN = process.env.DOMAIN || 'localhost';
 const APP_URL = process.env.APP_URL || `http://localhost:${PORT}`;
+const MINING_INTERVAL_MS = Number.parseInt(process.env.MINING_INTERVAL_MS, 10) || 30000;
+const WS_MAX_PER_IP = Number.parseInt(process.env.WS_MAX_PER_IP, 10) || 20;
+const RATE_LIMIT_GENERAL = Number.parseInt(process.env.RATE_LIMIT_GENERAL, 10) || 600;
 
 const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || APP_URL)
     .split(',')
     .map((o) => o.trim())
     .filter(Boolean);
 
+const AMOUNT_REGEX = /^\d{1,18}(\.\d{1,8})?$/;
+
+// ============================================
+// HELPERS
+// ============================================
+function intParam(value, def, min, max) {
+    const raw = Array.isArray(value) ? value[0] : value;
+    const n = Number.parseInt(raw, 10);
+    if (!Number.isFinite(n)) return def;
+    return Math.min(Math.max(n, min), max);
+}
+
+// Aceita string ou número e devolve string canônica (ou lança 400)
+function amountString(value, label = 'Amount') {
+    const str = typeof value === 'number' && Number.isFinite(value)
+        ? value.toFixed(8)
+        : value;
+    if (typeof str !== 'string' || !AMOUNT_REGEX.test(str.trim()) || Number(str) <= 0) {
+        throw new AppError(`${label} inválido`, 400);
+    }
+    return str.trim();
+}
+
+// Cache com deduplicação: se 10 requisições chegam com o cache vencido,
+// só uma consulta ao Mongo é feita.
+const _cache = new Map();
+const _inflight = new Map();
+
+async function cached(key, ttlMs, fn) {
+    const now = Date.now();
+    const entry = _cache.get(key);
+    if (entry && entry.expires > now) {
+        return { value: entry.value, cached: true, ts: entry.ts };
+    }
+    if (_inflight.has(key)) return _inflight.get(key);
+
+    const promise = (async () => {
+        try {
+            const value = await fn();
+            const ts = Date.now();
+            _cache.set(key, { value, ts, expires: ts + ttlMs });
+            return { value, cached: false, ts };
+        } finally {
+            _inflight.delete(key);
+        }
+    })();
+
+    _inflight.set(key, promise);
+    return promise;
+}
+
+function calcAvgBlockTimeSeconds(blocks) {
+    if (!Array.isArray(blocks) || blocks.length < 2) return 0;
+    const ts = blocks
+        .map((b) => new Date(b.timestamp).getTime())
+        .filter(Number.isFinite)
+        .sort((a, b) => b - a);
+    if (ts.length < 2) return 0;
+    let sum = 0;
+    for (let i = 1; i < ts.length; i++) sum += ts[i - 1] - ts[i];
+    return sum / (ts.length - 1) / 1000;
+}
+
 // ============================================
 // INICIALIZAÇÃO DO EXPRESS
 // ============================================
 const app = express();
 const server = http.createServer(app);
+// Evita 502 intermitente atrás de proxy/balanceador (Render, Nginx, etc.)
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
 
 // ============================================
-// 🛡️ v4.1 — Instâncias de defesa de consenso
+// 🛡️ Instâncias de defesa de consenso
 // ============================================
 const consecutiveGuard = new ConsecutiveBlockGuard({ maxConsecutive: 5 });
 const dynamicDiff = new DynamicDifficulty({
     baseTarget: 0x00000fff,
-    minTarget:  0x000000ff,
-    maxTarget:  0x00ffffff,
+    minTarget: 0x000000ff,
+    maxTarget: 0x00ffffff,
     alpha: 0.1,
     decayMs: 60_000
 });
@@ -140,19 +229,21 @@ const weakSubj = new WeakSubjectivity({
     quorum: 0.67,
     maxCheckpointAgeBlocks: 2000
 });
-const timestamps = new TimestampService({ maxEntries: 10_000 });
+const timestampService = new TimestampService({ maxEntries: 10_000 });
 
 app.set('consecutiveGuard', consecutiveGuard);
 app.set('dynamicDiff', dynamicDiff);
 app.set('reorgDetector', reorgDetector);
 app.set('weakSubj', weakSubj);
-app.set('timestamps', timestamps);
+app.set('timestamps', timestampService);
 app.set('atomicSwap', atomicSwap);
 
 // ============================================
-// SOCKET.IO (com auth)
+// SOCKET.IO (com auth e limites)
 // ============================================
 const io = socketIo(server, {
+    maxHttpBufferSize: 1e5,        // 100 KB por mensagem
+    pingTimeout: 20_000,
     cors: {
         origin: ALLOWED_ORIGINS,
         methods: ['GET', 'POST'],
@@ -161,16 +252,14 @@ const io = socketIo(server, {
     allowRequest: (req, callback) => {
         const origin = req.headers.origin;
         if (!origin) return callback(null, true);
-        const ok = ALLOWED_ORIGINS.includes(origin);
-        callback(null, ok);
+        callback(null, ALLOWED_ORIGINS.includes(origin));
     }
 });
 
 io.use(async (socket, next) => {
     try {
         const token = socket.handshake.auth?.token;
-
-        if (!token) {
+        if (!token || typeof token !== 'string') {
             socket.user = null;
             return next();
         }
@@ -190,7 +279,6 @@ io.use(async (socket, next) => {
         } else {
             socket.user = null;
         }
-
         next();
     } catch (error) {
         socket.user = null;
@@ -201,17 +289,17 @@ io.use(async (socket, next) => {
 // ============================================
 // MIDDLEWARE DE SEGURANÇA
 // ============================================
-app.set('trust proxy', 1);
+app.set('trust proxy', Number.parseInt(process.env.TRUST_PROXY_HOPS, 10) || 1);
 
 app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc: ["'self'"],
             scriptSrc: ["'self'"],
-            styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
-            fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
-            imgSrc: ["'self'", "data:", "blob:"],
-            connectSrc: ["'self'", "wss:", "https:"],
+            styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+            fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
+            imgSrc: ["'self'", 'data:', 'blob:'],
+            connectSrc: ["'self'", 'wss:', 'https:'],
             objectSrc: ["'none'"],
             mediaSrc: ["'self'"],
             frameAncestors: ["'none'"],
@@ -226,9 +314,7 @@ app.use(helmet({
         ? { maxAge: 31536000, includeSubDomains: true, preload: true }
         : false,
     referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
-    noSniff: true,
-    frameguard: { action: 'deny' },
-    xssFilter: true
+    frameguard: { action: 'deny' }
 }));
 
 app.use(cors({
@@ -236,7 +322,7 @@ app.use(cors({
         if (!origin) return cb(null, true);
         if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
         logger.warn('CORS bloqueado para origem:', origin);
-        cb(new Error('Origem não permitida pelo CORS'));
+        cb(new AppError('Origem não permitida pelo CORS', 403));
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -251,63 +337,66 @@ app.use(express.json({ limit: '1mb', strict: true }));
 app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 
 // ============================================
-// ✅ FIX [4] — LOGGER SANITIZADO
+// LOGGER SANITIZADO (não loga query string)
 // ============================================
-// Não loga query string (pode conter tokens, emails, etc.)
 function sanitizePathForLog(req) {
     const fullPath = req.originalUrl || req.url || '';
     const qIndex = fullPath.indexOf('?');
-    const pathOnly = qIndex >= 0 ? fullPath.substring(0, qIndex) : fullPath;
-    // também remove parâmetros dinâmicos sensíveis de path
-    return pathOnly;
+    return qIndex >= 0 ? fullPath.substring(0, qIndex) : fullPath;
 }
 
-if (IS_PROD) {
-    app.use((req, res, next) => {
-        const start = Date.now();
-        res.on('finish', () => {
-            const duration = Date.now() - start;
-            if (res.statusCode >= 400 || duration > 1000) {
-                logger.warn('Request', {
-                    method: req.method,
-                    path: sanitizePathForLog(req),
-                    status: res.statusCode,
-                    duration
-                });
-            }
-        });
-        next();
+app.use((req, res, next) => {
+    const start = Date.now();
+    res.on('finish', () => {
+        const duration = Date.now() - start;
+        if (!IS_PROD || res.statusCode >= 400 || duration > 1000) {
+            logger.info(`${req.method} ${sanitizePathForLog(req)} ${res.statusCode} ${duration}ms`);
+        }
     });
-} else {
-    app.use((req, res, next) => {
-        logger.info(`${req.method} ${sanitizePathForLog(req)}`);
-        next();
-    });
-}
+    next();
+});
 
 // ============================================
 // RATE LIMITERS
 // ============================================
+const limiterBase = { standardHeaders: true, legacyHeaders: false };
+
 const generalLimiter = rateLimit({
+    ...limiterBase,
     windowMs: 15 * 60 * 1000,
-    max: 300,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { success: false, error: 'Muitas requisições. Tente novamente em 15 minutos.' }
+    max: RATE_LIMIT_GENERAL,
+    message: { success: false, error: 'Muitas requisições. Tente novamente em alguns minutos.' }
+});
+
+// Login/registro/recuperação: conta só tentativas que falharam (anti força bruta)
+const authLimiter = rateLimit({
+    ...limiterBase,
+    windowMs: 15 * 60 * 1000,
+    max: 30,
+    skipSuccessfulRequests: true,
+    message: { success: false, error: 'Muitas tentativas. Tente novamente em 15 minutos.' }
 });
 
 const txLimiter = rateLimit({
+    ...limiterBase,
     windowMs: 60 * 1000,
     max: 20,
-    keyGenerator: (req) => req.user?._id?.toString() || req.ip,
+    skip: (req) => req.method === 'GET',
     message: { success: false, error: 'Muitas transações. Tente novamente em 1 minuto.' }
 });
 
 const swapLimiter = rateLimit({
+    ...limiterBase,
     windowMs: 60 * 1000,
     max: 30,
-    keyGenerator: (req) => req.user?._id?.toString() || req.ip,
     message: { success: false, error: 'Muitas operações de swap. Tente novamente em 1 minuto.' }
+});
+
+const buyLimiter = rateLimit({
+    ...limiterBase,
+    windowMs: 60 * 1000,
+    max: 20,
+    message: { success: false, error: 'Muitas operações de compra. Tente novamente em 1 minuto.' }
 });
 
 app.use('/api', generalLimiter);
@@ -328,60 +417,56 @@ app.get('/health/detailed', asyncHandler(async (req, res) => {
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
-        version: process.env.npm_package_version || '4.2.0',
         uptime: Math.floor(process.uptime()),
-        environment: process.env.NODE_ENV || 'development',
+        ...(IS_PROD ? {} : {
+            version: process.env.npm_package_version || '4.3.0',
+            environment: process.env.NODE_ENV || 'development'
+        }),
         blockchain: info
     });
 }));
 
-// ============================================
-// 🛡️ v4.1 — DIAGNÓSTICO DOS GUARDS DE DEFESA
-// ============================================
-app.get('/health/defense', (req, res) => {
+// Diagnóstico interno dos guards: só admin
+app.get('/health/defense', authenticate, requireAdmin, (req, res) => {
     try {
-        const currentChain = blockchain.chain || [];
-        const tail = currentChain.slice(-50);
-
+        const tail = (blockchain.chain || []).slice(-50);
         res.json({
             status: 'ok',
             timestamp: new Date().toISOString(),
             guards: {
                 consecutiveBlock: {
                     maxAllowed: 5,
-                    tailValid: consecutiveGuard.validate(tail).ok,
+                    tailValid: consecutiveGuard.validate(tail).ok
                 },
                 dynamicDifficulty: {
                     baseTarget: '0x' + dynamicDiff.baseTarget.toString(16),
-                    stats: dynamicDiff.stats(),
+                    stats: dynamicDiff.stats()
                 },
                 reorgDetector: {
                     maxDepth: reorgDetector.maxDepth,
-                    recentReorgs: reorgDetector.history.length,
+                    recentReorgs: reorgDetector.history.length
                 },
                 weakSubjectivity: {
                     periodBlocks: weakSubj.periodBlocks,
-                    checkpoints: weakSubj.checkpoints.length,
+                    checkpoints: weakSubj.checkpoints.length
                 },
                 timestampService: {
-                    trackedBlocks: timestamps.timestamps.size,
-                },
-            },
+                    trackedBlocks: timestampService.timestamps.size
+                }
+            }
         });
     } catch (err) {
         logger.error('❌ Erro em /health/defense:', err);
-        res.status(500).json({ success: false, error: err.message });
+        res.status(500).json({ success: false, error: 'Erro interno' });
     }
 });
 
 // ============================================
-// 📜 EXPLORER — Rotas públicas (dados REAIS)
+// 📜 EXPLORER — rotas públicas (dados reais)
 // ============================================
-
-// ✅ FIX [5] — /api/explorer/transactions lê da chain real (Mongo)
 app.get('/api/explorer/transactions', asyncHandler(async (req, res) => {
-    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
-    const offset = parseInt(req.query.offset) || 0;
+    const limit = intParam(req.query.limit, 20, 1, 100);
+    const offset = intParam(req.query.offset, 0, 0, 100000);
 
     const [txs, total] = await Promise.all([
         TransactionModel.find({})
@@ -390,15 +475,15 @@ app.get('/api/explorer/transactions', asyncHandler(async (req, res) => {
             .limit(limit)
             .select('hash from to amount fee timestamp status blockIndex blockHash confirmations type')
             .lean(),
-        TransactionModel.countDocuments({})
+        TransactionModel.estimatedDocumentCount()
     ]);
 
-    const formatted = txs.map(tx => ({
+    const data = txs.map((tx) => ({
         hash: tx.hash,
         fromAddress: tx.from || null,
         toAddress: tx.to,
-        amount: tx.amount ? parseFloat(tx.amount.toString()) : 0,
-        fee: tx.fee ? parseFloat(tx.fee.toString()) : 0,
+        amount: tx.amount ? Number.parseFloat(tx.amount.toString()) : 0,
+        fee: tx.fee ? Number.parseFloat(tx.fee.toString()) : 0,
         timestamp: tx.timestamp ? new Date(tx.timestamp).getTime() : null,
         type: tx.type || 'transfer',
         status: tx.status,
@@ -408,160 +493,112 @@ app.get('/api/explorer/transactions', asyncHandler(async (req, res) => {
         confirmations: tx.confirmations ?? 0
     }));
 
-    res.json({
-        success: true,
-        data: formatted,
-        total,
-        limit,
-        offset
-    });
+    res.json({ success: true, data, total, limit, offset });
 }));
 
-// ✅ FIX [6] — /api/explorer/stats lê dados REAIS da chain
 app.get('/api/explorer/stats', asyncHandler(async (req, res) => {
-    // Puxa dados reais em paralelo
-    const [
-        chainInfo,
-        totalWallets,
-        totalTx,
-        recentBlocks,
-        totalStaked
-    ] = await Promise.all([
-        blockchain.getChainInfo(),
-        WalletModel.countDocuments({}),
-        TransactionModel.countDocuments({}),
-        BlockModel.find().sort({ index: -1 }).limit(100).lean(),
-        WalletModel.countDocuments({ status: 'active' }) // placeholder até termos model de stake
-    ]);
+    const { value } = await cached('explorer:stats', 10_000, async () => {
+        const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
-    // Calcula média de tempo entre blocos recentes
-    let avgBlockTime = 0;
-    if (recentBlocks.length >= 2) {
-        const timestamps = recentBlocks
-            .map(b => new Date(b.timestamp).getTime())
-            .filter(t => Number.isFinite(t))
-            .sort((a, b) => b - a);
-        const deltas = [];
-        for (let i = 1; i < timestamps.length; i++) {
-            deltas.push(timestamps[i - 1] - timestamps[i]);
+        const [chainInfo, totalWallets, totalTx, recentBlocks, tx24h] = await Promise.all([
+            blockchain.getChainInfo(),
+            WalletModel.countDocuments({}),
+            TransactionModel.estimatedDocumentCount(),
+            BlockModel.find().sort({ index: -1 }).limit(100).select('index timestamp').lean(),
+            TransactionModel.countDocuments({ timestamp: { $gte: oneDayAgo } })
+        ]);
+
+        let currentPrice = null;
+        let basePrice = null;
+        try {
+            const state = priceEngine.getPriceState();
+            currentPrice = state.currentPrice;
+            basePrice = state.basePrice;
+        } catch (_) {
+            // indisponível: devolve null em vez de inventar
         }
-        if (deltas.length > 0) {
-            avgBlockTime = deltas.reduce((a, b) => a + b, 0) / deltas.length / 1000;
-        }
-    }
 
-    // TPS das últimas 24h (real)
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const tx24h = await TransactionModel.countDocuments({
-        timestamp: { $gte: oneDayAgo }
-    });
-
-    // Preço atual (do priceEngine real)
-    let currentPrice = null;
-    let basePrice = null;
-    try {
-        const state = priceEngine.getPriceState();
-        currentPrice = state.currentPrice;
-        basePrice = state.basePrice;
-    } catch (_) {
-        // Se falhar, retorna null em vez de mentir
-    }
-
-    res.json({
-        success: true,
-        data: {
-            // Rede
+        return {
             blockHeight: chainInfo.totalBlocks || 0,
             difficulty: chainInfo.difficulty || 0,
             chainwork: chainInfo.chainwork || '0',
-            avgBlockTime: Number(avgBlockTime.toFixed(2)),
+            avgBlockTime: Number(calcAvgBlockTimeSeconds(recentBlocks).toFixed(2)),
             pending: chainInfo.pendingTransactions || 0,
             orphanPoolSize: chainInfo.orphanPoolSize || 0,
-
-            // Transações
             totalTX: totalTx,
-            tx24h: tx24h,
-
-            // Wallets
+            tx24h,
             activeWallets: totalWallets,
-
-            // Preço (null se indisponível)
             basePrice,
             currentPrice,
-
-            // Supply (do blockchain real)
             blockReward: chainInfo.blockReward || '0',
-
-            // Info do último bloco
             latestBlock: chainInfo.latestBlock || null
-        },
-        timestamp: Date.now()
+        };
     });
+
+    res.json({ success: true, data: value, timestamp: Date.now() });
 }));
 
 // ============================================
-// 🛡️ VALIDATORS — Lista REAL (sem virtual)
-// ✅ FIX [7] + [8]
+// 🛡️ VALIDATORS
 // ============================================
+function formatValidator(v) {
+    return {
+        address: v.address,
+        publicKey: v.address,
+        stake: v.stake || 0,
+        blocksMined: v.blocksProposed || 0,
+        uptime: null,          // não inventamos uptime
+        commission: null,      // não inventamos comissão
+        status: v.active === false ? 'inactive' : 'active',
+        firstSeen: v.joined || null,
+        lastBlock: v.lastBlock ?? null,
+        lastActive: null
+    };
+}
+
 app.get('/api/validator/list', asyncHandler(async (req, res) => {
-    let validators = [];
+    let validators = (await validatorModule.getValidators(100)).map(formatValidator);
+    let source = 'registry';
 
-    // 1. Tenta buscar do banco (model Validator, se existir)
-    try {
-        const ValidatorModel = require('./models/Validator');
-        validators = await ValidatorModel.find({ status: 'active' })
-            .sort({ stake: -1 })
-            .limit(100)
-            .lean();
-    } catch (_) {
-        // Model não existe — deriva da chain real (sem inventar)
-    }
-
-    // 2. Se não achou no model, deriva da chain REAL (sem fake)
-    if (!validators || validators.length === 0) {
+    // Sem validadores registrados: deriva da chain real (mineradores e stakes)
+    if (validators.length === 0) {
+        source = 'chain';
         const blocks = await BlockModel.find()
             .sort({ index: -1 })
             .limit(1000)
+            .select('minerAddress timestamp transactions.type transactions.fromAddress transactions.amount')
             .lean();
 
-        const addressStake = new Map();
-        const addressBlocks = new Map();
-        const addressFirstSeen = new Map();
-        const addressLastActive = new Map();
+        const stakeBy = new Map();
+        const blocksBy = new Map();
+        const firstSeen = new Map();
+        const lastActive = new Map();
 
         for (const block of blocks) {
             const miner = block.minerAddress;
             if (miner) {
-                addressBlocks.set(miner, (addressBlocks.get(miner) || 0) + 1);
-                if (!addressFirstSeen.has(miner)) {
-                    addressFirstSeen.set(miner, block.timestamp);
-                }
-                addressLastActive.set(miner, block.timestamp);
+                blocksBy.set(miner, (blocksBy.get(miner) || 0) + 1);
+                if (!firstSeen.has(miner)) firstSeen.set(miner, block.timestamp);
+                lastActive.set(miner, block.timestamp);
             }
-
             for (const tx of (block.transactions || [])) {
                 if (tx.type === 'stake' && tx.fromAddress) {
-                    const current = addressStake.get(tx.fromAddress) || 0;
-                    addressStake.set(tx.fromAddress, current + Number(tx.amount || 0));
+                    stakeBy.set(tx.fromAddress, (stakeBy.get(tx.fromAddress) || 0) + Number(tx.amount || 0));
                 }
             }
         }
 
-        const allAddresses = new Set([
-            ...addressBlocks.keys(),
-            ...addressStake.keys()
-        ]);
-
-        validators = Array.from(allAddresses).map((addr) => ({
+        const addresses = new Set([...blocksBy.keys(), ...stakeBy.keys()]);
+        validators = Array.from(addresses).map((addr) => ({
             address: addr,
             publicKey: addr,
-            stake: addressStake.get(addr) || 0,
-            blocksMined: addressBlocks.get(addr) || 0,
-            uptime: null,               // não inventamos uptime
-            commission: null,           // não inventamos comissão
+            stake: stakeBy.get(addr) || 0,
+            blocksMined: blocksBy.get(addr) || 0,
+            uptime: null,
+            commission: null,
             status: 'active',
-            firstSeen: addressFirstSeen.get(addr) || null,
-            lastActive: addressLastActive.get(addr) || null
+            firstSeen: firstSeen.get(addr) || null,
+            lastActive: lastActive.get(addr) || null
         }));
     }
 
@@ -571,58 +608,40 @@ app.get('/api/validator/list', asyncHandler(async (req, res) => {
         success: true,
         data: validators,
         total: validators.length,
+        source,
         timestamp: Date.now()
     });
 }));
 
-// ============================================
-// 🛡️ VALIDATOR — Registro (agora exige ADMIN)
-// ✅ FIX [3]
-// ============================================
+// Registro de validador (admin). Agora trava o stake de verdade via validator.js
 app.post(
     '/api/validator/register',
     authenticate,
     requireAdmin,
     asyncHandler(async (req, res) => {
-        const { address, stake } = req.body;
-
-        if (!address || !address.startsWith('Br')) {
-            throw new AppError('Endereço inválido (deve começar com "Br")', 400);
+        const address = wallet.normalizeAddress(req.body?.address);
+        if (!wallet.isValidAddress(address)) {
+            throw new AppError('Endereço inválido', 400);
         }
 
-        const MIN_STAKE = 1000;
-        const stakeNum = Number(stake || 0);
-
-        if (stakeNum < MIN_STAKE) {
-            throw new AppError(`Stake mínimo é ${MIN_STAKE} BRD`, 400);
+        const stakeNum = Number(req.body?.stake);
+        if (!Number.isFinite(stakeNum) || stakeNum < validatorModule.MIN_VALIDATOR_STAKE) {
+            throw new AppError(`Stake mínimo é ${validatorModule.MIN_VALIDATOR_STAKE} BRD`, 400);
         }
 
         let saved;
         try {
-            const ValidatorModel = require('./models/Validator');
-            saved = await ValidatorModel.findOneAndUpdate(
-                { address },
-                {
-                    address,
-                    stake: stakeNum,
-                    status: 'active',
-                    uptime: 99.99,
-                    commission: 5,
-                    lastActive: Date.now(),
-                    $setOnInsert: { firstSeen: Date.now() }
-                },
-                { upsert: true, new: true }
-            );
-        } catch (_) {
-            saved = { address, stake: stakeNum, status: 'active' };
+            saved = await validatorModule.register(address, stakeNum);
+        } catch (err) {
+            throw new AppError(err.message || 'Falha ao registrar validador', 400);
         }
 
-        logger.info(`🛡️ Novo validador registrado: ${address} (${stakeNum} BRD)`);
+        logger.warn(`🛡️ ADMIN ${req.user._id} registrou validador ${address} (${stakeNum} BRD)`);
 
         res.json({
             success: true,
             message: 'Validador registrado com sucesso',
-            data: saved
+            data: formatValidator(saved)
         });
     })
 );
@@ -630,7 +649,6 @@ app.post(
 // ============================================
 // 💰 PREÇO DINÂMICO
 // ============================================
-
 app.get('/api/market/price', (req, res) => {
     const state = priceEngine.getPriceState();
     res.json({
@@ -650,70 +668,76 @@ app.get('/api/market/price/history', (req, res) => {
     res.json({ success: true, data: state.history });
 });
 
-// ✅ FIX [2] — agora exige admin
 app.post(
     '/api/market/price/recalculate',
     authenticate,
     requireAdmin,
     asyncHandler(async (req, res) => {
-        const newPrice = priceEngine.calculatePrice(req.body || {});
+        // Só aceita os 4 campos conhecidos, todos números finitos >= 0
+        const input = {};
+        for (const key of ['tx24h', 'stakingAmount', 'newWallets', 'burnedAmount']) {
+            const n = Number(req.body?.[key]);
+            input[key] = Number.isFinite(n) && n >= 0 ? n : 0;
+        }
+        const newPrice = priceEngine.calculatePrice(input);
+        logger.warn(`💰 ADMIN ${req.user._id} recalculou o preço manualmente → ${newPrice}`);
         res.json({ success: true, data: { price: newPrice } });
     })
 );
 
-// ✅ FIX [2] — agora exige admin
 app.post(
     '/api/market/price/buy',
     authenticate,
     requireAdmin,
     asyncHandler(async (req, res) => {
-        const { amount } = req.body;
-        if (!amount || amount <= 0) {
-            throw new AppError('Amount inválido', 400);
-        }
-        const newPrice = priceEngine.applyBoost(Number(amount), 'buy');
+        const amount = Number(amountString(req.body?.amount));
+        const newPrice = priceEngine.applyBoost(amount, 'buy');
+        logger.warn(`💰 ADMIN ${req.user._id} aplicou boost de preço (${amount}) → ${newPrice}`);
         res.json({ success: true, data: { price: newPrice, amount } });
     })
 );
 
-logger.info('✅ Rotas: /api/market/price*');
+// ============================================
+// 📊 LISTAS PÚBLICAS (token / nft) — antes dos routers
+// ============================================
+function publicListRoute(modelPath, label) {
+    return asyncHandler(async (req, res) => {
+        try {
+            const Model = require(modelPath);
+            const items = await Model.find({ status: 'active' })
+                .sort({ createdAt: -1 })
+                .limit(100)
+                .lean();
+            res.json({ success: true, data: items, total: items.length });
+        } catch (err) {
+            logger.warn(`Lista de ${label} indisponível: ${err.message}`);
+            res.json({ success: true, data: [], total: 0 });
+        }
+    });
+}
+
+app.get('/api/v1/token/list', publicListRoute('./models/Token', 'tokens'));
+app.get('/api/v1/nft/list', publicListRoute('./models/NFT', 'NFTs'));
 
 // ============================================
-// 📊 TOKEN LIST — público (vem ANTES de tokenRoutes)
+// 🛒 BUY — valida BUY_MASTER_SEED ANTES de montar as rotas
 // ============================================
-app.get('/api/v1/token/list', asyncHandler(async (req, res) => {
-    try {
-        const TokenModel = require('./models/Token');
-        const tokens = await TokenModel.find({ status: 'active' })
-            .sort({ createdAt: -1 })
-            .limit(100)
-            .lean();
-        res.json({ success: true, data: tokens, total: tokens.length });
-    } catch (_) {
-        res.json({ success: true, data: [], total: 0 });
+let buyEnabled = false;
+try {
+    const deposit = require('./services/buy/depositAddress');
+    if (!deposit.selfTest()) {
+        console.error('❌ BUY_MASTER_SEED inválida — abortando boot');
+        process.exit(1);
     }
-}));
-
-// ============================================
-// 📊 NFT LIST — público (vem ANTES de nftRoutes)
-// ============================================
-app.get('/api/v1/nft/list', asyncHandler(async (req, res) => {
-    try {
-        const NFTModel = require('./models/NFT');
-        const nfts = await NFTModel.find({ status: 'active' })
-            .sort({ createdAt: -1 })
-            .limit(100)
-            .lean();
-        res.json({ success: true, data: nfts, total: nfts.length });
-    } catch (_) {
-        res.json({ success: true, data: [], total: 0 });
-    }
-}));
+    buyEnabled = true;
+} catch (err) {
+    logger.error(`⚠️ depositAddress não carregou: ${err.message} (rotas /buy desativadas)`);
+}
 
 // ============================================
 // ROTAS DA API — v1
 // ============================================
-app.use('/api/v1/auth', authRoutes);
+app.use('/api/v1/auth', authLimiter, authRoutes);
 app.use('/api/v1/wallet', walletRoutes);
 app.use('/api/v1/transaction', txLimiter, transactionRoutes);
 app.use('/api/v1/reserve', reserveRoutes);
@@ -721,106 +745,63 @@ app.use('/api/v1/reserve-staking', reserveStakingRoutes);
 app.use('/api/v1/token', tokenRoutes);
 app.use('/api/v1/nft', nftRoutes);
 app.use('/api/v1/airdrop', airdropRouter);
-const { router: adminAirdropRouter } = require('./routes/adminAirdrop');
-app.use('/api/v1/admin/airdrop', adminAirdropRouter);
 app.use('/api/v1/governance', governanceRoutes);
 app.use('/api/atomic-swap', swapLimiter, atomicSwapRoutes);
 
-const buyRoutes = require('./routes/buy');
-app.use('/api/v1/buy', buyRoutes);
+// 🔐 Tudo em /api/v1/admin/* exige admin, em um único ponto
+app.use('/api/v1/admin', authenticate, requireAdmin);
+app.use('/api/v1/admin/airdrop', adminAirdropRouter);
 
-// ============================================
-// 🛒 Validação do BUY_MASTER_SEED ANTES de montar rotas
-// ============================================
-try {
-    const deposit = require('./services/buy/depositAddress');
-    if (!deposit.selfTest()) {
-        console.error('❌ BUY_MASTER_SEED inválida — abortando boot');
-        process.exit(1);
-    }
-} catch (err) {
-    console.warn(`⚠️ depositAddress não carregou: ${err.message}`);
-    console.warn('   (rotas /buy vão falhar — verifique BUY_MASTER_SEED no .env)');
+if (buyEnabled) {
+    app.use('/api/v1/buy', buyLimiter, require('./routes/buy'));
+} else {
+    app.use('/api/v1/buy', (req, res) =>
+        res.status(503).json({ success: false, error: 'Compra temporariamente indisponível' }));
 }
 
-// ============================================
-// 🔗 ALIAS — rotas sem /v1 (compatibilidade com frontend público)
-// ============================================
-// O frontend do explorer chama /api/wallet/... e /api/transaction/...
-// sem o prefixo /v1. Estas linhas criam aliases para essas rotas.
-
+// Aliases sem /v1 (compatibilidade com o frontend público)
 app.use('/api/wallet', walletRoutes);
 app.use('/api/transaction', txLimiter, transactionRoutes);
 app.use('/api/token', tokenRoutes);
 app.use('/api/nft', nftRoutes);
 
-logger.info('✅ Aliases /api/wallet, /api/transaction, /api/token, /api/nft registrados');
+logger.info('✅ Rotas da API registradas');
 
 // ============================================
-// 📊 NETWORK STATS — Painel agregado (dados REAIS)
-// Cola antes de: logger.info('✅ Rotas v1 registradas');
+// 📊 NETWORK STATS (cache de 15s, sem estouro)
 // ============================================
-
-const staking = require('./staking');
-const explorer = require('./explorer');
-
-// Cache interno de 15s (evita martelar Mongo quando 10 abas abrem junto)
-const _nsCache = { data: null, ts: 0 };
-const NS_CACHE_TTL = 15000;
-
-app.get('/api/network/stats', asyncHandler(async (req, res) => {
-    // Cache
-    if (_nsCache.data && (Date.now() - _nsCache.ts) < NS_CACHE_TTL) {
-        return res.json({ success: true, cached: true, timestamp: _nsCache.ts, data: _nsCache.data });
-    }
-
+async function buildNetworkStats() {
     const now = Date.now();
     const oneDayAgo = new Date(now - 86400000);
-    const MAX_SUPPLY = parseFloat(process.env.MAX_SUPPLY || '0');
 
-    // ===== Chamadas em paralelo =====
     const [
-        chainInfo,
-        totalTx,
-        tx24h,
-        activeWallets,
-        newWalletsToday,
-        feesAgg,
-        volumeAgg,
-        stakingStats,
-        priceState,
-        latestBlocks,
-        reserveDoc
+        chainInfo, totalTx, tx24h, activeWallets, newWalletsToday,
+        feesAgg, volumeAgg, stakingStats, priceState, latestBlocks, reserveDoc
     ] = await Promise.all([
         blockchain.getChainInfo().catch(() => ({})),
-        TransactionModel.countDocuments({}).catch(() => 0),
+        TransactionModel.estimatedDocumentCount().catch(() => 0),
         TransactionModel.countDocuments({ timestamp: { $gte: oneDayAgo } }).catch(() => 0),
         WalletModel.countDocuments({ status: 'active' }).catch(() => 0),
         WalletModel.countDocuments({ createdAt: { $gte: oneDayAgo } }).catch(() => 0),
 
-        // Soma de fees das últimas 24h
         TransactionModel.aggregate([
             { $match: { timestamp: { $gte: oneDayAgo } } },
             { $group: { _id: null, total: { $sum: { $toDouble: '$fee' } }, count: { $sum: 1 } } }
         ]).catch(() => []),
 
-        // Volume 24h (soma de amount de TX não-sistema)
         TransactionModel.aggregate([
             { $match: { timestamp: { $gte: oneDayAgo }, from: { $ne: null } } },
             { $group: { _id: null, total: { $sum: { $toDouble: '$amount' } } } }
         ]).catch(() => []),
 
-        staking.getStakingStats().catch(() => ({ totalStaked: 0, totalRewards: 0, activeStakers: 0, apy: 18 })),
+        staking.getStakingStats().catch(() => ({ totalStaked: 0, totalRewards: 0, activeStakers: 0 })),
 
         Promise.resolve().then(() => {
-            try { return priceEngine.getPriceState(); }
-            catch (_) { return null; }
+            try { return priceEngine.getPriceState(); } catch (_) { return null; }
         }),
 
-        // Últimos 100 blocos (para descentralização e avg block time)
-        BlockModel.find().sort({ index: -1 }).limit(100).lean().catch(() => []),
+        BlockModel.find().sort({ index: -1 }).limit(100).select('index timestamp minerAddress').lean().catch(() => []),
 
-        // Reserve (para locked)
         Promise.resolve().then(async () => {
             try {
                 const { ReserveModel } = require('./models/Reserve');
@@ -829,44 +810,25 @@ app.get('/api/network/stats', asyncHandler(async (req, res) => {
         })
     ]);
 
-    // ===== Cálculos derivados (REAIS) =====
-
-    // Avg block time dos últimos 100 blocos
-    let avgBlockTime = 30;
-    if (latestBlocks.length >= 2) {
-        const ts = latestBlocks
-            .map(b => new Date(b.timestamp).getTime())
-            .filter(Number.isFinite)
-            .sort((a, b) => b - a);
-        const deltas = [];
-        for (let i = 1; i < ts.length; i++) deltas.push(ts[i - 1] - ts[i]);
-        if (deltas.length) avgBlockTime = deltas.reduce((a, b) => a + b, 0) / deltas.length / 1000;
-    }
-
+    const avgBlockTime = calcAvgBlockTimeSeconds(latestBlocks);
     const blocksPerMin = avgBlockTime > 0 ? 60 / avgBlockTime : 0;
     const tps = tx24h / 86400;
-    const avgConfirmation = avgBlockTime;
 
-    // ===== Supply REAL =====
+    // Supply
     let minedSupply = 0;
-    try { minedSupply = explorer.calculateTotalSupply() || 0; } catch (_) {}
+    try { minedSupply = explorer.calculateTotalSupply() || 0; } catch (_) { /* mantém 0 */ }
 
-    const total = minedSupply;
-    const locked = reserveDoc ? parseFloat(reserveDoc.balance.toString()) : 0;
+    const locked = reserveDoc ? Number.parseFloat(reserveDoc.balance.toString()) : 0;
     const staked = Number(stakingStats.totalStaked || 0);
-    const burned = 0; // sem mechanism de burn ainda
-    const circulating = Math.max(0, total - locked - burned);
+    const burned = 0;
+    const circulating = Math.max(0, minedSupply - locked - burned);
 
-    // ===== Market Cap REAL =====
+    // Preço de referência
     const currentPrice = priceState?.currentPrice || 0;
     const basePrice = priceState?.basePrice || 0;
     const maxPrice = priceState?.maxPrice || currentPrice * 1.5;
 
-    const realMarketCap = circulating * currentPrice;
-    const dilutedMC = MAX_SUPPLY * currentPrice;
-    const targetMC = MAX_SUPPLY * maxPrice;
-
-    // ===== Descentralização (HHI) =====
+    // Descentralização (HHI) e saúde da rede
     let decentralization = 0;
     let networkHealth = 0;
     try {
@@ -886,47 +848,38 @@ app.get('/api/network/stats', asyncHandler(async (req, res) => {
         const orphanPenalty = Math.min(20, (chainInfo.orphanPoolSize || 0) * 2);
         const decPenalty = (100 - decentralization) / 5;
         networkHealth = Math.max(0, Math.round((100 - pendingPenalty - orphanPenalty - decPenalty) * 10) / 10);
-    } catch (_) {}
+    } catch (_) { /* mantém 0 */ }
 
     const feesToday = feesAgg[0]?.total || 0;
     const tx24hCount = feesAgg[0]?.count || tx24h;
     const avgFee = tx24hCount > 0 ? feesToday / tx24hCount : 0;
-    const volume24h = volumeAgg[0]?.total || 0;
 
-    // ===== Validação da chain =====
-    let isValid = true;
-    try { isValid = chainInfo.isValid !== false; } catch (_) {}
-
-    const responseData = {
-        // Rede
+    return {
         blockHeight: chainInfo.totalBlocks || 0,
         blocksPerMin: Number(blocksPerMin.toFixed(1)),
         avgBlockTime: Number(avgBlockTime.toFixed(1)),
-        nodesOnline: 1,             // TODO: pegar do P2P quando expuser contagem
+        nodesOnline: 1,
         validators: stakingStats.activeStakers || 0,
         networkHealth,
         decentralization,
         difficulty: chainInfo.difficulty || 0,
-        isValid,
+        isValid: chainInfo.isValid !== false,
 
-        // Transações
         tps: Number(tps.toFixed(2)),
-        avgConfirmation: Number(avgConfirmation.toFixed(1)),
+        avgConfirmation: Number(avgBlockTime.toFixed(1)),
         avgFee: Number(avgFee.toFixed(4)),
-        volume24h,
+        volume24h: volumeAgg[0]?.total || 0,
         feesToday,
         pending: chainInfo.pendingTransactions || 0,
         totalTX: totalTx,
         tx24h,
 
-        // Wallets
         activeWallets,
         newToday: newWalletsToday,
         inStaking: stakingStats.activeStakers || 0,
-        topHolders: 0,               // vem do /api/explorer/rich-list
+        topHolders: 0,
 
-        // Supply (REAL)
-        total,
+        total: minedSupply,
         circulating,
         maxSupply: MAX_SUPPLY,
         locked,
@@ -934,58 +887,49 @@ app.get('/api/network/stats', asyncHandler(async (req, res) => {
         burned,
         deflation: 0,
 
-        // Preço (REAL)
         basePrice,
         currentPrice,
         priceSupport: basePrice,
         maxPrice,
-        realMarketCap,
-        dilutedMC,
-        targetMC,
+        realMarketCap: circulating * currentPrice,
+        dilutedMC: MAX_SUPPLY * currentPrice,
+        targetMC: MAX_SUPPLY * maxPrice,
         variation24h: priceState?.variation24h || 0,
 
-        // Estabilidade (sem mecanismo ainda)
         buybackActive: false,
         stabilityFund: 0,
         boughtToday: 0,
         burnedToday: 0,
 
-        // Meta
         latestBlock: chainInfo.latestBlock || null,
         cachedAt: now
     };
+}
 
-    _nsCache.data = responseData;
-    _nsCache.ts = now;
-
-    res.json({ success: true, cached: false, timestamp: now, data: responseData });
+app.get('/api/network/stats', asyncHandler(async (req, res) => {
+    const result = await cached('network:stats', 15_000, buildNetworkStats);
+    res.json({ success: true, cached: result.cached, timestamp: result.ts, data: result.value });
 }));
 
-// ============================================
-// 📊 SUPPLY DETALHADO (endpoint alternativo)
-// ============================================
 app.get('/api/network/supply', asyncHandler(async (req, res) => {
-    const MAX_SUPPLY = parseFloat(process.env.MAX_SUPPLY || '0');
+    const { value } = await cached('network:supply', 15_000, async () => {
+        let mined = 0;
+        try { mined = explorer.calculateTotalSupply() || 0; } catch (_) { /* 0 */ }
 
-    let mined = 0;
-    try { mined = explorer.calculateTotalSupply() || 0; } catch (_) {}
+        let reserve = 0;
+        try {
+            const { ReserveModel } = require('./models/Reserve');
+            const r = await ReserveModel.getReserve();
+            reserve = Number.parseFloat(r.balance.toString());
+        } catch (_) { /* 0 */ }
 
-    let reserve = 0;
-    try {
-        const { ReserveModel } = require('./models/Reserve');
-        const r = await ReserveModel.getReserve();
-        reserve = parseFloat(r.balance.toString());
-    } catch (_) {}
+        let stakedTotal = 0;
+        try {
+            const s = await staking.getStakingStats();
+            stakedTotal = s.totalStaked || 0;
+        } catch (_) { /* 0 */ }
 
-    let stakedTotal = 0;
-    try {
-        const s = await staking.getStakingStats();
-        stakedTotal = s.totalStaked || 0;
-    } catch (_) {}
-
-    res.json({
-        success: true,
-        data: {
+        return {
             maxSupply: MAX_SUPPLY,
             total: mined,
             circulating: Math.max(0, mined - reserve),
@@ -993,80 +937,72 @@ app.get('/api/network/supply', asyncHandler(async (req, res) => {
             staked: stakedTotal,
             burned: 0,
             remaining: Math.max(0, MAX_SUPPLY - mined)
-        }
+        };
     });
+    res.json({ success: true, data: value });
 }));
 
-// ============================================
-// 📊 RICH LIST — Top Holders (expõe explorer.getRichList)
-// ============================================
 app.get('/api/explorer/rich-list', asyncHandler(async (req, res) => {
-    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
-    const result = await explorer.getRichList(limit);
-    res.json({ success: true, data: result });
+    const limit = intParam(req.query.limit, 100, 1, 500);
+    const { value } = await cached(`rich:${limit}`, 30_000, () => explorer.getRichList(limit));
+    res.json({ success: true, data: value });
 }));
 
 // ============================================
-// ROTAS DE ADMIN
+// ROTAS DE ADMIN (o gate authenticate+requireAdmin já vale para /api/v1/admin/*)
 // ============================================
 app.post(
     '/api/v1/admin/reserve/send',
-    authenticate,
-    requireAdmin,
     txLimiter,
     asyncHandler(async (req, res) => {
-        const {
-            fromAddress, toAddress, amount, fee,
-            nonce, timestamp, signature, publicKey
-        } = req.body;
+        const { toAddress, amount, fee, nonce, timestamp, signature, publicKey } = req.body || {};
+        const fromAddress = wallet.normalizeAddress(req.body?.fromAddress);
 
-        if (fromAddress !== process.env.RESERVE_ADDRESS) {
+        if (fromAddress !== RESERVE_ADDRESS) {
             throw new AppError('Admin só pode enviar do Reserve', 403);
         }
 
+        const safeAmount = amountString(amount);
+        const safeFee = fee === undefined || fee === null || fee === '' ? '0' : String(fee);
+        if (!/^\d{1,18}(\.\d{1,8})?$/.test(safeFee)) {
+            throw new AppError('Fee inválida', 400);
+        }
+
         const result = await transactions.submitSignedTransaction({
-            fromAddress, toAddress, amount,
-            fee: fee || '0',
+            fromAddress,
+            toAddress: wallet.normalizeAddress(toAddress),
+            amount: safeAmount,
+            fee: safeFee,
             nonce, timestamp,
             type: 'transfer',
             signature, publicKey
         });
 
-        res.json({
-            success: true,
-            message: 'Transação do Reserve submetida',
-            data: result
-        });
+        logger.warn(`🏦 ADMIN ${req.user._id} enviou ${safeAmount} BRD do Reserve para ${toAddress}`);
+
+        res.json({ success: true, message: 'Transação do Reserve submetida', data: result });
     })
 );
 
 app.get(
     '/api/v1/admin/reserve/info',
-    authenticate,
-    requireAdmin,
     asyncHandler(async (req, res) => {
         const { ReserveModel } = require('./models/Reserve');
-        const info = await ReserveModel.getInfo();
-        res.json({ success: true, data: info });
+        res.json({ success: true, data: await ReserveModel.getInfo() });
     })
 );
 
 app.post(
     '/api/v1/admin/reserve/mint',
-    authenticate,
-    requireAdmin,
     asyncHandler(async (req, res) => {
-        const { amount } = req.body;
-        if (!amount) throw new AppError('Amount é obrigatório', 400);
+        const amount = amountString(req.body?.amount);
 
         const { ReserveModel } = require('./models/Reserve');
-        const reserve = await ReserveModel.mint(amount.toString(), req.user._id);
+        const reserve = await ReserveModel.mint(amount, req.user._id);
 
-        res.json({
-            success: true,
-            message: `Minted ${amount} BRD`,
-            data: reserve.toPublic()
-        });
+        logger.warn(`🏦 ADMIN ${req.user._id} fez MINT de ${amount} BRD`);
+
+        res.json({ success: true, message: `Minted ${amount} BRD`, data: reserve.toPublic() });
     })
 );
 
@@ -1075,18 +1011,36 @@ logger.info('✅ Rotas de admin: /api/v1/admin/*');
 // ============================================
 // WEBSOCKET — EVENTOS
 // ============================================
+const wsByIp = new Map();
+
+function clientIp(socket) {
+    const xff = socket.handshake.headers['x-forwarded-for'];
+    if (xff) return String(xff).split(',').pop().trim();   // IP adicionado pelo proxy
+    return socket.handshake.address;
+}
+
 io.on('connection', async (socket) => {
-    const authType = socket.user ? `user ${socket.user.username}` : 'anonymous';
-    logger.info(`🔌 WS conectado: ${socket.id} (${authType})`);
+    const ip = clientIp(socket);
+    const current = wsByIp.get(ip) || 0;
+
+    if (current >= WS_MAX_PER_IP) {
+        socket.disconnect(true);
+        return;
+    }
+    wsByIp.set(ip, current + 1);
+
+    logger.info(`🔌 WS conectado: ${socket.id} (${socket.user ? 'autenticado' : 'anônimo'})`);
 
     try {
-        const info = await blockchain.getChainInfo();
-        socket.emit('blockchain:init', info);
+        socket.emit('blockchain:init', await blockchain.getChainInfo());
     } catch (error) {
         logger.error('Erro ao enviar init WS:', error);
     }
 
     socket.on('disconnect', () => {
+        const left = (wsByIp.get(ip) || 1) - 1;
+        if (left <= 0) wsByIp.delete(ip);
+        else wsByIp.set(ip, left);
         logger.info(`🔌 WS desconectado: ${socket.id}`);
     });
 });
@@ -1099,15 +1053,9 @@ app.use(express.static(path.join(__dirname, 'public'), {
     etag: true
 }));
 
-app.get('*', (req, res, next) => {
-    if (req.path.startsWith('/api')) {
-        return next();
-    }
-    if (req.path.includes('..') || req.path.includes('\0')) {
-        throw new AppError('Caminho inválido', 400);
-    }
-    const indexPath = path.join(__dirname, 'public', 'index.html');
-    res.sendFile(indexPath, (err) => {
+// Qualquer rota que não seja /api cai no index.html
+app.get(/^\/(?!api(\/|$)).*/, (req, res, next) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'), (err) => {
         if (err) next();
     });
 });
@@ -1143,42 +1091,46 @@ let miningInterval = null;
 let miningLock = false;
 let lastKnownHead = null;
 
-const MINING_INTERVAL_MS = parseInt(process.env.MINING_INTERVAL_MS) || 30000;
+const GUARD_ENABLED = process.env.ENFORCE_CONSECUTIVE_GUARD !== 'false';
 
-async function startAutoMining() {
+function startAutoMining() {
+    if (process.env.AUTO_MINING_ENABLED === 'false') {
+        logger.warn('⚠️ Auto-mining desativado (AUTO_MINING_ENABLED=false)');
+        return;
+    }
+
+    const minerAddress = wallet.normalizeAddress(process.env.AUTO_MINER_ADDRESS || '');
+    if (!wallet.isValidAddress(minerAddress)) {
+        logger.warn('⚠️ AUTO_MINER_ADDRESS ausente ou inválido — auto-mining não iniciado');
+        return;
+    }
+
     miningInterval = setInterval(async () => {
         if (miningLock) return;
         miningLock = true;
 
         try {
-            if (!blockchain.pendingTransactions || blockchain.pendingTransactions.length === 0) {
-                return;
-            }
+            if (!blockchain.pendingTransactions || blockchain.pendingTransactions.length === 0) return;
 
-            const minerAddress = process.env.AUTO_MINER_ADDRESS;
-            if (!minerAddress) {
-                logger.warn('AUTO_MINER_ADDRESS não configurado, pulando mineração');
-                return;
-            }
-
-            const minerWallet = await WalletModel.findOne({ address: minerAddress });
+            const minerWallet = await WalletModel.findOne({ address: minerAddress }).select('_id').lean();
             if (!minerWallet) {
                 logger.warn(`Carteira do minerador não encontrada: ${minerAddress}`);
                 return;
             }
 
-            const recentChain = (blockchain.chain || []).slice(-20);
-            const tailCheck = consecutiveGuard.validate(recentChain);
-            if (!tailCheck.ok) {
-                logger.warn(`🛡️ Mineração bloqueada: ${tailCheck.reason} (${tailCheck.streak}x ${tailCheck.producer})`);
-                return;
+            if (GUARD_ENABLED) {
+                const tailCheck = consecutiveGuard.validate((blockchain.chain || []).slice(-20));
+                if (!tailCheck.ok) {
+                    logger.warn(`🛡️ Mineração bloqueada: ${tailCheck.reason} (${tailCheck.streak}x ${tailCheck.producer})`);
+                    return;
+                }
             }
 
             const chain = blockchain.chain || [];
             const currentHead = chain[chain.length - 1];
 
             if (currentHead && lastKnownHead) {
-                const prevStillInChain = chain.some(b => b.hash === lastKnownHead.hash);
+                const prevStillInChain = chain.some((b) => b.hash === lastKnownHead.hash);
                 if (!prevStillInChain) {
                     const reorgCheck = reorgDetector.check(currentHead, lastKnownHead);
                     if (!reorgCheck.ok && reorgCheck.action === 'halt_and_alert') {
@@ -1188,7 +1140,6 @@ async function startAutoMining() {
                     logger.warn(`⚠️ Reorg detectado (profundidade: ${lastKnownHead.index - currentHead.index})`);
                 }
             }
-
             if (currentHead) lastKnownHead = currentHead;
 
             const target = dynamicDiff.getTarget(minerAddress);
@@ -1197,7 +1148,7 @@ async function startAutoMining() {
             const block = await blockchain.minePendingTransactions(minerAddress);
             if (block) {
                 dynamicDiff.recordAttempt(minerAddress);
-                timestamps.stamp(block);
+                timestampService.stamp(block);
 
                 logger.info(`⛏️ Bloco ${block.index} minerado (${block.transactions.length} txs)`);
 
@@ -1216,19 +1167,18 @@ async function startAutoMining() {
     }, MINING_INTERVAL_MS);
 
     logger.info(`⛏️ Auto-mining iniciado (intervalo: ${MINING_INTERVAL_MS}ms)`);
-    logger.info(`🛡️ Guards ativos: ConsecutiveBlock, ReorgDetector, DynamicDifficulty, TimestampService`);
 }
 
 // ============================================
 // 💰 AUTO-RECALCULADOR DE PREÇO (5 min)
 // ============================================
+let priceInterval = null;
+
 function startAutoPriceUpdate() {
-    setInterval(async () => {
+    priceInterval = setInterval(async () => {
         try {
             const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-            const tx24h = await TransactionModel.countDocuments({
-                timestamp: { $gte: oneDayAgo }
-            });
+            const tx24h = await TransactionModel.countDocuments({ timestamp: { $gte: oneDayAgo } });
 
             const newPrice = priceEngine.calculatePrice({
                 tx24h,
@@ -1247,20 +1197,19 @@ function startAutoPriceUpdate() {
 }
 
 // ============================================
-// 🛡️ v4.1 — Checkpoint periódico
+// 🛡️ Checkpoint periódico
 // ============================================
 let checkpointInterval = null;
+let lastCheckpointHeight = -1;
 
 function startCheckpointing() {
-    checkpointInterval = setInterval(async () => {
+    checkpointInterval = setInterval(() => {
         try {
             const chain = blockchain.chain || [];
             const head = chain[chain.length - 1];
-            if (!head) return;
+            if (!head || head.index % 100 !== 0) return;
+            if (head.index === lastCheckpointHeight) return;   // não repete no mesmo bloco
 
-            if (head.index % 100 !== 0) return;
-
-            const crypto = require('crypto');
             const root = crypto.createHash('sha256')
                 .update(JSON.stringify(head.state || head.stateRoot || { index: head.index }))
                 .digest('hex');
@@ -1270,17 +1219,12 @@ function startCheckpointing() {
                 : [];
 
             const signatures = validatorSet
-                .filter(v => v.status === 'active')
-                .map(v => ({ validator: v.id || v.address, valid: true }));
+                .filter((v) => v.status === 'active')
+                .map((v) => ({ validator: v.id || v.address, valid: true }));
 
-            const checkpoint = {
-                height: head.index,
-                root,
-                signatures,
-                ts: Date.now(),
-            };
+            weakSubj.addCheckpoint({ height: head.index, root, signatures, ts: Date.now() });
+            lastCheckpointHeight = head.index;
 
-            weakSubj.addCheckpoint(checkpoint);
             logger.info(`🛡️ Checkpoint criado no bloco ${head.index} (root: ${root.slice(0, 12)}...)`);
         } catch (err) {
             logger.error('❌ Erro ao criar checkpoint:', err.message);
@@ -1309,14 +1253,15 @@ async function initialize() {
         await blockchain.initialize();
         await wallet.initialize();
         await transactions.initialize();
+        await validatorModule.initialize();
 
-        // 🌐 P2P — opcional (desativado com P2P_ENABLED=false)
+        // 🌐 P2P — opcional (P2P_ENABLED=false desativa)
         if (process.env.P2P_ENABLED !== 'false') {
             try {
                 const { startP2P } = require('./p2p');
                 const p2pResult = await startP2P({
                     blockchain,
-                    port: parseInt(process.env.P2P_PORT) || 4001
+                    port: Number.parseInt(process.env.P2P_PORT, 10) || 4001
                 });
                 p2pNode = p2pResult.node;
                 logger.info(`🌐 P2P rodando (PeerID: ${p2pNode.peerId.toString()})`);
@@ -1326,10 +1271,9 @@ async function initialize() {
             }
         } else {
             logger.warn('⚠️ P2P desativado (P2P_ENABLED=false)');
-            p2pNode = null;
         }
 
-        // 📡 SwapGossip (só se P2P estiver ativo)
+        // 📡 SwapGossip (só com P2P ativo)
         if (p2pNode) {
             try {
                 const { initGossip, orderBook } = require('./atomic-swap/negotiation');
@@ -1358,40 +1302,37 @@ async function initialize() {
         logger.info(`💰 Reserve balance: ${reserve.balance.toString()} BRD`);
         logger.info(`📊 Max supply: ${reserve.maxSupply.toString()} BRD`);
 
-        await startAutoMining();
+        startAutoMining();
         startAutoPriceUpdate();
         startCheckpointing();
 
-        // ============================================
-        // 💰 BUY — creditWorker (credita BRD após pagamento)
-        // ============================================
-        try {
-            const creditWorker = require('./services/buy/creditWorker');
-            const creditingWatchdog = require('./services/buy/creditingWatchdog');
-            creditWorker.start({ io });
-            creditingWatchdog.start({ io });
-        } catch (err) {
-            logger.error('⚠️ Falha ao iniciar creditWorker/watchdog:', err.message);
-            logger.error('   Verifique models/Treasury.js e services/buy/credit*.js');
+        // 💰 BUY — workers de crédito
+        if (buyEnabled) {
+            try {
+                const creditWorker = require('./services/buy/creditWorker');
+                const creditingWatchdog = require('./services/buy/creditingWatchdog');
+                creditWorker.start({ io });
+                creditingWatchdog.start({ io });
+            } catch (err) {
+                logger.error('⚠️ Falha ao iniciar creditWorker/watchdog:', err.message);
+                logger.error('   Verifique models/Treasury.js e services/buy/credit*.js');
+            }
         }
 
         server.listen(PORT, '0.0.0.0', () => {
-            logger.info('');
             logger.info('════════════════════════════════════════');
-            logger.info(`✅ BradiChain rodando!`);
-            logger.info('════════════════════════════════════════');
+            logger.info('✅ BradiChain rodando!');
             logger.info(`📍 API: ${APP_URL}`);
             logger.info(`💚 Health: ${APP_URL}/health`);
-            logger.info(`🔗 WebSocket: ${APP_URL.replace('http', 'ws')}`);
             logger.info(`🌐 CORS: ${ALLOWED_ORIGINS.join(', ')}`);
             logger.info('════════════════════════════════════════');
-            logger.info('');
         });
     } catch (error) {
         logger.error('❌ Erro fatal ao inicializar:', error);
         process.exit(1);
     }
 }
+
 // ============================================
 // ERROS NÃO TRATADOS
 // ============================================
@@ -1401,19 +1342,30 @@ process.on('unhandledRejection', (reason) => {
 
 process.on('uncaughtException', (error) => {
     logger.error('❌ Uncaught Exception:', error);
-    if (IS_PROD) {
-        process.exit(1);
-    }
+    // Estado indefinido: sempre encerra (o gerenciador de processos reinicia)
+    process.exit(1);
 });
 
 // ============================================
 // GRACEFUL SHUTDOWN
 // ============================================
+let shuttingDown = false;
+
 async function shutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
     logger.info(`🛑 Recebido ${signal}. Encerrando graciosamente...`);
 
-    if (miningInterval) clearInterval(miningInterval);
-    if (checkpointInterval) clearInterval(checkpointInterval);
+    const forceTimer = setTimeout(() => {
+        logger.error('⚠️ Forçando saída após timeout');
+        process.exit(1);
+    }, 10_000);
+    forceTimer.unref();
+
+    for (const timer of [miningInterval, priceInterval, checkpointInterval]) {
+        if (timer) clearInterval(timer);
+    }
 
     try {
         if (p2pNode) {
@@ -1426,18 +1378,18 @@ async function shutdown(signal) {
 
     io.close();
 
-    server.close(() => {
+    server.close(async () => {
         logger.info('✅ Servidor HTTP encerrado');
-        mongoose.connection.close(false, () => {
+        try {
+            await mongoose.connection.close();
             logger.info('✅ MongoDB desconectado');
-            process.exit(0);
-        });
+        } catch (e) {
+            logger.error('Erro ao fechar MongoDB:', e.message);
+        }
+        process.exit(0);
     });
 
-    setTimeout(() => {
-        logger.error('⚠️ Forçando saída após timeout');
-        process.exit(1);
-    }, 10000);
+    if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections();
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
