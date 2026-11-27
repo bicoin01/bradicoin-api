@@ -1,12 +1,13 @@
 // transactions.js
-// Bradicoin Blockchain - Transactions (v3.2)
+// Bradicoin Blockchain - Transactions (v4.0)
 // ============================================
 // 🔐 NÃO-CUSTODIAL
-// 🆕 v3.1 — normalização de endereço + hash unificado
-// 🆕 v3.2 — MAX_AMOUNT aumentado para 100 trilhões (uso pessoal)
+// v4.0 — valores exatos (BigInt, 8 casas), anti-replay atômico, tipos internos
+//        bloqueados para usuários, créditos internos idempotentes e com rollback
+'use strict';
 
 const mongoose = require('mongoose');
-const { Decimal128 } = mongoose.Schema.Types;
+const Decimal128 = mongoose.Types.Decimal128;
 const { sha256 } = require('@noble/hashes/sha256');
 const { bytesToHex, utf8ToBytes } = require('@noble/hashes/utils');
 
@@ -18,24 +19,157 @@ const blockchain = require('./blockchain');
 // ============================================
 // CONSTANTES
 // ============================================
-const MAX_AMOUNT = 100_000_000_000_000;
+const SCALE = 8;
+const UNIT = 10n ** BigInt(SCALE);
+
+const MAX_AMOUNT = 100_000_000_000_000; // 100 trilhões de BRD
 const MAX_FEE = 1000;
+const MAX_UNITS = BigInt(MAX_AMOUNT) * UNIT;
+const MAX_FEE_UNITS = BigInt(MAX_FEE) * UNIT;
 const MAX_FUTURE_TIMESTAMP_MS = 5 * 60 * 1000;
 const MAX_PAST_TIMESTAMP_MS = 10 * 60 * 1000;
-const MIN_AMOUNT = 0.00000001;
+
+// Tipos que um USUÁRIO pode assinar e enviar pela API.
+// mint / reward / unstake / airdrop / buy / wallet_creation são SOMENTE internos.
+const USER_TX_TYPES = new Set([
+    'transfer', 'stake', 'tip', 'burn',
+    'nft_mint', 'nft_transfer', 'token_create', 'token_transfer'
+]);
 
 // ============================================
-// INICIALIZAR
+// ERRO TIPADO (o server.js pode usar err.status / err.code)
+// ============================================
+class TxError extends Error {
+    constructor(message, status = 400, code = 'TX_ERROR') {
+        super(message);
+        this.name = 'TxError';
+        this.status = status;
+        this.code = code;
+    }
+}
+
+// ============================================
+// VALORES EXATOS (sem float)
+// ============================================
+const CANONICAL_RE = /^(0|[1-9]\d{0,14})(\.\d{0,7}[1-9])?$/; // sem zeros à direita, sem notação científica
+const LOOSE_RE = /^\d{1,15}(\.\d{1,8})?$/;
+
+// canonical=true  → usado em tx assinadas (a string precisa ser idêntica à assinada)
+// canonical=false → uso interno (airdrop/compra), aceita "100.50"
+function parseUnits(value, label, canonical) {
+    let s;
+    if (typeof value === 'number') {
+        if (!Number.isFinite(value)) throw new TxError(`${label} inválido`);
+        s = canonical ? String(value) : value.toFixed(SCALE);
+    } else if (typeof value === 'string') {
+        s = canonical ? value : value.trim();
+    } else {
+        throw new TxError(`${label} inválido`);
+    }
+
+    if (!(canonical ? CANONICAL_RE : LOOSE_RE).test(s)) {
+        throw new TxError(
+            canonical
+                ? `${label} inválido: use string decimal (ex.: "10.5"), máx. 8 casas, sem zeros à direita nem notação científica`
+                : `${label} inválido (máx. 8 casas decimais)`
+        );
+    }
+    const [int, frac = ''] = s.split('.');
+    return { raw: s, units: BigInt(int) * UNIT + BigInt(frac.padEnd(SCALE, '0')) };
+}
+
+function fromUnits(units) {
+    const neg = units < 0n;
+    const u = neg ? -units : units;
+    const int = (u / UNIT).toString();
+    const frac = (u % UNIT).toString().padStart(SCALE, '0').replace(/0+$/, '');
+    return (neg ? '-' : '') + int + (frac ? '.' + frac : '');
+}
+
+// Decimal128 / string do banco → unidades (aceita notação científica)
+function decimalToUnits(value) {
+    const s = value === null || value === undefined ? '0' : value.toString();
+    const m = /^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(s);
+    if (!m) throw new TxError('Valor numérico inválido no banco de dados', 500, 'DB_VALUE');
+    const [, sign, int, frac = '', exp = '0'] = m;
+    const shift = SCALE - (frac.length - Number(exp));
+    let n = BigInt(int + frac);
+    n = shift >= 0 ? n * 10n ** BigInt(shift) : n / 10n ** BigInt(-shift);
+    return sign ? -n : n;
+}
+
+const toDecimal128 = (units) => Decimal128.fromString(fromUnits(units));
+
+// ============================================
+// HELPERS
+// ============================================
+function assertAddress(value, label) {
+    if (typeof value !== 'string' || !value || value.length > 128) {
+        throw new TxError(`${label} inválido`);
+    }
+    const normalized = wallet.normalizeAddress(value);
+    if (!wallet.isValidAddress(normalized)) throw new TxError(`${label} inválido`);
+    return normalized;
+}
+
+function getReserveAddress() {
+    const raw = process.env.RESERVE_ADDRESS;
+    if (!raw) throw new TxError('RESERVE_ADDRESS não configurado', 500, 'CONFIG');
+    const addr = wallet.normalizeAddress(raw);
+    if (!wallet.isValidAddress(addr)) throw new TxError('RESERVE_ADDRESS inválido', 500, 'CONFIG');
+    return addr;
+}
+
+function normalizeHash(hash) {
+    if (typeof hash !== 'string') throw new TxError('Hash é obrigatório');
+    const h = hash.trim().replace(/^0x/i, '').toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(h)) throw new TxError('Hash inválido');
+    return h;
+}
+
+// Fila por endereço: serializa operações do mesmo remetente neste processo.
+const locks = new Map();
+async function withAddressLock(address, fn) {
+    const prev = locks.get(address) || Promise.resolve();
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const chain = prev.then(() => gate);
+    locks.set(address, chain);
+    await prev;
+    try {
+        return await fn();
+    } finally {
+        release();
+        if (locks.get(address) === chain) locks.delete(address);
+    }
+}
+
+// ============================================
+// INICIALIZAR (garante índices únicos anti-replay)
 // ============================================
 async function initialize() {
+    if (mongoose.connection.readyState === 1) {
+        const col = TransactionModel.collection;
+        const indexes = [
+            [{ hash: 1 }, { unique: true }],
+            [{ signature: 1 }, { unique: true }],
+            [{ from: 1, timestamp: -1 }, {}],
+            [{ to: 1, timestamp: -1 }, {}]
+        ];
+        for (const [spec, opts] of indexes) {
+            try {
+                await col.createIndex(spec, opts);
+            } catch (e) {
+                console.warn(`⚠️ Índice ${JSON.stringify(spec)} não criado:`, e.message);
+            }
+        }
+    }
     console.log('✅ Transactions inicializadas');
 }
 
 // ============================================
-// 🆕 HASH UNIFICADO — usado por transactions.js E blockchain.js
+// HASH UNIFICADO — usado por transactions.js E blockchain.js
 // ============================================
-// Este é O ÚNICO lugar que calcula hash de tx. Todo o resto chama isto.
-//
 function calculateTxHash(tx, signature) {
     const payload = JSON.stringify({
         from: tx.fromAddress || tx.from || null,
@@ -51,286 +185,251 @@ function calculateTxHash(tx, signature) {
 }
 
 // ============================================
-// STRING PARA ASSINATURA
+// STRING PARA ASSINATURA (formato inalterado)
 // ============================================
 function buildSignableMessage(tx) {
     return [
         tx.fromAddress,
         tx.toAddress,
-        tx.amount.toString(),
-        (tx.fee || '0').toString(),
-        tx.nonce.toString(),
+        String(tx.amount),
+        String(tx.fee || '0'),
+        String(tx.nonce),
         tx.timestamp,
         tx.type || 'transfer'
     ].join('|');
 }
 
 // ============================================
-// VALIDAÇÕES
+// VALIDAÇÃO (tx enviada por usuário)
 // ============================================
-function validateTransactionPayload(payload) {
-    const { fromAddress, toAddress, amount, fee, nonce, timestamp, type } = payload;
+function validateUserPayload(p) {
+    if (!p || typeof p !== 'object') throw new TxError('Payload inválido');
 
-    if (!fromAddress || !toAddress) {
-        throw new Error('fromAddress e toAddress são obrigatórios');
-    }
-    if (!wallet.isValidAddress(fromAddress)) {
-        throw new Error('Endereço de origem inválido');
-    }
-    if (!wallet.isValidAddress(toAddress)) {
-        throw new Error('Endereço de destino inválido');
-    }
-    if (wallet.normalizeAddress(fromAddress) === wallet.normalizeAddress(toAddress)) {
-        throw new Error('Não é possível enviar para si mesmo');
-    }
+    const from = assertAddress(p.fromAddress, 'Endereço de origem');
+    const to = assertAddress(p.toAddress, 'Endereço de destino');
+    if (from === to) throw new TxError('Não é possível enviar para si mesmo');
 
-    const amountNum = parseFloat(amount);
-    if (!Number.isFinite(amountNum) || amountNum < MIN_AMOUNT) {
-        throw new Error(`Valor deve ser >= ${MIN_AMOUNT}`);
-    }
-    if (amountNum > MAX_AMOUNT) {
-        throw new Error(`Valor máximo por transação: ${MAX_AMOUNT} BRD`);
-    }
+    const amount = parseUnits(p.amount, 'Valor', true);
+    if (amount.units < 1n) throw new TxError('Valor deve ser >= 0.00000001');
+    if (amount.units > MAX_UNITS) throw new TxError(`Valor máximo por transação: ${MAX_AMOUNT} BRD`);
 
-    const feeNum = parseFloat(fee || '0');
-    if (!Number.isFinite(feeNum) || feeNum < 0 || feeNum > MAX_FEE) {
-        throw new Error(`Taxa deve estar entre 0 e ${MAX_FEE} BRD`);
-    }
+    const hasFee = p.fee !== undefined && p.fee !== null && p.fee !== '';
+    const fee = parseUnits(hasFee ? p.fee : 0, 'Taxa', true);
+    if (fee.units > MAX_FEE_UNITS) throw new TxError(`Taxa deve estar entre 0 e ${MAX_FEE} BRD`);
 
-    if (!Number.isInteger(nonce) || nonce < 0) {
-        throw new Error('Nonce inválido');
-    }
+    if (!Number.isSafeInteger(p.nonce) || p.nonce < 0) throw new TxError('Nonce inválido');
 
-    if (!timestamp) throw new Error('Timestamp é obrigatório');
-    const ts = new Date(timestamp).getTime();
-    if (isNaN(ts)) throw new Error('Timestamp inválido');
-
+    if (typeof p.timestamp !== 'string' || !p.timestamp) throw new TxError('Timestamp é obrigatório');
+    const ts = Date.parse(p.timestamp);
+    if (Number.isNaN(ts)) throw new TxError('Timestamp inválido');
     const now = Date.now();
-    if (ts > now + MAX_FUTURE_TIMESTAMP_MS) throw new Error('Timestamp muito no futuro');
-    if (ts < now - MAX_PAST_TIMESTAMP_MS) throw new Error('Timestamp muito antigo');
+    if (ts > now + MAX_FUTURE_TIMESTAMP_MS) throw new TxError('Timestamp muito no futuro');
+    if (ts < now - MAX_PAST_TIMESTAMP_MS) throw new TxError('Timestamp muito antigo');
 
-    const validTypes = [
-    'transfer', 'stake', 'unstake', 'reward', 'mint', 'burn',
-    'airdrop', 'wallet_creation', 'tip', 'nft_mint', 'nft_transfer', 'buy',
-    'token_create',
-    'token_transfer'
-];
-if (type && !validTypes.includes(type)) {
-    throw new Error('Tipo de transação inválido');
-}
-}
-
-// ============================================
-// CLIENT-SIDE — CRIAR E ASSINAR
-// ============================================
-function createSignedTransaction({
-    fromAddress,
-    toAddress,
-    amount,
-    fee = 0,
-    nonce,
-    type = 'transfer',
-    privateKey
-}) {
-    if (!privateKey) throw new Error('Chave privada é obrigatória');
-
-    // 🆕 normaliza antes de assinar (o cliente também usa minúsculas)
-    const fromAddr = wallet.normalizeAddress(fromAddress);
-    const toAddr = wallet.normalizeAddress(toAddress);
-
-    const timestamp = new Date().toISOString();
-
-    const tx = {
-        fromAddress: fromAddr,
-        toAddress: toAddr,
-        amount: amount.toString(),
-        fee: fee.toString(),
-        nonce,
-        timestamp,
-        type
-    };
-
-    validateTransactionPayload(tx);
-
-    const message = buildSignableMessage(tx);
-    const secp256k1 = require('@noble/secp256k1');
-    const messageBytes = utf8ToBytes(message);
-    const messageHash = sha256(messageBytes);
-
-    const privateKeyBytes = privateKey.startsWith('0x')
-        ? privateKey.slice(2)
-        : privateKey;
-
-    const signature = secp256k1.sign(messageHash, privateKeyBytes);
-    const publicKey = secp256k1.getPublicKey(privateKeyBytes, true);
+    const type = p.type === undefined || p.type === null ? 'transfer' : p.type;
+    if (typeof type !== 'string' || !USER_TX_TYPES.has(type)) {
+        throw new TxError('Tipo de transação inválido ou não permitido');
+    }
 
     return {
-        ...tx,
-        hash: calculateTxHash(tx, signature),
-        signature: signature,
-        publicKey: bytesToHex(publicKey)
+        from, to,
+        amountRaw: amount.raw, amountUnits: amount.units,
+        feeRaw: fee.raw, feeUnits: fee.units,
+        nonce: p.nonce, timestamp: p.timestamp, type
     };
+}
+
+// ============================================
+// FERRAMENTA DE TESTE — criar e assinar
+// ⚠️ Chave privada NUNCA deve chegar ao servidor. Desativada em produção.
+// ============================================
+async function createSignedTransaction({
+    fromAddress, toAddress, amount, fee = 0, nonce, type = 'transfer', privateKey
+}) {
+    if (process.env.NODE_ENV === 'production' && process.env.ALLOW_SERVER_SIGNING !== 'true') {
+        throw new TxError('Assinatura no servidor desativada em produção', 403, 'SIGNING_DISABLED');
+    }
+    if (typeof privateKey !== 'string' || !privateKey) throw new TxError('Chave privada é obrigatória');
+
+    const tx = {
+        fromAddress: assertAddress(fromAddress, 'Endereço de origem'),
+        toAddress: assertAddress(toAddress, 'Endereço de destino'),
+        amount: fromUnits(parseUnits(amount, 'Valor', false).units),
+        fee: fromUnits(parseUnits(fee, 'Taxa', false).units),
+        nonce,
+        timestamp: new Date().toISOString(),
+        type
+    };
+    validateUserPayload(tx);
+
+    const secp256k1 = require('@noble/secp256k1');
+    const keyHex = privateKey.replace(/^0x/, '');
+    const digest = sha256(utf8ToBytes(buildSignableMessage(tx)));
+
+    // v1 do noble-secp256k1 é assíncrona; await funciona nas duas versões
+    const sig = await secp256k1.sign(digest, keyHex);
+    const signature = typeof sig === 'string'
+        ? sig
+        : (sig && typeof sig.toCompactHex === 'function' ? sig.toCompactHex() : bytesToHex(sig));
+    const publicKey = bytesToHex(secp256k1.getPublicKey(keyHex, true));
+
+    return { ...tx, hash: calculateTxHash(tx, signature), signature, publicKey };
 }
 
 // ============================================
 // SERVER-SIDE — SUBMETER TX ASSINADA
 // ============================================
-async function submitSignedTransaction({
-    fromAddress,
-    toAddress,
-    amount,
-    fee = 0,
-    nonce,
-    timestamp,
-    type = 'transfer',
-    signature,
-    publicKey
-}) {
-    // 🆕 0. NORMALIZA antes de qualquer coisa
-    const fromAddr = wallet.normalizeAddress(fromAddress);
-    const toAddr = wallet.normalizeAddress(toAddress);
+async function submitSignedTransaction(input) {
+    if (!input || typeof input !== 'object') throw new TxError('Payload inválido');
+    const { signature, publicKey } = input;
 
-    const payload = {
-        fromAddress: fromAddr,
-        toAddress: toAddr,
-        amount,
-        fee,
-        nonce,
-        timestamp,
-        type
+    if (typeof signature !== 'string' || typeof publicKey !== 'string' || !signature || !publicKey) {
+        throw new TxError('Assinatura e chave pública são obrigatórias');
+    }
+    if (signature.length > 512 || publicKey.length > 256) {
+        throw new TxError('Assinatura ou chave pública inválida');
+    }
+
+    const v = validateUserPayload(input);
+
+    if (!wallet.isValidPublicKey(publicKey)) throw new TxError('Public key inválida');
+
+    // publicKey ↔ address
+    const derived = wallet.normalizeAddress(wallet.deriveAddressFromPublicKey(publicKey));
+    if (derived !== v.from) throw new TxError('Public key não corresponde ao endereço de origem');
+
+    // Assinatura sobre os valores canônicos
+    const signable = {
+        fromAddress: v.from, toAddress: v.to,
+        amount: v.amountRaw, fee: v.feeRaw,
+        nonce: v.nonce, timestamp: v.timestamp, type: v.type
     };
-    validateTransactionPayload(payload);
-
-    if (!signature || !publicKey) {
-        throw new Error('Assinatura e chave pública são obrigatórias');
-    }
-    if (!wallet.isValidPublicKey(publicKey)) {
-        throw new Error('Public key inválida');
-    }
-
-    // 2. publicKey ↔ address
-    const derivedAddress = wallet.deriveAddressFromPublicKey(publicKey);
-    if (derivedAddress !== fromAddr) {
-        throw new Error('Public key não corresponde ao endereço de origem');
-    }
-
-    // 3. Assinatura
-    const message = buildSignableMessage(payload);
-    if (!wallet.verifySignature(message, signature, publicKey)) {
-        throw new Error('Assinatura inválida');
-    }
-
-    // 4. Carteira origem
-    const senderWallet = await WalletModel.findOne({ address: fromAddr });
-    if (!senderWallet) throw new Error('Carteira de origem não encontrada');
-    if (senderWallet.status !== 'active') throw new Error('Carteira de origem inativa');
-
-    // 5. Nonce
-    if (senderWallet.nonce !== nonce) {
-        throw new Error(`Nonce inválido: esperado ${senderWallet.nonce}, recebido ${nonce}`);
-    }
-
-    // 6. Saldo
-    const amountNum = parseFloat(amount);
-    const feeNum = parseFloat(fee || '0');
-    const totalCost = amountNum + feeNum;
-    const balanceNum = parseFloat(senderWallet.balance.toString());
-    if (balanceNum < totalCost) {
-        throw new Error(`Saldo insuficiente: ${balanceNum} < ${totalCost}`);
-    }
-
-    // 7. Anti-replay assinatura
-    if (await TransactionModel.findOne({ signature })) {
-        throw new Error('Transação já submetida (replay detectado)');
-    }
-
-    // 8. Anti-replay nonce
-    if (await TransactionModel.findOne({ from: fromAddr, nonce })) {
-        throw new Error('Nonce já usado (replay detectado)');
-    }
-
-    // 9. Hash canônico
-    const hash = calculateTxHash(payload, signature);
-
-    // 10. Grava pending
-    const transaction = await TransactionModel.create({
-        hash,
-        from: fromAddr,
-        to: toAddr,
-        amount: Decimal128.fromString(amountNum.toString()),
-        fee: Decimal128.fromString(feeNum.toString()),
-        nonce,
-        signature,
-        publicKey,
-        type,
-        status: 'pending',
-        timestamp: new Date(timestamp)
-    });
-
-    // 11. Mempool
+    let signatureOk = false;
     try {
-        await blockchain.addTransaction({
+        signatureOk = wallet.verifySignature(buildSignableMessage(signable), signature, publicKey) === true;
+    } catch (_) { signatureOk = false; }
+    if (!signatureOk) throw new TxError('Assinatura inválida', 401, 'BAD_SIGNATURE');
+
+    // A partir daqui, uma submissão por vez para o mesmo remetente
+    return withAddressLock(v.from, async () => {
+        const sender = await WalletModel.findOne({ address: v.from });
+        if (!sender) throw new TxError('Carteira de origem não encontrada', 404);
+        if (sender.status !== 'active') throw new TxError('Carteira de origem inativa', 403);
+
+        if (sender.nonce !== v.nonce) {
+            throw new TxError(`Nonce inválido: esperado ${sender.nonce}, recebido ${v.nonce}`, 409, 'BAD_NONCE');
+        }
+
+        const balanceUnits = decimalToUnits(sender.balance);
+        const totalCost = v.amountUnits + v.feeUnits;
+        if (balanceUnits < totalCost) {
+            throw new TxError(
+                `Saldo insuficiente: ${fromUnits(balanceUnits)} < ${fromUnits(totalCost)}`,
+                400, 'INSUFFICIENT_FUNDS'
+            );
+        }
+
+        // Anti-replay
+        if (await TransactionModel.exists({ signature })) {
+            throw new TxError('Transação já submetida (replay detectado)', 409, 'REPLAY');
+        }
+        if (await TransactionModel.exists({ from: v.from, nonce: v.nonce })) {
+            throw new TxError('Nonce já usado (replay detectado)', 409, 'REPLAY');
+        }
+
+        const hash = calculateTxHash({
+            fromAddress: v.from, toAddress: v.to,
+            amount: v.amountRaw, fee: v.feeRaw,
+            nonce: v.nonce, type: v.type, timestamp: v.timestamp
+        }, signature);
+
+        let transaction;
+        try {
+            transaction = await TransactionModel.create({
+                hash,
+                from: v.from,
+                to: v.to,
+                amount: toDecimal128(v.amountUnits),
+                fee: toDecimal128(v.feeUnits),
+                nonce: v.nonce,
+                signature,
+                publicKey,
+                type: v.type,
+                status: 'pending',
+                timestamp: new Date(v.timestamp)
+            });
+        } catch (err) {
+            if (err && err.code === 11000) {
+                throw new TxError('Transação já submetida (replay detectado)', 409, 'REPLAY');
+            }
+            throw err;
+        }
+
+        try {
+            await blockchain.addTransaction({
+                hash,
+                fromAddress: v.from,
+                toAddress: v.to,
+                amount: Number(v.amountRaw),
+                fee: Number(v.feeRaw),
+                amountStr: v.amountRaw, // valores exatos, para quem precisar
+                feeStr: v.feeRaw,
+                nonce: v.nonce,
+                signature,
+                publicKey,
+                type: v.type,
+                timestamp: v.timestamp,
+                status: 'pending'
+            });
+        } catch (err) {
+            await TransactionModel.deleteOne({ hash });
+            throw err;
+        }
+
+        console.log(`✅ TX submetida: ${hash.substring(0, 12)}...`);
+
+        return {
+            success: true,
             hash,
-            fromAddress: fromAddr,
-            toAddress: toAddr,
-            amount: amountNum,
-            fee: feeNum,
-            nonce,
-            signature,
-            publicKey,
-            type,
-            timestamp,
-            status: 'pending'
-        });
-    } catch (err) {
-        await TransactionModel.deleteOne({ hash });
-        throw err;
-    }
-
-    console.log(`✅ TX submetida: ${hash.substring(0, 12)}...`);
-
-    return {
-        success: true,
-        hash,
-        status: 'pending',
-        message: `Transação de ${amount} BRD submetida. Será confirmada no próximo bloco.`,
-        transaction: transaction.toPublic()
-    };
+            status: 'pending',
+            message: `Transação de ${v.amountRaw} BRD submetida. Será confirmada no próximo bloco.`,
+            transaction: transaction.toPublic()
+        };
+    });
 }
 
 // ============================================
 // CONSULTAS
 // ============================================
 async function getTransactionByHash(hash) {
-    if (!hash || typeof hash !== 'string') throw new Error('Hash é obrigatório');
-    const tx = await TransactionModel.findOne({ hash });
-    if (!tx) throw new Error('Transação não encontrada');
+    const h = normalizeHash(hash);
+    const tx = await TransactionModel.findOne({ hash: h });
+    if (!tx) throw new TxError('Transação não encontrada', 404, 'NOT_FOUND');
     return tx.toPublic();
 }
 
 async function getWalletTransactions(address, limit = 50, offset = 0) {
-    const normalized = wallet.normalizeAddress(address);
-    if (!wallet.isValidAddress(normalized)) throw new Error('Endereço inválido');
+    const normalized = assertAddress(address, 'Endereço');
 
-    limit = Math.min(Math.max(1, limit), 100);
-    offset = Math.max(0, offset);
+    const lim = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 100);
+    const off = Math.min(Math.max(parseInt(offset, 10) || 0, 0), 100000);
 
     const query = { $or: [{ from: normalized }, { to: normalized }] };
 
     const [transactions, total] = await Promise.all([
-        TransactionModel.find(query).sort({ timestamp: -1 }).skip(offset).limit(limit).lean(),
+        TransactionModel.find(query).sort({ timestamp: -1 }).skip(off).limit(lim).lean(),
         TransactionModel.countDocuments(query)
     ]);
 
     return {
         address: normalized,
         total,
-        transactions: transactions.map(tx => ({
+        transactions: transactions.map((tx) => ({
             hash: tx.hash,
             from: tx.from,
             to: tx.to,
-            amount: tx.amount?.toString() || '0',
-            fee: tx.fee?.toString() || '0',
+            amount: tx.amount ? tx.amount.toString() : '0',
+            fee: tx.fee ? tx.fee.toString() : '0',
             type: tx.type,
             status: tx.status,
             nonce: tx.nonce,
@@ -340,13 +439,19 @@ async function getWalletTransactions(address, limit = 50, offset = 0) {
             timestamp: tx.timestamp,
             confirmed: tx.status === 'confirmed'
         })),
-        limit,
-        offset,
-        hasMore: offset + limit < total
+        limit: lim,
+        offset: off,
+        hasMore: off + lim < total
     };
 }
 
+let statsCache = { data: null, at: 0 };
+const STATS_TTL_MS = 15000;
+
 async function getTransactionStats() {
+    const now = Date.now();
+    if (statsCache.data && now - statsCache.at < STATS_TTL_MS) return statsCache.data;
+
     const [total, pending, confirmed, failed, volumeAgg] = await Promise.all([
         TransactionModel.countDocuments({}),
         TransactionModel.countDocuments({ status: 'pending' }),
@@ -354,13 +459,18 @@ async function getTransactionStats() {
         TransactionModel.countDocuments({ status: 'failed' }),
         TransactionModel.aggregate([
             { $match: { status: 'confirmed' } },
-            { $group: { _id: null, totalVolume: { $sum: { $toDouble: '$amount' } }, totalFees: { $sum: { $toDouble: '$fee' } } } }
+            {
+                $group: {
+                    _id: null,
+                    totalVolume: { $sum: { $toDouble: '$amount' } },
+                    totalFees: { $sum: { $toDouble: '$fee' } }
+                }
+            }
         ])
     ]);
 
     const agg = volumeAgg[0] || { totalVolume: 0, totalFees: 0 };
-
-    return {
+    const data = {
         totalTransactions: total,
         confirmed,
         pending,
@@ -368,129 +478,192 @@ async function getTransactionStats() {
         totalVolume: agg.totalVolume,
         totalFees: agg.totalFees
     };
+    statsCache = { data, at: now };
+    return data;
 }
 
 // ============================================
-// MINERADOR
+// MINERADOR (uso interno)
 // ============================================
 async function confirmTransaction(hash, blockIndex, blockHash) {
+    const h = normalizeHash(hash);
+    if (!Number.isSafeInteger(blockIndex) || blockIndex < 0) throw new TxError('blockIndex inválido');
+    if (typeof blockHash !== 'string' || !/^[a-f0-9]{64}$/i.test(blockHash)) throw new TxError('blockHash inválido');
+
     return TransactionModel.findOneAndUpdate(
-        { hash, status: 'pending' },
+        { hash: h, status: 'pending' },
         { $set: { status: 'confirmed', blockIndex, blockHash, confirmations: 1 } },
         { new: true }
     );
 }
 
 async function failTransaction(hash, reason) {
+    const h = normalizeHash(hash);
     return TransactionModel.findOneAndUpdate(
-        { hash, status: 'pending' },
-        { $set: { status: 'failed', 'metadata.reason': reason } },
+        { hash: h, status: 'pending' },
+        { $set: { status: 'failed', 'metadata.reason': String(reason || 'unknown').slice(0, 200) } },
         { new: true }
     );
 }
 
 // ============================================
-// AIRDROP
+// CRÉDITOS INTERNOS — base comum (airdrop e compra)
 // ============================================
-async function creditAirdrop({ toAddress, amount, campaign, userId }) {
-    const toAddr = wallet.normalizeAddress(toAddress);
 
-    if (!wallet.isValidAddress(toAddr)) throw new Error('Endereço de destino inválido');
+// Reivindica a tx interna de forma idempotente (assinatura determinística + índice único).
+async function claimInternalTx({ type, from, to, amountUnits, signature, metadata }) {
+    // Reprocessa uma tx que falhou antes (atômico)
+    const reclaimed = await TransactionModel.findOneAndUpdate(
+        { signature, status: 'failed' },
+        { $set: { status: 'pending' } },
+        { new: true }
+    );
+    if (reclaimed) return { claimed: true, hash: reclaimed.hash };
 
-    const fromAddress = wallet.normalizeAddress(process.env.RESERVE_ADDRESS);
-    if (!fromAddress) throw new Error('RESERVE_ADDRESS não configurado no .env');
-
-    const toWallet = await WalletModel.findOne({ address: toAddr });
-    if (!toWallet) throw new Error('Carteira de destino não existe');
-    if (toWallet.status !== 'active') throw new Error('Carteira de destino inativa');
-
-    const amountNum = parseFloat(amount);
-    if (!Number.isFinite(amountNum) || amountNum <= 0) throw new Error('Valor do airdrop inválido');
+    const existing = await TransactionModel.findOne({ signature }).select('hash status').lean();
+    if (existing) return { claimed: false, existing };
 
     const timestamp = new Date().toISOString();
-    const txPayload = {
-        fromAddress,
-        toAddress: toAddr,
-        amount: amountNum,
-        fee: 0,
-        nonce: 0,
-        timestamp,
-        type: 'airdrop'
-    };
+    const hash = calculateTxHash({
+        fromAddress: from, toAddress: to,
+        amount: fromUnits(amountUnits), fee: '0',
+        nonce: 0, type, timestamp
+    }, signature);
 
-    const internalSignature = `INTERNAL_AIRDROP_${campaign}_${Date.now()}`;
-    const hash = calculateTxHash(txPayload, internalSignature);
+    try {
+        await TransactionModel.create({
+            hash,
+            from,
+            to,
+            amount: toDecimal128(amountUnits),
+            fee: toDecimal128(0n),
+            nonce: 0,
+            signature,
+            publicKey: 'INTERNAL',
+            type,
+            status: 'pending',
+            timestamp: new Date(timestamp),
+            metadata: { ...metadata, internal: true }
+        });
+    } catch (err) {
+        if (err && err.code === 11000) {
+            const dup = await TransactionModel.findOne({ signature }).select('hash status').lean();
+            return { claimed: false, existing: dup };
+        }
+        throw err;
+    }
+    return { claimed: true, hash };
+}
 
-    if (await TransactionModel.findOne({ hash })) {
-        throw new Error('Transação de airdrop já registrada');
+// Debita a reserva ANTES; se o crédito falhar, devolve à reserva.
+async function moveFromReserve({ reserve, to, amountUnits }) {
+    const amountStr = fromUnits(amountUnits);
+
+    const reserveWallet = await WalletModel.debit(reserve, amountStr); // falhou aqui = nada aconteceu
+
+    try {
+        const userWallet = await WalletModel.credit(to, amountStr);
+        return { reserveWallet, userWallet };
+    } catch (err) {
+        try {
+            await WalletModel.credit(reserve, amountStr);
+        } catch (refundErr) {
+            console.error(`🚨 REEMBOLSO À RESERVA FALHOU (${amountStr} BRD, destino ${to}):`, refundErr.message);
+            err.refundFailed = true;
+        }
+        throw err;
+    }
+}
+
+async function finishInternalTx(hash, status, reason) {
+    const set = { status };
+    if (reason) set['metadata.reason'] = String(reason).slice(0, 200);
+    try {
+        await TransactionModel.updateOne({ hash }, { $set: set });
+    } catch (e) {
+        console.error(`🚨 Falha ao atualizar tx interna ${hash}:`, e.message);
+    }
+}
+
+// ============================================
+// AIRDROP (idempotente por campanha + usuário)
+// ============================================
+async function creditAirdrop({ toAddress, amount, campaign, userId, idempotencyKey }) {
+    if (typeof campaign !== 'string' || !campaign.trim() || campaign.length > 64) {
+        throw new TxError('campaign é obrigatório (máx. 64 caracteres)');
     }
 
-    const tx = await TransactionModel.create({
-        hash,
-        from: fromAddress,
-        to: toAddr,
-        amount: Decimal128.fromString(amountNum.toString()),
-        fee: Decimal128.fromString('0'),
-        nonce: 0,
-        signature: internalSignature,
-        publicKey: 'INTERNAL',
+    const to = assertAddress(toAddress, 'Endereço de destino');
+    const reserve = getReserveAddress();
+    if (to === reserve) throw new TxError('Destino não pode ser a reserva');
+
+    const { units: amountUnits } = parseUnits(amount, 'Valor do airdrop', false);
+    if (amountUnits < 1n || amountUnits > MAX_UNITS) throw new TxError('Valor do airdrop inválido');
+
+    const toWallet = await WalletModel.findOne({ address: to });
+    if (!toWallet) throw new TxError('Carteira de destino não existe', 404);
+    if (toWallet.status !== 'active') throw new TxError('Carteira de destino inativa', 403);
+
+    const key = String(idempotencyKey || `${campaign}_${userId || to}`).slice(0, 200);
+    const signature = `INTERNAL_AIRDROP_${key}`;
+
+    const claim = await claimInternalTx({
         type: 'airdrop',
-        status: 'confirmed',
-        timestamp: new Date(timestamp),
-        metadata: { campaign, userId: userId?.toString(), internal: true }
+        from: reserve,
+        to,
+        amountUnits,
+        signature,
+        metadata: { campaign, userId: userId ? String(userId) : undefined }
     });
 
-    const newBalance = Number(toWallet.balance || 0) + amountNum;
-    toWallet.balance = Decimal128.fromString(newBalance.toString());
-    await toWallet.save();
+    if (!claim.claimed) {
+        const st = claim.existing && claim.existing.status;
+        throw new TxError(
+            st === 'confirmed' ? 'Airdrop já creditado' : 'Airdrop em processamento ou pendente de revisão',
+            409, 'DUPLICATE'
+        );
+    }
 
-    await WalletModel.updateOne({ address: fromAddress }, { $inc: { nonce: 1 } });
+    let moved;
+    try {
+        moved = await moveFromReserve({ reserve, to, amountUnits });
+    } catch (err) {
+        await finishInternalTx(claim.hash, err.refundFailed ? 'pending' : 'failed', err.message);
+        throw err;
+    }
 
-    console.log(`✅ Airdrop creditado: ${amountNum} BRD → ${toAddr}`);
+    await finishInternalTx(claim.hash, 'confirmed');
+    console.log(`✅ Airdrop creditado: ${fromUnits(amountUnits)} BRD → ${to}`);
 
     return {
-        txHash: hash,
+        txHash: claim.hash,
         blockIndex: null,
-        amount: amountNum,
-        newBalance: newBalance.toString()
+        amount: Number(fromUnits(amountUnits)),
+        newBalance: moved.userWallet.balance.toString()
     };
 }
 
 // ============================================
-// 🛒 COMPRA DE BRADICOIN (buy) — SEM SESSÃO ATÔMICA
+// 🛒 COMPRA DE BRADICOIN (buy)
 // ============================================
-// Usado pelo creditWorker quando o pagamento é confirmado.
-// Debita do Reserve + credita no usuário + registra tx tipo 'buy'.
-//
-// ⚠️ SEM session atômica. Usa 3 proteções:
-//    1. Idempotência (se já creditado, não duplica)
-//    2. Ordem segura (credita usuário antes de debitar Reserve)
-//    3. Status 'crediting' como lock (evita 2 workers processando)
-//
-// Retorna { txHash, newBalance, orderId, alreadyCredited }
-//
+// Proteções:
+//  1. Lock por status do pedido: 'paid' → 'crediting' (atômico)
+//  2. Idempotência: assinatura determinística por pedido + índice único
+//  3. Ordem correta: debita a reserva primeiro; falha no crédito devolve à reserva
+//  4. Valor conferido contra o pedido
+//  5. Se os fundos já foram movidos, o pedido NUNCA volta para 'failed'
+//     (evita reprocessamento e crédito duplo)
 async function creditPurchase({ orderId, toAddress, amount }) {
-    if (!orderId) throw new Error('orderId é obrigatório');
-    if (!toAddress) throw new Error('toAddress é obrigatório');
-    
-    const amountNum = parseFloat(amount);
-    if (!Number.isFinite(amountNum) || amountNum <= 0) {
-        throw new Error('amount inválido (deve ser > 0)');
+    if (typeof orderId !== 'string' || !orderId || orderId.length > 128) {
+        throw new TxError('orderId é obrigatório');
     }
-
-    const toAddr = wallet.normalizeAddress(toAddress);
-    if (!wallet.isValidAddress(toAddr)) {
-        throw new Error('Endereço de destino inválido');
-    }
-
-    const fromAddress = wallet.normalizeAddress(process.env.RESERVE_ADDRESS);
-    if (!fromAddress) {
-        throw new Error('RESERVE_ADDRESS não configurado no .env');
-    }
+    const to = assertAddress(toAddress, 'Endereço de destino');
+    const reserve = getReserveAddress();
+    const { units: amountUnits } = parseUnits(amount, 'amount', false);
+    if (amountUnits < 1n || amountUnits > MAX_UNITS) throw new TxError('amount inválido (deve ser > 0)');
 
     const BuyOrder = require('./models/BuyOrder');
 
-    // 🛡️ LOCK: só continua se estiver 'paid'
     const order = await BuyOrder.findOneAndUpdate(
         { orderId, status: 'paid' },
         { $set: { status: 'crediting' } },
@@ -499,104 +672,103 @@ async function creditPurchase({ orderId, toAddress, amount }) {
 
     if (!order) {
         const existing = await BuyOrder.findOne({ orderId });
-        if (!existing) throw new Error(`Pedido ${orderId} não encontrado`);
+        if (!existing) throw new TxError(`Pedido ${orderId} não encontrado`, 404);
         if (existing.status === 'credited' && existing.creditTxHash) {
-            console.log(`⚠️ Pedido ${orderId} já creditado (${existing.creditTxHash})`);
             return {
                 txHash: existing.creditTxHash,
                 orderId: existing.orderId,
-                amount: parseFloat(existing.amountBr.toString()),
+                amount: Number(existing.amountBr.toString()),
                 alreadyCredited: true
             };
         }
         if (existing.status === 'crediting') {
-            throw new Error(`Pedido ${orderId} já está sendo processado`);
+            throw new TxError(`Pedido ${orderId} já está sendo processado`, 409, 'IN_PROGRESS');
         }
-        throw new Error(`Pedido ${orderId} em estado inválido: ${existing.status}`);
+        throw new TxError(`Pedido ${orderId} em estado inválido: ${existing.status}`, 409, 'BAD_STATE');
     }
 
+    let fundsMoved = false;
     try {
-        // ===== 1. CREDITA NO USUÁRIO PRIMEIRO (ordem segura) =====
-        const userWallet = await WalletModel.credit(toAddr, amountNum.toString());
-
-        // ===== 2. DEBITA DO RESERVE =====
-        let reserveWallet;
-        try {
-            reserveWallet = await WalletModel.debit(fromAddress, amountNum.toString());
-        } catch (debitErr) {
-            console.error(`❌ Falha ao debitar Reserve: ${debitErr.message}`);
-            await BuyOrder.findOneAndUpdate(
-                { orderId },
-                { $set: { status: 'failed', failureReason: `Reserve debit failed: ${debitErr.message}` } }
-            );
-            throw debitErr;
+        // Valor precisa bater com o pedido
+        if (order.amountBr !== undefined && order.amountBr !== null) {
+            if (decimalToUnits(order.amountBr) !== amountUnits) {
+                throw new TxError('amount diverge do valor do pedido', 409, 'AMOUNT_MISMATCH');
+            }
         }
 
-        // ===== 3. CRIA TRANSACTIONMODEL (type: 'buy') =====
-        const timestamp = new Date().toISOString();
-        const txPayload = {
-            fromAddress,
-            toAddress: toAddr,
-            amount: amountNum,
-            fee: 0,
-            nonce: 0,
-            timestamp,
-            type: 'buy'
-        };
+        const claim = await claimInternalTx({
+            type: 'buy',
+            from: reserve,
+            to,
+            amountUnits,
+            signature: `INTERNAL_BUY_${orderId}`,
+            metadata: {
+                orderId: order.orderId,
+                currency: order.currency,
+                amountUsd: order.amountUsd,
+                priceAtOrder: order.priceAtOrder,
+                source: 'buy_worker'
+            }
+        });
 
-        const internalSignature = `INTERNAL_BUY_${orderId}_${Date.now()}`;
-        const hash = calculateTxHash(txPayload, internalSignature);
-
-        const existingTx = await TransactionModel.findOne({ hash });
-        if (!existingTx) {
-            await TransactionModel.create({
-                hash,
-                from: fromAddress,
-                to: toAddr,
-                amount: Decimal128.fromString(amountNum.toString()),
-                fee: Decimal128.fromString('0'),
-                nonce: 0,
-                signature: internalSignature,
-                publicKey: 'INTERNAL',
-                type: 'buy',
-                status: 'confirmed',
-                timestamp: new Date(timestamp),
-                metadata: {
+        // Já existe tx confirmada para este pedido: apenas conclui o pedido
+        if (!claim.claimed) {
+            if (claim.existing && claim.existing.status === 'confirmed') {
+                fundsMoved = true;
+                await BuyOrder.findOneAndUpdate(
+                    { orderId, status: 'crediting' },
+                    { $set: { status: 'credited', creditTxHash: claim.existing.hash, creditedAt: new Date() } }
+                );
+                return {
+                    txHash: claim.existing.hash,
                     orderId: order.orderId,
-                    currency: order.currency,
-                    amountUsd: order.amountUsd,
-                    priceAtOrder: order.priceAtOrder,
-                    internal: true,
-                    source: 'buy_worker'
-                }
-            });
+                    amount: Number(fromUnits(amountUnits)),
+                    alreadyCredited: true
+                };
+            }
+            throw new TxError('Transação de compra pendente de revisão manual', 409, 'NEEDS_REVIEW');
         }
 
-        // ===== 4. MARCA PEDIDO COMO 'CREDITED' =====
+        let moved;
+        try {
+            moved = await moveFromReserve({ reserve, to, amountUnits });
+        } catch (err) {
+            await finishInternalTx(claim.hash, err.refundFailed ? 'pending' : 'failed', err.message);
+            throw err;
+        }
+        fundsMoved = true;
+
+        await finishInternalTx(claim.hash, 'confirmed');
+
         await BuyOrder.findOneAndUpdate(
             { orderId, status: 'crediting' },
-            { $set: { status: 'credited', creditTxHash: hash, creditedAt: new Date() } }
+            { $set: { status: 'credited', creditTxHash: claim.hash, creditedAt: new Date() } }
         );
 
-        console.log(`✅ Compra creditada: ${amountNum} BRD → ${toAddr} (tx: ${hash.substring(0, 12)}...)`);
+        console.log(`✅ Compra creditada: ${fromUnits(amountUnits)} BRD → ${to} (tx: ${claim.hash.substring(0, 12)}...)`);
 
         return {
-            txHash: hash,
+            txHash: claim.hash,
             orderId: order.orderId,
-            amount: amountNum,
-            newBalance: userWallet.balance.toString(),
-            reserveBalance: reserveWallet.balance.toString()
+            amount: Number(fromUnits(amountUnits)),
+            newBalance: moved.userWallet.balance.toString(),
+            reserveBalance: moved.reserveWallet.balance.toString()
         };
-
     } catch (err) {
         console.error(`❌ Erro ao creditar compra ${orderId}:`, err.message);
-        try {
-            await BuyOrder.findOneAndUpdate(
-                { orderId, status: 'crediting' },
-                { $set: { status: 'failed', failureReason: err.message } }
-            );
-        } catch (updateErr) {
-            console.error(`❌ Erro ao marcar pedido como failed:`, updateErr.message);
+
+        if (fundsMoved) {
+            // Fundos já foram creditados: não marcar como failed. Revisão manual.
+            console.error(`🚨 Pedido ${orderId}: fundos movidos mas o fechamento falhou. Conferir manualmente.`);
+        } else {
+            try {
+                await BuyOrder.findOneAndUpdate(
+                    { orderId, status: 'crediting' },
+                    { $set: { status: 'failed', failureReason: String(err.message).slice(0, 300) } }
+                );
+            } catch (updateErr) {
+                console.error('❌ Erro ao marcar pedido como failed:', updateErr.message);
+            }
         }
         throw err;
     }
@@ -607,6 +779,8 @@ async function creditPurchase({ orderId, toAddress, amount }) {
 // ============================================
 module.exports = {
     initialize,
+    TxError,
+    USER_TX_TYPES,
     buildSignableMessage,
     calculateTxHash,
     createSignedTransaction,
