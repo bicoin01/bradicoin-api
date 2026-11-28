@@ -1,6 +1,7 @@
 {
   "name": "bradicoin-blockchain",
-  "version": "3.1.0",
+  "version": "5.0.0",
+  "private": true,
   "description": "Bradicoin Blockchain - Complete System with Atomic Swap",
   "main": "server.js",
   "exports": {
@@ -12,7 +13,8 @@
     "dev": "nodemon server.js",
     "test": "jest",
     "test:watch": "jest --watch",
-    "clean": "rm -rf node_modules package-lock.json",
+    "audit:prod": "npm audit --omit=dev --audit-level=high",
+    "clean": "rm -rf node_modules",
     "swap:wallet": "node scripts/generate-bitcoin-wallet.js",
     "swap:test-btc": "node scripts/test-btc-htlc.js",
     "swap:test-evm": "node scripts/test-evm-htlc.js",
@@ -22,8 +24,8 @@
   },
   "dependencies": {
     "@noble/hashes": "1.8.0",
-    "@noble/secp256k1": "2.0.0",
-    "axios": "^1.7.7",
+    "@noble/secp256k1": "1.7.1",
+    "axios": "^1.17.0",
     "bcryptjs": "^2.4.3",
     "bip32": "^4.0.0",
     "bip39": "^3.1.0",
@@ -34,30 +36,31 @@
     "dotenv": "^16.4.5",
     "ecpair": "^2.1.0",
     "ethers": "^6.13.2",
-    "express": "^4.19.2",
+    "express": "^4.22.2",
     "express-mongo-sanitize": "^2.2.0",
     "express-rate-limit": "^7.4.0",
     "helmet": "^7.1.0",
     "hpp": "^0.2.3",
     "jsonwebtoken": "^9.0.2",
-    "mongoose": "^8.6.0",
+    "mongoose": "^8.22.1",
     "qrcode": "^1.5.3",
-    "socket.io": "^4.7.5",
+    "socket.io": "^4.8.1",
     "solc": "^0.8.27",
     "speakeasy": "^2.0.0",
     "tiny-secp256k1": "^2.2.3",
     "winston": "^3.14.2"
   },
   "overrides": {
-    "@noble/hashes": "1.8.0"
+    "@noble/hashes": "1.8.0",
+    "engine.io": "^6.6.10"
   },
   "devDependencies": {
     "jest": "^29.7.0",
     "nodemon": "^3.1.4",
-    "supertest": "^6.3.3"
+    "supertest": "^7.1.0"
   },
   "engines": {
-    "node": ">=20.0.0 <21.0.0"
+    "node": ">=24.0.0 <25.0.0"
   },
   "keywords": [
     "blockchain",
